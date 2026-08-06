@@ -13,7 +13,7 @@ regular periods and larger than one in outlier periods.
 
 Conventions
 -----------
-* B has shape (1 + n*p, n): constant first, then lag blocks.
+* B has shape (1 + n*p + m, n): constant first, then lag blocks, then m deterministic/exogenous regressors.
 * vec(B) is column-major (order="F"), equation by equation.
 * The estimation sample is the maximal balanced block of absolute changes.
   The end-of-sample ragged edge is retained for Durbin--Koopman forecasts.
@@ -192,7 +192,79 @@ def load_energy_panel(
         raise ValueError("The model panel contains infinite values.")
     return frame
 
-def _prepare_var_regression(data: pd.DataFrame, p: int) -> tuple[np.ndarray, np.ndarray, pd.DatetimeIndex]:
+def monthly_seasonal_dummies(
+    index: Sequence[pd.Timestamp] | pd.DatetimeIndex,
+    *,
+    reference_month: int = 1,
+    prefix: str = "month",
+) -> pd.DataFrame:
+    """Return eleven monthly seasonal dummies for a model with an intercept.
+
+    ``reference_month`` is omitted to avoid exact collinearity with the
+    constant. For the electricity model the default makes January the
+    reference category, matching ``drop_first=True`` on calendar months.
+    """
+    if reference_month not in range(1, 13):
+        raise ValueError("reference_month must be an integer from 1 to 12.")
+    dates = pd.DatetimeIndex(index)
+    if dates.isna().any():
+        raise ValueError("The seasonal-dummy index contains invalid dates.")
+    dates = dates.to_period("M").to_timestamp(how="start")
+    if dates.has_duplicates:
+        raise ValueError("The seasonal-dummy index contains duplicate months.")
+    data = {
+        f"{prefix}_{month:02d}": (dates.month == month).astype(float)
+        for month in range(1, 13)
+        if month != reference_month
+    }
+    return pd.DataFrame(data, index=pd.DatetimeIndex(dates, name="date"))
+
+
+def _normalise_monthly_exog(
+    exog: pd.DataFrame | None,
+    index: pd.DatetimeIndex,
+) -> pd.DataFrame | None:
+    """Validate deterministic regressors and align them to the model calendar."""
+    if exog is None:
+        return None
+    if not isinstance(exog, pd.DataFrame):
+        raise TypeError("exog must be a pandas DataFrame or None.")
+    if exog.shape[1] == 0:
+        return None
+    if not isinstance(exog.index, (pd.DatetimeIndex, pd.PeriodIndex)):
+        raise TypeError("exog must have a DatetimeIndex or PeriodIndex.")
+    if not exog.columns.is_unique:
+        raise ValueError("exog column names must be unique.")
+
+    frame = exog.copy()
+    frame.columns = [str(column) for column in frame.columns]
+    dates = (
+        frame.index.to_timestamp(how="start")
+        if isinstance(frame.index, pd.PeriodIndex)
+        else pd.DatetimeIndex(frame.index)
+    )
+    frame.index = dates.to_period("M").to_timestamp(how="start")
+    frame.index.name = "date"
+    if frame.index.has_duplicates:
+        raise ValueError("exog contains duplicate monthly dates.")
+    frame = frame.apply(pd.to_numeric, errors="coerce").reindex(index)
+    if np.isinf(frame.to_numpy(dtype=float)).any():
+        raise ValueError("exog contains infinite values.")
+    if frame.isna().any().any():
+        bad = frame.index[frame.isna().any(axis=1)][:10]
+        dates_text = ", ".join(date.date().isoformat() for date in bad)
+        raise ValueError(
+            "exog must be known over the full model calendar; missing values at "
+            f"{dates_text}."
+        )
+    return frame.astype(float)
+
+
+def _prepare_var_regression(
+    data: pd.DataFrame,
+    p: int,
+    exog: pd.DataFrame | None = None,
+) -> tuple[np.ndarray, np.ndarray, pd.DatetimeIndex]:
     if p < 1:
         raise ValueError("p must be at least 1.")
     if len(data) <= p:
@@ -202,7 +274,21 @@ def _prepare_var_regression(data: pd.DataFrame, p: int) -> tuple[np.ndarray, np.
     arr = data.to_numpy(dtype=float)
     Y = arr[p:]
     lag_blocks = [arr[p - lag : len(arr) - lag] for lag in range(1, p + 1)]
-    X = np.column_stack([np.ones(len(Y)), *lag_blocks])
+    pieces = [np.ones(len(Y)), *lag_blocks]
+    if exog is not None:
+        exog_regression = exog.reindex(data.index[p:])
+        if exog_regression.isna().any().any():
+            raise ValueError("exog is missing on one or more regression dates.")
+        deterministic = exog_regression.to_numpy(dtype=float)
+        rank_design = np.column_stack([np.ones(len(Y)), deterministic])
+        if np.linalg.matrix_rank(rank_design) < rank_design.shape[1]:
+            raise ValueError(
+                "The deterministic regressors are collinear with one another or "
+                "with the constant. With a constant, use eleven rather than "
+                "twelve monthly seasonal dummies."
+            )
+        pieces.append(deterministic)
+    X = np.column_stack(pieces)
     return Y, X, data.index[p:]
 
 
@@ -210,12 +296,13 @@ def prepare_bvar_panel(
     levels: pd.DataFrame,
     p: int = 12,
     variables: Sequence[str] | None = None,
+    exog: pd.DataFrame | None = None,
 ) -> dict:
-    """Prepare levels, absolute changes, balanced estimation sample and ragged edge.
+    """Prepare levels, changes, deterministic regressors and the ragged edge.
 
-    Missing rows are allowed only at the beginning and at the end of the
-    transformed panel. An interior gap is rejected because silently deleting it
-    would change the monthly spacing of the VAR.
+    Missing endogenous rows are allowed only at the beginning and at the end of
+    the transformed panel. Deterministic regressors must be observed over the
+    complete calendar because their future values are known by construction.
     """
     if not isinstance(levels, pd.DataFrame):
         raise TypeError("levels must be a pandas DataFrame.")
@@ -232,6 +319,7 @@ def prepare_bvar_panel(
     frame = frame.reindex(full_index)
     if np.isinf(frame.to_numpy()).any():
         raise ValueError("The level panel contains infinite values.")
+    exog_frame = _normalise_monthly_exog(exog, full_index)
 
     differences = frame.diff()
     complete = differences.notna().all(axis=1).to_numpy()
@@ -254,25 +342,35 @@ def prepare_bvar_panel(
         raise ValueError(
             f"Only {len(balanced)} balanced changes remain; this is too short for VAR({p})."
         )
-    Y, X, regression_dates = _prepare_var_regression(balanced, p)
+    balanced_exog = None if exog_frame is None else exog_frame.reindex(balanced.index)
+    Y, X, regression_dates = _prepare_var_regression(balanced, p, balanced_exog)
+    exog_regression = (
+        None if balanced_exog is None else balanced_exog.reindex(regression_dates).copy()
+    )
     balanced_end = balanced.index[-1]
     ragged = differences.loc[differences.index > balanced_end].copy()
 
     state_rows = balanced.iloc[-p:].to_numpy(dtype=float)[::-1]
     last_companion_state = state_rows.reshape(-1)
     level_at_balanced_end = frame.loc[balanced_end].to_numpy(dtype=float)
+    exog_names = [] if exog_frame is None else list(exog_frame.columns)
 
     return {
         "levels": frame,
         "differences": differences,
         "balanced": balanced,
         "ragged": ragged,
+        "exog": exog_frame,
+        "exog_regression": exog_regression,
+        "exog_names": exog_names,
+        "n_exog": len(exog_names),
         "Y": Y,
         "X": X,
         "dates": regression_dates,
         "variables": variables,
         "p": int(p),
         "n": len(variables),
+        "k": int(X.shape[1]),
         "balanced_start": balanced.index[0],
         "balanced_end": balanced_end,
         "last_calendar_date": frame.index[-1],
@@ -282,7 +380,6 @@ def prepare_bvar_panel(
         "n_regression_observations": len(Y),
         "n_ragged_months": len(ragged),
     }
-
 
 def fit_var_ols_from_prepared(prep: Mapping) -> dict:
     Y = np.asarray(prep["Y"], dtype=float)
@@ -319,24 +416,46 @@ def ar1_residual_scales(data: pd.DataFrame | np.ndarray) -> np.ndarray:
 # -----------------------------------------------------------------------------
 
 
-def coefficient_labels(variables: Sequence[str], p: int) -> list[str]:
+def coefficient_labels(
+    variables: Sequence[str],
+    p: int,
+    exog_names: Sequence[str] | None = None,
+) -> list[str]:
     variables = list(variables)
+    exog_names = [] if exog_names is None else list(exog_names)
     labels: list[str] = []
     for equation in variables:
         labels.append(f"{equation}: const")
         for lag in range(1, p + 1):
             labels.extend(f"{equation}: {regressor} L{lag}" for regressor in variables)
+        labels.extend(f"{equation}: {name}" for name in exog_names)
     return labels
 
 
-def make_bvar_svo_prior(prep: Mapping, config: BVARSVOPriorConfig | None = None) -> dict:
+def make_bvar_svo_prior(
+    prep: Mapping,
+    config: BVARSVOPriorConfig | None = None,
+    *,
+    exog_prior_scale: float = 10.0,
+) -> dict:
+    """Build the Minnesota prior plus diffuse deterministic-coefficient priors.
+
+    The lag block follows the Minnesota standard-deviation convention. Each
+    deterministic coefficient has prior mean zero and prior standard deviation
+    ``sigma_i * exog_prior_scale`` in equation ``i``. This is deliberately
+    separate from the lag tightness because seasonal dummies are not VAR slopes.
+    """
     config = BVARSVOPriorConfig() if config is None else config
     config.validate()
     data = prep["balanced"]
     variables = list(prep["variables"])
+    exog_names = list(prep.get("exog_names", []))
+    n_exog = len(exog_names)
+    if n_exog and exog_prior_scale <= 0:
+        raise ValueError("exog_prior_scale must be positive.")
     n = prep["n"]
     p = prep["p"]
-    k = 1 + n * p
+    k = 1 + n * p + n_exog
     scales = ar1_residual_scales(data)
 
     B0 = np.zeros((k, n))
@@ -357,6 +476,8 @@ def make_bvar_svo_prior(prep: Mapping, config: BVARSVOPriorConfig | None = None)
                         / lag**config.lambda3
                     )
                 variances[row, eq] = sd**2
+        if n_exog:
+            variances[1 + n * p :, eq] = (scales[eq] * exog_prior_scale) ** 2
 
     b0 = B0.reshape(-1, order="F")
     v0_diag = variances.reshape(-1, order="F")
@@ -382,7 +503,7 @@ def make_bvar_svo_prior(prep: Mapping, config: BVARSVOPriorConfig | None = None)
         "b0": b0,
         "V0_diag": v0_diag,
         "V0_inv_diag": 1.0 / v0_diag,
-        "coefficient_labels": coefficient_labels(variables, p),
+        "coefficient_labels": coefficient_labels(variables, p, exog_names),
         "scales": scales,
         "a_mean": 0.0,
         "a_var": float(config.a_prior_var),
@@ -393,9 +514,10 @@ def make_bvar_svo_prior(prep: Mapping, config: BVARSVOPriorConfig | None = None)
         "outlier_alpha": float(outlier_alpha),
         "outlier_beta": float(outlier_beta),
         "outlier_grid": grid,
+        "exog_names": exog_names,
+        "exog_prior_scale": float(exog_prior_scale),
         "config": asdict(config),
     }
-
 
 # -----------------------------------------------------------------------------
 # Companion form and linear algebra
@@ -404,14 +526,16 @@ def make_bvar_svo_prior(prep: Mapping, config: BVARSVOPriorConfig | None = None)
 
 def var_companion(B: np.ndarray, n: int, p: int) -> np.ndarray:
     B = np.asarray(B, dtype=float)
-    if B.shape != (1 + n * p, n):
-        raise ValueError(f"B must have shape {(1 + n * p, n)}, got {B.shape}.")
+    minimum_rows = 1 + n * p
+    if B.ndim != 2 or B.shape[1] != n or B.shape[0] < minimum_rows:
+        raise ValueError(
+            f"B must have n={n} columns and at least {minimum_rows} rows; got {B.shape}."
+        )
     F = np.zeros((n * p, n * p))
-    F[:n] = B[1:].T
+    F[:n] = B[1 : 1 + n * p].T
     if p > 1:
         F[n:, :-n] = np.eye(n * (p - 1))
     return F
-
 
 def spectral_radius(B: np.ndarray, n: int, p: int) -> float:
     eig = np.linalg.eigvals(var_companion(B, n, p))
@@ -800,6 +924,8 @@ def gibbs_bvar_sv_outlier(
     levels: pd.DataFrame,
     p: int = 12,
     variables: Sequence[str] | None = None,
+    exog: pd.DataFrame | None = None,
+    exog_prior_scale: float = 10.0,
     prior_config: BVARSVOPriorConfig | None = None,
     sampler_config: SamplerConfig | None = None,
 ) -> dict:
@@ -808,8 +934,12 @@ def gibbs_bvar_sv_outlier(
     sampler_config = SamplerConfig() if sampler_config is None else sampler_config
     prior_config.validate()
     sampler_config.validate()
-    prep = prepare_bvar_panel(levels, p=p, variables=variables)
-    prior = make_bvar_svo_prior(prep, prior_config)
+    prep = prepare_bvar_panel(levels, p=p, variables=variables, exog=exog)
+    prior = make_bvar_svo_prior(
+        prep,
+        prior_config,
+        exog_prior_scale=exog_prior_scale,
+    )
     Y = prep["Y"]
     X = prep["X"]
     T, n = Y.shape
@@ -956,12 +1086,13 @@ def gibbs_bvar_sv_outlier(
         ),
         "n_draws": len(out_B),
         "variables": list(prep["variables"]),
+        "exog_names": list(prep["exog_names"]),
+        "exog_prior_scale": float(exog_prior_scale),
         "p": p,
         "sv_sampler": sampler_config.sv_sampler,
         "outlier_support": prior["outlier_grid"].copy(),
     }
     return result
-
 
 # -----------------------------------------------------------------------------
 # Posterior summaries and diagnostics
@@ -1199,30 +1330,84 @@ def _durbin_koopman_companion_draw(
     covariance_sequence: np.ndarray,
     initial_companion_state: np.ndarray,
     rng: np.random.Generator,
+    *,
+    exog_path: np.ndarray | None = None,
+    p: int | None = None,
 ) -> np.ndarray:
     endog = np.asarray(endog, dtype=float)
     covariance_sequence = np.asarray(covariance_sequence, dtype=float)
     L, n = endog.shape
-    p = (B.shape[0] - 1) // n
+
+    # Preserve the original no-exog code path exactly. This guarantees that the
+    # validated gas model consumes the random-number stream in the same order.
+    if exog_path is None:
+        inferred_p = (B.shape[0] - 1) // n
+        if covariance_sequence.shape != (L, n, n):
+            raise ValueError("covariance_sequence must have shape (L, n, n).")
+        F, intercept, selection, design = _companion_components(B, n, inferred_p)
+        k_states = n * inferred_p
+
+        initial_mean = intercept + F @ np.asarray(initial_companion_state, dtype=float)
+        initial_cov = selection @ covariance_sequence[0] @ selection.T
+
+        model = MLEModel(endog=endog, k_states=k_states, k_posdef=n)
+        model["design"] = design
+        model["obs_cov"] = np.zeros((n, n))
+        model["transition"] = F
+        model["state_intercept"] = intercept
+        model["selection"] = selection
+
+        transition_covariance = np.empty_like(covariance_sequence)
+        if L > 1:
+            transition_covariance[:-1] = covariance_sequence[1:]
+        transition_covariance[-1] = covariance_sequence[-1]
+        model["state_cov"] = np.moveaxis(transition_covariance, 0, -1)
+        model.initialize_known(initial_mean, 0.5 * (initial_cov + initial_cov.T))
+
+        simulator = model.simulation_smoother(method="kfs")
+        simulator.simulate(random_state=rng)
+        return simulator.simulated_state.T.copy()
+
+    if p is None or p < 1:
+        raise ValueError("p must be supplied when exog_path is used.")
+    exog_path = np.asarray(exog_path, dtype=float)
+    if exog_path.ndim != 2 or exog_path.shape[0] != L:
+        raise ValueError("exog_path must have shape (L, n_exog).")
+    n_exog = exog_path.shape[1]
+    expected_rows = 1 + n * p + n_exog
+    if B.shape != (expected_rows, n):
+        raise ValueError(
+            f"With {n_exog} exogenous regressors B must have shape "
+            f"{(expected_rows, n)}, got {B.shape}."
+        )
     if covariance_sequence.shape != (L, n, n):
         raise ValueError("covariance_sequence must have shape (L, n, n).")
+
     F, intercept, selection, design = _companion_components(B, n, p)
     k_states = n * p
+    exog_coefficients = B[1 + n * p :]
+    state_intercepts = np.zeros((L, k_states))
+    state_intercepts[:, :n] = B[0][None, :] + exog_path @ exog_coefficients
 
-    initial_mean = intercept + F @ np.asarray(initial_companion_state, dtype=float)
+    initial_mean = state_intercepts[0] + F @ np.asarray(initial_companion_state, dtype=float)
     initial_cov = selection @ covariance_sequence[0] @ selection.T
 
     model = MLEModel(endog=endog, k_states=k_states, k_posdef=n)
     model["design"] = design
     model["obs_cov"] = np.zeros((n, n))
     model["transition"] = F
-    model["state_intercept"] = intercept
     model["selection"] = selection
 
+    # The first state is initialized explicitly. Transition t -> t+1 therefore
+    # uses the deterministic term and covariance of period t+1.
+    transition_intercepts = np.empty_like(state_intercepts)
     transition_covariance = np.empty_like(covariance_sequence)
     if L > 1:
+        transition_intercepts[:-1] = state_intercepts[1:]
         transition_covariance[:-1] = covariance_sequence[1:]
+    transition_intercepts[-1] = state_intercepts[-1]
     transition_covariance[-1] = covariance_sequence[-1]
+    model["state_intercept"] = np.moveaxis(transition_intercepts, 0, -1)
     model["state_cov"] = np.moveaxis(transition_covariance, 0, -1)
     model.initialize_known(initial_mean, 0.5 * (initial_cov + initial_cov.T))
 
@@ -1259,19 +1444,57 @@ def _normalise_level_conditions(
     return out
 
 
+def _forecast_exog_path(
+    prep: Mapping,
+    tail_dates: pd.DatetimeIndex,
+    future_dates: pd.DatetimeIndex,
+    future_exog: pd.DataFrame | None,
+) -> pd.DataFrame | None:
+    names = list(prep.get("exog_names", []))
+    if not names:
+        if future_exog is not None and future_exog.shape[1]:
+            raise ValueError("future_exog was supplied but the fitted model has no exogenous regressors.")
+        return None
+
+    historical = prep.get("exog")
+    if historical is None:
+        raise ValueError("The fitted result is missing its historical exogenous regressors.")
+    historical_tail = historical.reindex(tail_dates)[names]
+    if historical_tail.isna().any().any():
+        raise ValueError("Historical exogenous values are missing in the ragged edge.")
+    if future_exog is None:
+        raise ValueError(
+            "This model contains deterministic/exogenous regressors. Supply "
+            "future_exog for every future forecast date."
+        )
+    future = _normalise_monthly_exog(future_exog, future_dates)
+    if future is None:
+        raise ValueError("future_exog must contain the fitted exogenous columns.")
+    missing = [name for name in names if name not in future.columns]
+    extra = [name for name in future.columns if name not in names]
+    if missing or extra:
+        raise ValueError(
+            f"future_exog columns must exactly match {names}; missing={missing}, extra={extra}."
+        )
+    future = future[names]
+    return pd.concat([historical_tail, future]).sort_index()
+
+
 def forecast_bvar_sv_outlier(
     result: Mapping,
     H: int = 12,
     level_conditions: Mapping[str, float | Sequence[float]] | None = None,
+    future_exog: pd.DataFrame | None = None,
     n_draws: int | None = None,
     simulate_future_outliers: bool = True,
     seed: int = 123,
 ) -> dict:
     """Draw ragged-edge nowcasts and future forecasts with DK smoothing.
 
-    Conditions are supplied as future *level paths*. They are converted to
-    exact future absolute changes and entered as observed values in the
-    state-space system; all unconstrained variables remain missing.
+    Level conditions are converted into exact future absolute changes. When the
+    fitted model contains deterministic regressors, ``future_exog`` must provide
+    their known values for every future date; the historical ragged-edge values
+    are taken directly from the fitted model object.
     """
     if H < 1:
         raise ValueError("H must be at least 1.")
@@ -1287,11 +1510,10 @@ def forecast_bvar_sv_outlier(
     path_dates = tail_dates.append(future_dates)
     tail_length = len(tail_dates)
     L = len(path_dates)
+    exog_path_frame = _forecast_exog_path(prep, tail_dates, future_dates, future_exog)
+    exog_path = None if exog_path_frame is None else exog_path_frame.reindex(path_dates).to_numpy(dtype=float)
 
     observed_changes = levels.diff().reindex(path_dates)
-    # pandas may expose a read-only NumPy view (notably with Copy-on-Write).
-    # The template is mutated below when future observations are set to NaN
-    # and conditioning paths are inserted, so force an independent writable copy.
     endog_template = observed_changes.to_numpy(dtype=float, copy=True)
     if H:
         endog_template[tail_length:] = np.nan
@@ -1339,6 +1561,8 @@ def forecast_bvar_sv_outlier(
             Sigma_path,
             prep["last_companion_state"],
             rng,
+            exog_path=exog_path,
+            p=prep["p"] if exog_path is not None else None,
         )
         diff_path = state_path[:, :n]
         diff_paths[out_index] = diff_path
@@ -1360,12 +1584,14 @@ def forecast_bvar_sv_outlier(
         "variables": variables,
         "draw_indices": draw_indices,
         "level_conditions": conditions,
+        "exog_names": list(prep.get("exog_names", [])),
+        "exog_path": exog_path_frame,
+        "future_exog": None if exog_path_frame is None else exog_path_frame.reindex(future_dates),
         "simulate_future_outliers": bool(simulate_future_outliers),
         "balanced_end": prep["balanced_end"],
         "last_calendar_date": prep["last_calendar_date"],
         "H": H,
     }
-
 
 # -----------------------------------------------------------------------------
 # Lightweight posterior predictive check
@@ -1385,6 +1611,8 @@ def posterior_predictive_statistics(
     available = len(result["B"])
     indices = np.arange(available) if n_draws >= available else rng.choice(available, n_draws, replace=False)
     replicated = []
+    exog_regression = result["prep"].get("exog_regression")
+    exog_values = None if exog_regression is None else exog_regression.to_numpy(dtype=float)
 
     initial = result["prep"]["balanced"].iloc[:p].to_numpy(dtype=float)
     for draw_index in indices:
@@ -1396,7 +1624,10 @@ def posterior_predictive_statistics(
         history = [row.copy() for row in initial]
         path = np.empty_like(Y)
         for t in range(len(Y)):
-            x = np.r_[1.0, np.concatenate(history[-p:][::-1])]
+            x_parts = [np.array([1.0]), np.concatenate(history[-p:][::-1])]
+            if exog_values is not None:
+                x_parts.append(exog_values[t])
+            x = np.concatenate(x_parts)
             structural_shock = o[t] * np.exp(0.5 * log_h[t]) * rng.standard_normal(n)
             y_new = x @ B + Ainv @ structural_shock
             path[t] = y_new
@@ -1435,7 +1666,6 @@ def posterior_predictive_statistics(
     )
     draws = pd.DataFrame(np.column_stack(rep_columns), columns=labels)
     return summary, draws
-
 
 # -----------------------------------------------------------------------------
 # Presentation-oriented tables
@@ -1579,13 +1809,14 @@ def forecast_horizon_table(
 
 
 def _var_lag_matrices(B: np.ndarray, n: int, p: int) -> list[np.ndarray]:
-    """Return VAR lag matrices B_1,...,B_p from the module's (k,n) convention."""
+    """Return VAR lag matrices B_1,...,B_p, ignoring deterministic rows."""
     B = np.asarray(B, dtype=float)
-    expected = 1 + n * p
-    if B.shape != (expected, n):
-        raise ValueError(f"B must have shape {(expected, n)}, got {B.shape}.")
+    minimum_rows = 1 + n * p
+    if B.ndim != 2 or B.shape[1] != n or B.shape[0] < minimum_rows:
+        raise ValueError(
+            f"B must have n={n} columns and at least {minimum_rows} rows; got {B.shape}."
+        )
     return [B[1 + lag * n : 1 + (lag + 1) * n].T for lag in range(p)]
-
 
 def _reference_regression_index(result: Mapping, reference_date=None) -> tuple[int, pd.Timestamp]:
     dates = pd.DatetimeIndex(result["prep"]["dates"])
@@ -2021,6 +2252,12 @@ def historical_decomposition(
         for r in range(T):
             t = p + r
             base_full[t] = B[0]
+            exog_regression = prep.get("exog_regression")
+            if exog_regression is not None:
+                base_full[t] += (
+                    exog_regression.iloc[r].to_numpy(dtype=float)
+                    @ B[1 + n * p :]
+                )
             for lag in range(1, p + 1):
                 base_full[t] += lag_mats[lag - 1] @ base_full[t - lag]
                 for c in range(n_components):
@@ -2078,13 +2315,21 @@ def _stable_json(value) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
 
 
-def hash_model_data(levels: pd.DataFrame) -> str:
-    """Hash the exact transformed-input panel passed to the model."""
+def hash_model_data(
+    levels: pd.DataFrame,
+    exog: pd.DataFrame | None = None,
+) -> str:
+    """Hash the exact endogenous levels and deterministic inputs passed to the model."""
     frame = levels.copy()
     digest = hashlib.sha256()
     digest.update(_stable_json(list(frame.columns)).encode("utf-8"))
     digest.update(pd.util.hash_pandas_object(frame.index, index=True).values.tobytes())
     digest.update(pd.util.hash_pandas_object(frame, index=True).values.tobytes())
+    if exog is not None and exog.shape[1]:
+        deterministic = exog.reindex(frame.index).copy()
+        digest.update(b"|exog|")
+        digest.update(_stable_json(list(deterministic.columns)).encode("utf-8"))
+        digest.update(pd.util.hash_pandas_object(deterministic, index=True).values.tobytes())
     return digest.hexdigest()
 
 
@@ -2094,6 +2339,8 @@ def hash_run_config(
     *,
     p: int,
     variables: Sequence[str],
+    exog_names: Sequence[str] | None = None,
+    exog_prior_scale: float = 10.0,
 ) -> str:
     payload = {
         "p": int(p),
@@ -2101,6 +2348,12 @@ def hash_run_config(
         "prior": asdict(prior_config),
         "sampler": asdict(sampler_config),
     }
+    names = [] if exog_names is None else list(exog_names)
+    if names:
+        payload["deterministic"] = {
+            "names": names,
+            "prior_scale": float(exog_prior_scale),
+        }
     return hashlib.sha256(_stable_json(payload).encode("utf-8")).hexdigest()
 
 
@@ -2113,15 +2366,20 @@ def build_run_metadata(
     variables: Sequence[str],
     prior_config: BVARSVOPriorConfig,
     sampler_config: SamplerConfig,
+    exog: pd.DataFrame | None = None,
+    exog_prior_scale: float = 10.0,
     code_version: str = "unversioned",
-    result_schema_version: str = "1.0",
+    result_schema_version: str = "1.1",
 ) -> dict:
-    data_hash = hash_model_data(levels)
+    exog_names = [] if exog is None else list(exog.columns)
+    data_hash = hash_model_data(levels, exog)
     config_hash = hash_run_config(
         prior_config,
         sampler_config,
         p=p,
         variables=variables,
+        exog_names=exog_names,
+        exog_prior_scale=exog_prior_scale,
     )
     identity = {
         "model_id": str(model_id),
@@ -2138,6 +2396,8 @@ def build_run_metadata(
         "result_schema_version": result_schema_version,
         "frequency": "monthly",
         "variables": list(variables),
+        "exog_names": exog_names,
+        "exog_prior_scale": float(exog_prior_scale) if exog_names else None,
         "p": int(p),
         "n_observations": int(len(levels)),
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -2151,6 +2411,8 @@ def run_energy_bvar(
     vintage: str,
     p: int = 12,
     variables: Sequence[str] | None = None,
+    exog: pd.DataFrame | None = None,
+    exog_prior_scale: float = 10.0,
     prior_config: BVARSVOPriorConfig | None = None,
     sampler_config: SamplerConfig | None = None,
     code_version: str = "unversioned",
@@ -2163,22 +2425,25 @@ def run_energy_bvar(
         levels=levels,
         p=p,
         variables=variables,
+        exog=exog,
+        exog_prior_scale=exog_prior_scale,
         prior_config=prior_config,
         sampler_config=sampler_config,
     )
+    normalised_exog = result["prep"].get("exog")
     result["metadata"] = build_run_metadata(
         model_id=model_id,
         vintage=vintage,
-        levels=levels[variables],
+        levels=result["prep"]["levels"][variables],
         p=p,
         variables=variables,
+        exog=normalised_exog,
+        exog_prior_scale=exog_prior_scale,
         prior_config=prior_config,
         sampler_config=sampler_config,
         code_version=code_version,
     )
     return result
-
-
 
 # Backward-compatible structural aliases. New notebooks should use the generic names.
 recursive_impact_draws_gas = recursive_impact_draws
@@ -2192,6 +2457,7 @@ __all__ = [
     "BVARSVOPriorConfig",
     "SamplerConfig",
     "load_energy_panel",
+    "monthly_seasonal_dummies",
     "prepare_bvar_panel",
     "fit_var_ols_from_prepared",
     "make_bvar_svo_prior",

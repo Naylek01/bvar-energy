@@ -194,22 +194,30 @@ def style_numeric_table(
     )
 
 
-def plot_data_levels(levels: pd.DataFrame, last_obs: int | None = None):
+def plot_data_levels(
+    levels: pd.DataFrame,
+    last_obs: int | None = None,
+    units: Mapping[str, str] | None = None,
+):
     data = levels if last_obs is None else levels.iloc[-last_obs:]
     n = data.shape[1]
     fig, axes = plt.subplots(n, 1, figsize=(11, 3.0 * n), sharex=True)
     for ax, column in zip(_axes_array(axes), data.columns):
         ax.plot(data.index, data[column], linewidth=1.2)
         ax.set_title(column)
-        ax.set_ylabel("EUR/MWh")
+        ax.set_ylabel((units or {}).get(column, "EUR/MWh"))
         ax.grid(alpha=0.25)
     _axes_array(axes)[-1].set_xlabel("Date")
-    fig.suptitle("Gas-model input series in levels")
+    fig.suptitle("Energy-model input series in levels")
     fig.tight_layout()
     return fig
 
 
-def plot_absolute_differences(differences: pd.DataFrame, last_obs: int | None = None):
+def plot_absolute_differences(
+    differences: pd.DataFrame,
+    last_obs: int | None = None,
+    units: Mapping[str, str] | None = None,
+):
     data = differences if last_obs is None else differences.iloc[-last_obs:]
     n = data.shape[1]
     fig, axes = plt.subplots(n, 1, figsize=(11, 3.0 * n), sharex=True)
@@ -217,13 +225,12 @@ def plot_absolute_differences(differences: pd.DataFrame, last_obs: int | None = 
         ax.plot(data.index, data[column], linewidth=1.0)
         ax.axhline(0.0, linewidth=0.8)
         ax.set_title(rf"Absolute change: {column}")
-        ax.set_ylabel("EUR/MWh")
+        ax.set_ylabel((units or {}).get(column, "EUR/MWh"))
         ax.grid(alpha=0.25)
     _axes_array(axes)[-1].set_xlabel("Date")
     fig.suptitle(r"Model transformation: $\Delta P_t=P_t-P_{t-1}$")
     fig.tight_layout()
     return fig
-
 
 def plot_minnesota_prior_by_equation(prior: Mapping, variables: Sequence[str], p: int):
     """Plot only the informative lag-decay profile, one figure per equation.
@@ -238,8 +245,13 @@ def plot_minnesota_prior_by_equation(prior: Mapping, variables: Sequence[str], p
     if n == 0 or p < 1:
         raise ValueError("variables must be non-empty and p must be positive.")
 
-    k = 1 + n * p
-    sd = np.sqrt(np.asarray(prior["V0_diag"], dtype=float).reshape(k, n, order="F"))
+    prior_variances = np.asarray(prior["V0_diag"], dtype=float)
+    if prior_variances.size % n:
+        raise ValueError("The coefficient-prior vector is incompatible with the number of equations.")
+    k = prior_variances.size // n
+    if k < 1 + n * p:
+        raise ValueError("The coefficient prior does not contain the requested VAR lag block.")
+    sd = np.sqrt(prior_variances.reshape(k, n, order="F"))
     config = dict(prior.get("config", {}))
     lambda1 = float(config.get("lambda1", np.nan))
     lambda2 = float(config.get("lambda2", np.nan))
@@ -437,7 +449,7 @@ def plot_coefficient_heatmap(
         raise ValueError(f"Unknown equations: {unknown}")
     rows = ["constant"] + [
         f"{name} lag {lag}" for lag in range(1, p + 1) for name in variables
-    ]
+    ] + list(result.get("exog_names", result.get("prep", {}).get("exog_names", [])))
     figures = {}
     for name in equations:
         eq = variables.index(name)
@@ -1127,12 +1139,13 @@ def plot_hicp_forecast_fan(
     hicp_forecast: Mapping,
     kind: str = "yoy",
     last_obs: int = 72,
+    component_label: str = "gas",
 ):
     """Plot HICP history, orange nowcast and blue forecast without a gap."""
     if kind == "yoy":
         paths = np.asarray(hicp_forecast["hicp_yoy_paths"], dtype=float)
         ylabel = "Year-on-year percent"
-        title = "HICP gas inflation — nowcast and forecast"
+        title = f"HICP {component_label} inflation — nowcast and forecast"
         actual = 100.0 * (
             hicp_forecast["actual_hicp"]
             / hicp_forecast["actual_hicp"].shift(12)
@@ -1141,7 +1154,7 @@ def plot_hicp_forecast_fan(
     elif kind == "level":
         paths = np.asarray(hicp_forecast["hicp_level_paths"], dtype=float)
         ylabel = "Index"
-        title = "HICP gas index — nowcast and forecast"
+        title = f"HICP {component_label} index — nowcast and forecast"
         actual = hicp_forecast["actual_hicp"]
     else:
         raise ValueError("kind must be 'yoy' or 'level'.")
@@ -1309,6 +1322,8 @@ def plot_gas_irf(
     cumulative: bool = True,
     credible_intervals: Sequence[float] = (0.05, 0.16, 0.84, 0.95),
     title: str | None = None,
+    units: Mapping[str, str] | None = None,
+    horizon_unit: str = "months",
 ):
     """Plot posterior IRFs for every response-shock pair."""
     key = "cumulative_level_irfs" if cumulative else "change_irfs"
@@ -1328,6 +1343,7 @@ def plot_gas_irf(
         sharex=True,
     )
     for i, response in enumerate(variables):
+        response_unit = (units or {}).get(response, "response units")
         for j, shock in enumerate(shocks):
             ax = axes[i, j]
             ax.fill_between(horizons, q05[:, i, j], q95[:, i, j], alpha=0.15, label="90% interval")
@@ -1337,25 +1353,29 @@ def plot_gas_irf(
             ax.set_title(f"{response} ← {shock}")
             ax.grid(alpha=0.22)
             if i == n_response - 1:
-                ax.set_xlabel("Months after shock")
+                ax.set_xlabel(f"{horizon_unit.capitalize()} after shock")
             if j == 0:
-                ax.set_ylabel("Cumulative EUR/MWh" if cumulative else "Monthly change (EUR/MWh)")
+                ax.set_ylabel(
+                    f"Cumulative {response_unit}"
+                    if cumulative
+                    else f"Change ({response_unit})"
+                )
     handles, labels = axes[0, 0].get_legend_handles_labels()
     fig.legend(handles, labels, frameon=False, ncol=3, loc="lower center")
     identification = irf_result.get("identification", "structural")
     default_title = (
-        f"{'Cumulative level' if cumulative else 'Monthly-change'} impulse responses "
+        f"{'Cumulative level' if cumulative else 'Change'} impulse responses "
         f"— {identification.replace('_', ' ')} identification"
     )
     fig.suptitle(title or default_title, y=1.01)
     fig.tight_layout(rect=(0, 0.06, 1, 1))
     return fig
 
-
 def plot_gas_fevd(
     fevd_result: Mapping,
     responses: Sequence[str] | None = None,
     title: str | None = None,
+    horizon_unit: str = "months",
 ):
     """Plot posterior-median FEVD shares as stacked areas by response variable."""
     draws = np.asarray(fevd_result["fevd_draws"], dtype=float)
@@ -1380,7 +1400,7 @@ def plot_gas_fevd(
         ax.set_title(f"Forecast-error variance of {response}")
         ax.grid(axis="y", alpha=0.22)
         ax.legend(frameon=False, ncol=min(3, len(shocks)), loc="upper right")
-    axes[-1, 0].set_xlabel("Forecast horizon (months)")
+    axes[-1, 0].set_xlabel(f"Forecast horizon ({horizon_unit})")
     default_title = f"Forecast error variance decomposition — {fevd_result.get('identification', 'structural').replace('_', ' ')}"
     fig.suptitle(title or default_title, y=1.01)
     fig.tight_layout()
@@ -1392,6 +1412,7 @@ def plot_gas_historical_decomposition(
     response: str,
     last_obs: int | None = None,
     title: str | None = None,
+    unit: str = "EUR/MWh",
 ):
     """Plot posterior-mean historical contributions, preserving exact additivity."""
     variables = list(hd_result["variables"])
@@ -1424,7 +1445,7 @@ def plot_gas_historical_decomposition(
     ax.plot(dates, observed, linewidth=1.5, color="0.10", label="Observed monthly change")
     ax.plot(dates, base, linewidth=1.0, linestyle="--", color="0.40", label="Base / initial conditions")
     ax.axhline(0.0, linewidth=0.8, color="0.35")
-    ax.set_ylabel("EUR/MWh monthly change")
+    ax.set_ylabel(f"Monthly change ({unit})")
     ax.set_title(title or f"Historical decomposition — {response}")
     ax.grid(alpha=0.20)
     ax.legend(frameon=False, ncol=2, loc="upper left")
@@ -1456,6 +1477,9 @@ __all__ = [
     "plot_gas_irf",
     "plot_gas_fevd",
     "plot_gas_historical_decomposition",
+    "plot_impulse_responses",
+    "plot_fevd",
+    "plot_historical_decomposition",
 ]
 
 
