@@ -1415,215 +1415,6 @@ def _durbin_koopman_companion_draw(
     simulator.simulate(random_state=rng)
     return simulator.simulated_state.T.copy()
 
-# RAGGED_EDGE_LEVEL_STATE_FIX_2026_08_06_V3
-def _durbin_koopman_level_draw(
-    level_endog: np.ndarray,
-    B: np.ndarray,
-    covariance_sequence: np.ndarray,
-    initial_companion_state: np.ndarray,
-    rng: np.random.Generator,
-    *,
-    exog_path: np.ndarray | None = None,
-    p: int,
-) -> np.ndarray:
-    """Jointly draw missing changes and cumulative levels.
-
-    The VAR is estimated in monthly absolute changes. To condition on future
-    levels without pre-differencing around a ragged edge, the difference
-    companion state is augmented with
-
-        cumulative_t = level_t - level_at_balanced_end.
-
-    ``level_endog`` observes this cumulative-level block directly. Published
-    ragged-edge levels and future level conditions are exact observations;
-    unpublished values remain NaN and are drawn jointly by the simulation
-    smoother.
-    """
-    level_endog = np.asarray(level_endog, dtype=float)
-    B = np.asarray(B, dtype=float)
-    covariance_sequence = np.asarray(covariance_sequence, dtype=float)
-    initial_companion_state = np.asarray(
-        initial_companion_state, dtype=float
-    ).reshape(-1)
-
-    if level_endog.ndim != 2:
-        raise ValueError("level_endog must be a two-dimensional array.")
-    L, n = level_endog.shape
-    if L < 1:
-        raise ValueError("The state-space forecast path is empty.")
-    if p < 1:
-        raise ValueError("p must be at least 1.")
-    if initial_companion_state.shape != (n * p,):
-        raise ValueError(
-            "initial_companion_state must have shape "
-            f"{(n * p,)}, got {initial_companion_state.shape}."
-        )
-    if covariance_sequence.shape != (L, n, n):
-        raise ValueError(
-            f"covariance_sequence must have shape {(L, n, n)}, "
-            f"got {covariance_sequence.shape}."
-        )
-    if not np.all(np.isfinite(covariance_sequence)):
-        raise ValueError("covariance_sequence must be finite.")
-
-    minimum_rows = 1 + n * p
-    if B.ndim != 2 or B.shape[1] != n or B.shape[0] < minimum_rows:
-        raise ValueError(
-            f"B must have at least {minimum_rows} rows and {n} columns; "
-            f"got {B.shape}."
-        )
-
-    n_exog = B.shape[0] - minimum_rows
-    if n_exog == 0:
-        if exog_path is not None:
-            candidate = np.asarray(exog_path, dtype=float)
-            if candidate.size:
-                raise ValueError(
-                    "exog_path was supplied but this posterior draw has no "
-                    "exogenous coefficient rows."
-                )
-        intercept_path = np.repeat(B[0][None, :], L, axis=0)
-    else:
-        if exog_path is None:
-            raise ValueError(
-                f"This posterior draw has {n_exog} exogenous coefficient "
-                "rows; exog_path is required."
-            )
-        exog_path = np.asarray(exog_path, dtype=float)
-        if exog_path.shape != (L, n_exog):
-            raise ValueError(
-                f"exog_path must have shape {(L, n_exog)}, "
-                f"got {exog_path.shape}."
-            )
-        if not np.all(np.isfinite(exog_path)):
-            raise ValueError("exog_path must be finite.")
-        intercept_path = B[0][None, :] + exog_path @ B[minimum_rows:]
-
-    companion_size = n * p
-    F = var_companion(B, n=n, p=p)
-    selection = np.vstack(
-        [np.eye(n), np.zeros((n * (p - 1), n))]
-    )
-    J = np.hstack(
-        [np.eye(n), np.zeros((n, companion_size - n))]
-    )
-    # Explicit shape contracts. These make any future dimension regression
-    # point at the offending matrix by name instead of surfacing as an
-    # opaque broadcasting error deep inside statsmodels.
-    assert F.shape == (companion_size, companion_size), (
-        f"F must be {(companion_size, companion_size)}, got {F.shape}."
-    )
-    assert selection.shape == (companion_size, n), (
-        f"selection must be {(companion_size, n)}, got {selection.shape}."
-    )
-    assert J.shape == (n, companion_size), (
-        f"J must be {(n, companion_size)}, got {J.shape}."
-    )
-    assert intercept_path.shape == (L, n), (
-        f"intercept_path must be {(L, n)}, got {intercept_path.shape}."
-    )
-
-    # Augmented state:
-    #   [difference companion_t,
-    #    level_t - level_at_balanced_end]
-    F_aug = np.block(
-        [
-            [F, np.zeros((companion_size, n))],
-            [J @ F, np.eye(n)],
-        ]
-    )
-    selection_aug = np.vstack([selection, np.eye(n)])
-    design_aug = np.hstack(
-        [np.zeros((n, companion_size)), np.eye(n)]
-    )
-
-    assert F_aug.shape == (companion_size + n, companion_size + n), (
-        f"F_aug must be {(companion_size + n,) * 2}, got {F_aug.shape}."
-    )
-    assert selection_aug.shape == (companion_size + n, n), (
-        f"selection_aug must be {(companion_size + n, n)}, "
-        f"got {selection_aug.shape}."
-    )
-    assert design_aug.shape == (n, companion_size + n), (
-        f"design_aug must be {(n, companion_size + n)}, "
-        f"got {design_aug.shape}."
-    )
-
-    # State 0 corresponds to the first ragged-edge/path date. The same
-    # innovation drives its current difference and cumulative level.
-    #
-    # The intercept is an n-vector but the companion state has length n*p.
-    # It enters ONLY the leading contemporaneous block; the lag blocks carry
-    # no intercept. Adding it to the whole companion vector is a dimension
-    # error for p > 1 (and silently wrong-free only because n*p == n at p=1).
-    first_companion_mean = F @ initial_companion_state
-    assert first_companion_mean.shape == (companion_size,), (
-        f"F @ initial_companion_state must be {(companion_size,)}, "
-        f"got {first_companion_mean.shape}."
-    )
-    first_companion_mean[:n] += intercept_path[0]
-
-    # cumulative_0 = cumulative_{-1} + delta_0 = 0 + J @ companion_0, since
-    # the cumulative state is measured from level_at_balanced_end.
-    initial_mean = np.concatenate(
-        [first_companion_mean, J @ first_companion_mean]
-    )
-    assert initial_mean.shape == (companion_size + n,), (
-        f"initial_mean must be {(companion_size + n,)}, "
-        f"got {initial_mean.shape}."
-    )
-    initial_cov = (
-        selection_aug
-        @ covariance_sequence[0]
-        @ selection_aug.T
-    )
-
-    # statsmodels column t governs the transition from state t to state t+1.
-    transition_intercepts = np.empty_like(intercept_path)
-    transition_covariance = np.empty_like(covariance_sequence)
-    if L > 1:
-        transition_intercepts[:-1] = intercept_path[1:]
-        transition_covariance[:-1] = covariance_sequence[1:]
-    transition_intercepts[-1] = intercept_path[-1]
-    transition_covariance[-1] = covariance_sequence[-1]
-
-    # Same asymmetry as above, in matrix form: transition_intercepts.T is
-    # (n, L) but the companion block of the state intercept is
-    # (companion_size, L). Embed the n-vector in the leading block and let
-    # the cumulative-level block inherit it through J.
-    companion_intercepts = np.zeros((companion_size, L))
-    companion_intercepts[:n] = transition_intercepts.T
-    state_intercept_aug = np.vstack(
-        [companion_intercepts, J @ companion_intercepts]
-    )
-    assert state_intercept_aug.shape == (companion_size + n, L), (
-        f"state_intercept_aug must be {(companion_size + n, L)}, "
-        f"got {state_intercept_aug.shape}."
-    )
-
-    model = MLEModel(
-        endog=level_endog,
-        k_states=companion_size + n,
-        k_posdef=n,
-    )
-    model["design"] = design_aug
-    model["obs_cov"] = np.zeros((n, n))
-    model["transition"] = F_aug
-    model["state_intercept"] = state_intercept_aug
-    model["selection"] = selection_aug
-    model["state_cov"] = np.moveaxis(
-        transition_covariance, 0, -1
-    )
-    model.initialize_known(
-        initial_mean,
-        0.5 * (initial_cov + initial_cov.T),
-    )
-
-    simulator = model.simulation_smoother(method="kfs")
-    simulator.simulate(random_state=rng)
-    return simulator.simulated_state.T.copy()
-
-
 
 def _normalise_level_conditions(
     conditions: Mapping[str, float | Sequence[float]] | None,
@@ -1631,42 +1422,26 @@ def _normalise_level_conditions(
     H: int,
     levels: pd.DataFrame,
 ) -> dict[str, np.ndarray]:
-    """Validate future level paths without requiring a balanced panel edge.
-
-    A conditioned variable only needs at least one observed historical
-    level.  Any missing months between its last observation and the first
-    future condition remain missing observations and are drawn jointly by
-    the augmented Durbin--Koopman smoother.
-    """
     if conditions is None:
         return {}
-
     out: dict[str, np.ndarray] = {}
     for variable, value in conditions.items():
         if variable not in variables:
             raise ValueError(f"Unknown conditioned variable {variable!r}.")
-
         arr = np.asarray(value, dtype=float)
         if arr.ndim == 0:
             arr = np.repeat(float(arr), H)
         if arr.ndim != 1 or len(arr) != H:
-            raise ValueError(
-                f"Condition for {variable!r} must be scalar or length H={H}."
-            )
+            raise ValueError(f"Condition for {variable!r} must be scalar or length H={H}.")
         if not np.all(np.isfinite(arr)):
+            raise ValueError("Level conditions must be finite; omit unconstrained variables instead.")
+        if not np.isfinite(levels[variable].iloc[-1]):
             raise ValueError(
-                "Level conditions must be finite; omit unconstrained "
-                "variables instead."
-            )
-        if levels[variable].dropna().empty:
-            raise ValueError(
-                f"No observed historical level is available for "
-                f"conditioned variable {variable!r}."
+                f"The latest level of conditioned variable {variable!r} is missing. "
+                "A future level path cannot be converted into exact differences."
             )
         out[variable] = arr
-
     return out
-
 
 
 def _forecast_exog_path(
@@ -1716,12 +1491,10 @@ def forecast_bvar_sv_outlier(
 ) -> dict:
     """Draw ragged-edge nowcasts and future forecasts with DK smoothing.
 
-    Future level conditions enter an augmented state-space directly as exact
-    cumulative-level observations. Missing ragged-edge levels remain NaN and
-    are drawn jointly with the conditioned future path; no fixed-anchor
-    pre-differencing is performed. When the fitted model contains deterministic
-    regressors, ``future_exog`` must provide their known values for every future
-    date, while historical ragged-edge values come from the fitted model object.
+    Level conditions are converted into exact future absolute changes. When the
+    fitted model contains deterministic regressors, ``future_exog`` must provide
+    their known values for every future date; the historical ragged-edge values
+    are taken directly from the fitted model object.
     """
     if H < 1:
         raise ValueError("H must be at least 1.")
@@ -1740,24 +1513,14 @@ def forecast_bvar_sv_outlier(
     exog_path_frame = _forecast_exog_path(prep, tail_dates, future_dates, future_exog)
     exog_path = None if exog_path_frame is None else exog_path_frame.reindex(path_dates).to_numpy(dtype=float)
 
-    # Conditions are observations of the cumulative-level state, not
-    # pre-computed monthly differences.  Observed ragged-edge levels stay
-    # observed; unpublished months stay NaN and are drawn jointly.
-    base_level = np.asarray(
-        prep["level_at_balanced_end"], dtype=float
-    )
-    level_endog_template = (
-        levels.reindex(path_dates)
-        .to_numpy(dtype=float, copy=True)
-        - base_level[None, :]
-    )
+    observed_changes = levels.diff().reindex(path_dates)
+    endog_template = observed_changes.to_numpy(dtype=float, copy=True)
     if H:
-        level_endog_template[tail_length:] = np.nan
+        endog_template[tail_length:] = np.nan
     for variable, path in conditions.items():
         column = variables.index(variable)
-        level_endog_template[tail_length:, column] = (
-            path - base_level[column]
-        )
+        previous = float(levels[variable].iloc[-1])
+        endog_template[tail_length:, column] = np.diff(np.r_[previous, path])
 
     available_draws = len(result["B"])
     if n_draws is None or n_draws >= available_draws:
@@ -1792,24 +1555,18 @@ def forecast_bvar_sv_outlier(
             o_path = np.ones((L, n))
 
         Sigma_path = build_time_varying_covariances(A, h_path, o_path)
-        state_path = _durbin_koopman_level_draw(
-            level_endog_template,
+        state_path = _durbin_koopman_companion_draw(
+            endog_template,
             B,
             Sigma_path,
             prep["last_companion_state"],
             rng,
             exog_path=exog_path,
-            p=prep["p"],
+            p=prep["p"] if exog_path is not None else None,
         )
-        companion_size = len(prep["last_companion_state"])
         diff_path = state_path[:, :n]
-        cumulative_level_path = state_path[
-            :, companion_size:companion_size + n
-        ]
         diff_paths[out_index] = diff_path
-        level_paths[out_index] = (
-            base_level[None, :] + cumulative_level_path
-        )
+        level_paths[out_index] = base_level[None, :] + np.cumsum(diff_path, axis=0)
         future_log_variance[out_index] = h_path
         future_outlier_scales[out_index] = o_path
 
