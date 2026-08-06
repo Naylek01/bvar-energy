@@ -1,0 +1,19 @@
+# Local data
+data/raw/
+data/interim/
+data/processed/
+
+documentation_todelete/
+
+# Generated outputs
+output/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Virtual environment
+.venv/
