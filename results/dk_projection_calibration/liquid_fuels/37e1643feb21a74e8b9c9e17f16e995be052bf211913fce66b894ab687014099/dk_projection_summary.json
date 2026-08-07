@@ -1,0 +1,48 @@
+{
+  "n_sweeps": 200,
+  "level_error": {
+    "median": 2.5936354451318378e-12,
+    "p95": 2.3993121346507653e-11,
+    "p99": 7.913794334225751e-11,
+    "max": 1.1260883909395399e-10,
+    "p99_over_median": 30.51236190143709,
+    "max_over_median": 43.4173735963228,
+    "sweep_of_maximum": 99
+  },
+  "difference_adjustment": {
+    "median": 1.3414751977106005e-10,
+    "p95": 1.512970998222753e-09,
+    "p99": 3.75252692571693e-09,
+    "max": 5.340284278820575e-09,
+    "p99_over_median": 27.973136828180635,
+    "max_over_median": 39.80904222407135,
+    "sweep_of_maximum": 99
+  },
+  "difference_to_level_ratio": {
+    "median": 47.445859790119,
+    "p99": 124.38112318491888,
+    "max": 296.7194464510197
+  },
+  "level_argmax": {
+    "unique_positions": 63,
+    "top_position_row": 859,
+    "top_position_col": 1,
+    "top_position_share": 0.355,
+    "near_missing_share": 0.0,
+    "median_time_fraction": 0.7902483900643974,
+    "p95_time_fraction": 0.9817847286108555,
+    "maximum_date": "2022-03-07 00:00:00",
+    "maximum_variable": "crude_oil_eur"
+  },
+  "difference_argmax": {
+    "unique_positions": 69,
+    "top_position_row": 859,
+    "top_position_col": 1,
+    "top_position_share": 0.28,
+    "near_missing_share": 0.0,
+    "median_time_fraction": 0.7902483900643974,
+    "p95_time_fraction": 0.9826586936522539,
+    "maximum_date": "2022-03-07 00:00:00",
+    "maximum_variable": "crude_oil_eur"
+  }
+}

@@ -1,0 +1,3 @@
+implementation,status,model_path,sha256,identity_error,observed_level_error,condition_error,exception_type,exception_message
+before,error,C:\Users\kelyan.gane\Project\Python\Bayesian_model\bvar-energy\src\model\old\energy_bvar_sv_outlier_model_function_v7.py,ad57c4d5eb62e8de9fcd93038740cc84637ed239244b0aceac6ccc4c95d523d2,,,,AttributeError,The historical module has no _durbin_koopman_level_draw helper; the isolated comparison cannot be run.
+after,ok,C:\Users\kelyan.gane\Project\Python\Bayesian_model\bvar-energy\src\model\energy_bvar_model.py,d5081e33cca2b8a6cb767ca0a4006ede859caa4fca46e73bf7e28dd4eb948e99,3.979039320256561e-13,6.394884621840902e-14,7.176481631177012e-13,,

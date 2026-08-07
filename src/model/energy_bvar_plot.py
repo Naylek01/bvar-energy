@@ -377,9 +377,14 @@ def plot_phi_and_outlier_priors(prior: Mapping, max_phi: float | None = None):
     axes[1].fill_between(p_grid, beta_density, color="#fee6ce", alpha=0.90)
     axes[1].plot(p_grid, beta_density, color="#e6550d", linewidth=1.5)
     prior_mean = alpha / (alpha + beta)
+    prior_frequency = str(prior.get("frequency", "monthly")).lower()
+    prior_period = "weeks" if prior_frequency == "weekly" else "months"
     axes[1].axvline(
         prior_mean, color="#cb181d", linestyle="--", linewidth=1.1,
-        label=f"mean = {format_number(prior_mean)} (1 in {1/prior_mean:.0f} months)",
+        label=(
+            f"mean = {format_number(prior_mean)} "
+            f"(1 in {1/prior_mean:.0f} {prior_period})"
+        ),
     )
     axes[1].set_title(r"Prior on the outlier probability $p_j$")
     axes[1].set_xlabel(r"$p_j$")
@@ -716,6 +721,23 @@ _CONDITIONAL_DARK = "#238b45"
 _CONDITIONAL_MID = "#74c476"
 _CONDITIONED_COLOR = "#31a354"
 
+def _forecast_frequency(forecast: Mapping) -> str:
+    frequency = str(forecast.get("frequency", "monthly")).lower()
+    if frequency not in {"monthly", "weekly"}:
+        raise ValueError(f"Unknown forecast frequency {frequency!r}.")
+    return frequency
+
+
+def _period_name_from_frequency(frequency: str) -> str:
+    return "month" if frequency == "monthly" else "week"
+
+
+def _horizon_unit_from_result(result: Mapping, requested: str | None) -> str:
+    if requested is not None:
+        return str(requested)
+    frequency = str(result.get("frequency", "monthly")).lower()
+    return "weeks" if frequency == "weekly" else "months"
+
 
 def _validate_forecast_variable(
     forecast: Mapping,
@@ -752,7 +774,6 @@ def _prepend_anchor(
     anchored_dates = pd.DatetimeIndex([pd.Timestamp(anchor_date)]).append(dates)
     return anchored_paths, anchored_dates
 
-
 def _forecast_segments(
     forecast: Mapping,
     historical_levels: pd.DataFrame,
@@ -762,6 +783,7 @@ def _forecast_segments(
     variables, j, history = _validate_forecast_variable(
         forecast, historical_levels, variable
     )
+    frequency = _forecast_frequency(forecast)
     all_dates = pd.DatetimeIndex(forecast["path_dates"])
     all_paths = np.asarray(forecast["level_paths"], dtype=float)[:, :, j]
     if all_paths.ndim != 2 or all_paths.shape[1] != len(all_dates):
@@ -779,7 +801,6 @@ def _forecast_segments(
     future_paths = all_paths[:, tail_length:]
     actual = history.dropna()
 
-    # Only genuinely missing ragged-edge observations are labelled as nowcasts.
     nowcast_dates = pd.DatetimeIndex([])
     nowcast_paths = np.empty((all_paths.shape[0], 0), dtype=float)
     nowcast_anchor_date = None
@@ -788,8 +809,6 @@ def _forecast_segments(
         missing_positions = np.flatnonzero(missing_tail)
         if missing_positions.size:
             first_missing = int(missing_positions[0])
-            # Ragged edges should be contiguous. Keep all dates from the first
-            # missing month onward so the fan remains continuous.
             nowcast_dates = tail_dates[first_missing:]
             nowcast_paths = tail_paths[:, first_missing:]
             candidates = actual.loc[actual.index < nowcast_dates[0]]
@@ -803,11 +822,8 @@ def _forecast_segments(
                 float(candidates.iloc[-1]),
             )
 
-    # Released values inside the ragged edge are observations/conditions, not nowcasts.
     conditioned = history.reindex(tail_dates).dropna()
 
-    # Future forecasts are anchored at the final calendar month. The anchor is
-    # draw-specific when that month was itself nowcasted, and observed otherwise.
     forecast_dates = pd.DatetimeIndex([])
     anchored_future_paths = np.empty((all_paths.shape[0], 0), dtype=float)
     forecast_anchor_date = pd.Timestamp(forecast["last_calendar_date"])
@@ -829,6 +845,8 @@ def _forecast_segments(
 
     return {
         "variables": variables,
+        "frequency": frequency,
+        "period_name": _period_name_from_frequency(frequency),
         "history": history,
         "actual": actual,
         "tail_dates": tail_dates,
@@ -954,7 +972,7 @@ def plot_forecast_fan(
         color="0.45",
         linestyle="--",
         linewidth=1.0,
-        label="Last observed month",
+        label=f'Last observed {segments["period_name"]}',
     )
     if segments["last_calendar_date"] != last_observed_date:
         ax.axvline(
@@ -1116,7 +1134,7 @@ def plot_forecast_comparison(
         color="0.45",
         linestyle="--",
         linewidth=1.0,
-        label="Last observed month",
+        label=f'Last observed {seg_u["period_name"]}',
     )
     if seg_u["last_calendar_date"] != last_observed_date:
         ax.axvline(
@@ -1323,9 +1341,10 @@ def plot_gas_irf(
     credible_intervals: Sequence[float] = (0.05, 0.16, 0.84, 0.95),
     title: str | None = None,
     units: Mapping[str, str] | None = None,
-    horizon_unit: str = "months",
+    horizon_unit: str | None = None,
 ):
     """Plot posterior IRFs for every response-shock pair."""
+    horizon_unit = _horizon_unit_from_result(irf_result, horizon_unit)
     key = "cumulative_level_irfs" if cumulative else "change_irfs"
     draws = np.asarray(irf_result[key], dtype=float)
     variables = list(irf_result["variables"])
@@ -1375,9 +1394,10 @@ def plot_gas_fevd(
     fevd_result: Mapping,
     responses: Sequence[str] | None = None,
     title: str | None = None,
-    horizon_unit: str = "months",
+    horizon_unit: str | None = None,
 ):
     """Plot posterior-median FEVD shares as stacked areas by response variable."""
+    horizon_unit = _horizon_unit_from_result(fevd_result, horizon_unit)
     draws = np.asarray(fevd_result["fevd_draws"], dtype=float)
     variables = list(fevd_result["variables"])
     shocks = list(fevd_result["shock_names"])
@@ -1445,7 +1465,7 @@ def plot_gas_historical_decomposition(
     ax.plot(dates, observed, linewidth=1.5, color="0.10", label="Observed monthly change")
     ax.plot(dates, base, linewidth=1.0, linestyle="--", color="0.40", label="Base / initial conditions")
     ax.axhline(0.0, linewidth=0.8, color="0.35")
-    ax.set_ylabel(f"Monthly change ({unit})")
+    ax.set_ylabel(f"Period change ({unit})")
     ax.set_title(title or f"Historical decomposition — {response}")
     ax.grid(alpha=0.20)
     ax.legend(frameon=False, ncol=2, loc="upper left")

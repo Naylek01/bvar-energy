@@ -1,0 +1,6 @@
+,value
+after_completed,True
+after_identity_pass,True
+after_observed_levels_pass,True
+after_conditions_pass,True
+all_after_checks_pass,True

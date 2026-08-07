@@ -15,8 +15,10 @@ Conventions
 -----------
 * B has shape (1 + n*p + m, n): constant first, then lag blocks, then m deterministic/exogenous regressors.
 * vec(B) is column-major (order="F"), equation by equation.
-* The estimation sample is the maximal balanced block of absolute changes.
-  The end-of-sample ragged edge is retained for Durbin--Koopman forecasts.
+* Panels without interior missing values keep the original maximal-balanced-block
+  estimation path. Panels with interior gaps use exact Gaussian data augmentation:
+  missing levels are drawn inside each Gibbs sweep with the same augmented
+  Durbin--Koopman level smoother used for ragged-edge forecasts.
 * The KSC seven-component approximation is used for the log-volatility paths.
 * The continuous U(2, 20) outlier support is represented by a configurable
   finite grid. The default grid is the integer support 2, ..., 20.
@@ -107,6 +109,11 @@ class SamplerConfig:
     max_stability_tries: int = 1_000
     progress_every: int = 500
     sv_sampler: str = "centered_ksc"
+    dk_projection_mode: str = "strict"
+    dk_level_relative_gate: float = 1e-6
+    dk_difference_relative_gate: float = 1e-6
+    dk_catastrophic_level_relative_gate: float = 1e-4
+    dk_catastrophic_difference_relative_gate: float = 1e-3
 
     def validate(self) -> None:
         if self.reps < 2:
@@ -121,6 +128,20 @@ class SamplerConfig:
             raise ValueError("progress_every cannot be negative.")
         if self.sv_sampler != "centered_ksc":
             raise ValueError("Only sv_sampler='centered_ksc' is implemented. ASIS is reserved for a later sampler update.")
+        if self.dk_projection_mode not in {"strict", "record_only"}:
+            raise ValueError("dk_projection_mode must be 'strict' or 'record_only'.")
+        for name in (
+            "dk_level_relative_gate",
+            "dk_difference_relative_gate",
+            "dk_catastrophic_level_relative_gate",
+            "dk_catastrophic_difference_relative_gate",
+        ):
+            if getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be positive.")
+        if self.dk_catastrophic_level_relative_gate <= self.dk_level_relative_gate:
+            raise ValueError("The catastrophic DK level gate must exceed the strict gate.")
+        if self.dk_catastrophic_difference_relative_gate <= self.dk_difference_relative_gate:
+            raise ValueError("The catastrophic DK difference gate must exceed the strict gate.")
 
 
 # -----------------------------------------------------------------------------
@@ -130,31 +151,87 @@ class SamplerConfig:
 
 
 
+# -----------------------------------------------------------------------------
+# Calendar helpers
+# -----------------------------------------------------------------------------
+
+_FREQUENCY_ALIASES = {
+    "monthly": "monthly",
+    "month": "monthly",
+    "m": "monthly",
+    "ms": "monthly",
+    "weekly": "weekly",
+    "week": "weekly",
+    "w": "weekly",
+    "w-mon": "weekly",
+}
+
+
+def _canonical_frequency(frequency: str) -> str:
+    key = str(frequency).strip().lower()
+    try:
+        return _FREQUENCY_ALIASES[key]
+    except KeyError as exc:
+        raise ValueError("frequency must be 'monthly' or 'weekly'.") from exc
+
+
+def _calendar_rule(frequency: str) -> str:
+    return "MS" if _canonical_frequency(frequency) == "monthly" else "W-MON"
+
+
+def _normalise_calendar_index(
+    index: Sequence[pd.Timestamp] | pd.DatetimeIndex | pd.PeriodIndex,
+    frequency: str,
+) -> pd.DatetimeIndex:
+    frequency = _canonical_frequency(frequency)
+    dates = (
+        index.to_timestamp(how="start")
+        if isinstance(index, pd.PeriodIndex)
+        else pd.DatetimeIndex(index)
+    )
+    if dates.isna().any():
+        raise ValueError("The calendar index contains invalid dates.")
+    if frequency == "monthly":
+        normalised = dates.to_period("M").to_timestamp(how="start")
+    else:
+        normalised = dates.to_period("W-SUN").start_time
+    return pd.DatetimeIndex(normalised, name="date")
+
+
+def _next_period_start(date: pd.Timestamp, frequency: str) -> pd.Timestamp:
+    date = pd.Timestamp(date)
+    frequency = _canonical_frequency(frequency)
+    if frequency == "monthly":
+        return date + pd.offsets.MonthBegin(1)
+    return date + pd.offsets.Week(weekday=0)
+
+
+def _period_name(frequency: str) -> str:
+    return "month" if _canonical_frequency(frequency) == "monthly" else "week"
+
 def _read_dated_csv(path: str | Path, frequency: str = "monthly") -> pd.DataFrame:
-    """Read a dated CSV and normalise its calendar index."""
+    """Read a dated CSV and normalise it to the requested regular calendar."""
+    frequency = _canonical_frequency(frequency)
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(path)
     frame = pd.read_csv(path)
     date_candidates = [
-        c for c in frame.columns if c.lower() in {"date", "time", "period"}
+        column
+        for column in frame.columns
+        if str(column).lower() in {"date", "time", "period"}
     ]
     if not date_candidates:
         raise ValueError(f"No date column found in {path}.")
     date_col = date_candidates[0]
     frame[date_col] = pd.to_datetime(frame[date_col], errors="raise")
     frame = frame.set_index(date_col).sort_index()
-    dates = pd.DatetimeIndex(frame.index)
-    if frequency == "monthly":
-        frame.index = dates.to_period("M").to_timestamp(how="start")
-    elif frequency == "weekly":
-        frame.index = dates.to_period("W-SUN").start_time
-    else:
-        raise ValueError("frequency must be 'monthly' or 'weekly'.")
+    frame.index = _normalise_calendar_index(frame.index, frequency)
     if frame.index.has_duplicates:
         frame = frame.groupby(level=0).last()
     frame.index.name = "date"
     return frame
+
 
 
 def load_energy_panel(
@@ -164,11 +241,13 @@ def load_energy_panel(
     aliases: Mapping[str, str] | None = None,
     frequency: str = "monthly",
 ) -> pd.DataFrame:
-    """Load a model panel without filling missing observations.
+    """Load model levels on a complete monthly or Monday-labelled weekly calendar.
 
-    The generic engine receives already constructed model levels. Source-specific
-    transformations and aliases are supplied by component adapters.
+    Missing observations are retained. The modelling layer, rather than the
+    loader, decides which balanced block is used for estimation and which final
+    observations belong to the ragged edge.
     """
+    frequency = _canonical_frequency(frequency)
     frame = _read_dated_csv(path, frequency=frequency)
     if aliases:
         frame = frame.rename(columns=dict(aliases))
@@ -178,19 +257,18 @@ def load_energy_panel(
         raise KeyError(
             f"Missing model columns {missing}. Available columns: {list(frame.columns)}"
         )
-    frame = frame[variables].astype(float)
-    if frequency == "monthly":
-        full_index = pd.date_range(
-            frame.index.min(), frame.index.max(), freq="MS", name="date"
-        )
-    else:
-        full_index = pd.date_range(
-            frame.index.min(), frame.index.max(), freq="W-MON", name="date"
-        )
-    frame = frame.reindex(full_index)
+    frame = frame[variables].apply(pd.to_numeric, errors="coerce")
+    full_index = pd.date_range(
+        frame.index.min(),
+        frame.index.max(),
+        freq=_calendar_rule(frequency),
+        name="date",
+    )
+    frame = frame.reindex(full_index).astype(float)
     if np.isinf(frame.to_numpy()).any():
         raise ValueError("The model panel contains infinite values.")
     return frame
+
 
 def monthly_seasonal_dummies(
     index: Sequence[pd.Timestamp] | pd.DatetimeIndex,
@@ -220,11 +298,13 @@ def monthly_seasonal_dummies(
     return pd.DataFrame(data, index=pd.DatetimeIndex(dates, name="date"))
 
 
-def _normalise_monthly_exog(
+def _normalise_exog(
     exog: pd.DataFrame | None,
     index: pd.DatetimeIndex,
+    frequency: str,
 ) -> pd.DataFrame | None:
     """Validate deterministic regressors and align them to the model calendar."""
+    frequency = _canonical_frequency(frequency)
     if exog is None:
         return None
     if not isinstance(exog, pd.DataFrame):
@@ -238,15 +318,11 @@ def _normalise_monthly_exog(
 
     frame = exog.copy()
     frame.columns = [str(column) for column in frame.columns]
-    dates = (
-        frame.index.to_timestamp(how="start")
-        if isinstance(frame.index, pd.PeriodIndex)
-        else pd.DatetimeIndex(frame.index)
-    )
-    frame.index = dates.to_period("M").to_timestamp(how="start")
-    frame.index.name = "date"
+    frame.index = _normalise_calendar_index(frame.index, frequency)
     if frame.index.has_duplicates:
-        raise ValueError("exog contains duplicate monthly dates.")
+        raise ValueError(
+            f"exog contains duplicate {_period_name(frequency)}ly dates."
+        )
     frame = frame.apply(pd.to_numeric, errors="coerce").reindex(index)
     if np.isinf(frame.to_numpy(dtype=float)).any():
         raise ValueError("exog contains infinite values.")
@@ -258,6 +334,15 @@ def _normalise_monthly_exog(
             f"{dates_text}."
         )
     return frame.astype(float)
+
+
+def _normalise_monthly_exog(
+    exog: pd.DataFrame | None,
+    index: pd.DatetimeIndex,
+) -> pd.DataFrame | None:
+    """Backward-compatible monthly wrapper around :func:`_normalise_exog`."""
+    return _normalise_exog(exog, index, frequency="monthly")
+
 
 
 def _prepare_var_regression(
@@ -292,94 +377,278 @@ def _prepare_var_regression(
     return Y, X, data.index[p:]
 
 
+def _first_complete_difference_run(complete: np.ndarray, p: int, last_index: int) -> int:
+    """Return the first index ending a run of ``p`` complete differences."""
+    complete = np.asarray(complete, dtype=bool)
+    for end in range(p - 1, int(last_index) + 1):
+        if complete[end - p + 1 : end + 1].all():
+            return int(end)
+    raise ValueError(
+        f"No run of {p} consecutive fully observed changes is available to "
+        "initialise the VAR companion state."
+    )
+
+
 def prepare_bvar_panel(
     levels: pd.DataFrame,
     p: int = 12,
     variables: Sequence[str] | None = None,
     exog: pd.DataFrame | None = None,
+    frequency: str = "monthly",
 ) -> dict:
-    """Prepare levels, changes, deterministic regressors and the ragged edge.
+    """Prepare levels, absolute changes, regressors and missing-data metadata.
 
-    Missing endogenous rows are allowed only at the beginning and at the end of
-    the transformed panel. Deterministic regressors must be observed over the
-    complete calendar because their future values are known by construction.
+    Panels with no interior missing transformed observations follow the original
+    balanced-sample implementation exactly.  If interior gaps are present, they
+    are *not* interpolated or dropped.  Instead the preparation object records an
+    exact observed-level template for Gibbs data augmentation.  A run of ``p``
+    complete changes is used only to initialise the companion state; all later
+    missing levels up to the final fully observed level date are latent states.
+
+    Deterministic regressors must be known over the complete calendar.
     """
+    frequency = _canonical_frequency(frequency)
+    if p < 1:
+        raise ValueError("p must be at least 1.")
     if not isinstance(levels, pd.DataFrame):
         raise TypeError("levels must be a pandas DataFrame.")
     if variables is None:
         variables = list(levels.columns)
     variables = list(variables)
+    missing_columns = [name for name in variables if name not in levels.columns]
+    if missing_columns:
+        raise KeyError(f"levels is missing model columns {missing_columns}.")
+
     frame = levels[variables].copy().astype(float).sort_index()
-    if not isinstance(frame.index, pd.DatetimeIndex):
-        raise TypeError("levels must have a DatetimeIndex.")
-    frame.index = frame.index.to_period("M").to_timestamp(how="start")
+    # Adapter provenance may live in DataFrame.attrs (including DataFrames).
+    # Internal pandas concat/finalize compares attrs, which is unsafe for such
+    # objects; provenance remains on the caller's frame and is not model data.
+    frame.attrs = {}
+    if not isinstance(frame.index, (pd.DatetimeIndex, pd.PeriodIndex)):
+        raise TypeError("levels must have a DatetimeIndex or PeriodIndex.")
+    frame.index = _normalise_calendar_index(frame.index, frequency)
     if frame.index.has_duplicates:
-        raise ValueError("The monthly panel contains duplicate dates.")
-    full_index = pd.date_range(frame.index.min(), frame.index.max(), freq="MS", name="date")
+        raise ValueError(
+            f"The {_period_name(frequency)}ly panel contains duplicate dates."
+        )
+    full_index = pd.date_range(
+        frame.index.min(),
+        frame.index.max(),
+        freq=_calendar_rule(frequency),
+        name="date",
+    )
     frame = frame.reindex(full_index)
     if np.isinf(frame.to_numpy()).any():
         raise ValueError("The level panel contains infinite values.")
-    exog_frame = _normalise_monthly_exog(exog, full_index)
+    exog_frame = _normalise_exog(exog, full_index, frequency)
 
     differences = frame.diff()
     complete = differences.notna().all(axis=1).to_numpy()
     if not complete.any():
-        raise ValueError("No fully observed monthly changes are available.")
+        raise ValueError(
+            f"No fully observed {_period_name(frequency)}ly changes are available."
+        )
     first = int(np.flatnonzero(complete)[0])
     last = int(np.flatnonzero(complete)[-1])
-    interior_bad = np.flatnonzero(~complete[first : last + 1]) + first
-    if len(interior_bad):
-        dates = [differences.index[i].date().isoformat() for i in interior_bad[:10]]
-        suffix = " ..." if len(interior_bad) > 10 else ""
-        raise ValueError(
-            "Interior missing observations in the transformed VAR panel at "
-            + ", ".join(dates)
-            + suffix
-        )
+    interior_bad = np.flatnonzero(~complete[first:last + 1]) + first
 
-    balanced = differences.iloc[first : last + 1].copy()
-    if len(balanced) <= p + 5:
-        raise ValueError(
-            f"Only {len(balanced)} balanced changes remain; this is too short for VAR({p})."
+    # ------------------------------------------------------------------
+    # Original path: preserve the validated balanced implementation.
+    # ------------------------------------------------------------------
+    if len(interior_bad) == 0:
+        balanced = differences.iloc[first:last + 1].copy()
+        if len(balanced) <= p + 5:
+            raise ValueError(
+                f"Only {len(balanced)} balanced changes remain; "
+                f"this is too short for VAR({p})."
+            )
+        balanced_exog = None if exog_frame is None else exog_frame.reindex(balanced.index)
+        Y, X, regression_dates = _prepare_var_regression(balanced, p, balanced_exog)
+        exog_regression = (
+            None
+            if balanced_exog is None
+            else balanced_exog.reindex(regression_dates).copy()
         )
-    balanced_exog = None if exog_frame is None else exog_frame.reindex(balanced.index)
-    Y, X, regression_dates = _prepare_var_regression(balanced, p, balanced_exog)
-    exog_regression = (
-        None if balanced_exog is None else balanced_exog.reindex(regression_dates).copy()
+        balanced_end = balanced.index[-1]
+        ragged = differences.loc[differences.index > balanced_end].copy()
+
+        state_rows = balanced.iloc[-p:].to_numpy(dtype=float)[::-1]
+        last_companion_state = state_rows.reshape(-1)
+        level_at_balanced_end = frame.loc[balanced_end].to_numpy(dtype=float)
+        exog_names = [] if exog_frame is None else list(exog_frame.columns)
+
+        return {
+            "levels": frame,
+            "differences": differences,
+            "balanced": balanced,
+            "prior_scale_data": balanced,
+            "ragged": ragged,
+            "exog": exog_frame,
+            "exog_regression": exog_regression,
+            "exog_names": exog_names,
+            "n_exog": len(exog_names),
+            "Y": Y,
+            "X": X,
+            "dates": regression_dates,
+            "variables": variables,
+            "frequency": frequency,
+            "calendar_rule": _calendar_rule(frequency),
+            "period_name": _period_name(frequency),
+            "p": int(p),
+            "n": len(variables),
+            "k": int(X.shape[1]),
+            "balanced_start": balanced.index[0],
+            "balanced_end": balanced_end,
+            "last_calendar_date": frame.index[-1],
+            "last_companion_state": last_companion_state,
+            "level_at_balanced_end": level_at_balanced_end,
+            "n_balanced_changes": len(balanced),
+            "n_regression_observations": len(Y),
+            "n_ragged_periods": len(ragged),
+            "n_ragged_months": len(ragged),
+            "requires_data_augmentation": False,
+            "interior_missing_dates": pd.DatetimeIndex([], name="date"),
+            "n_interior_missing_dates": 0,
+            "n_interior_missing_level_cells": 0,
+        }
+
+    # ------------------------------------------------------------------
+    # Missing-interior path: exact Gibbs data augmentation in levels.
+    # ------------------------------------------------------------------
+    level_complete = frame.notna().all(axis=1).to_numpy()
+    complete_level_positions = np.flatnonzero(level_complete)
+    if len(complete_level_positions) == 0:
+        raise ValueError("No fully observed level date is available.")
+    estimation_end_position = int(complete_level_positions[-1])
+    anchor_position = _first_complete_difference_run(
+        complete, p=p, last_index=estimation_end_position
     )
-    balanced_end = balanced.index[-1]
-    ragged = differences.loc[differences.index > balanced_end].copy()
+    if anchor_position >= estimation_end_position:
+        raise ValueError(
+            "No observations remain after the companion-state initialisation window."
+        )
 
-    state_rows = balanced.iloc[-p:].to_numpy(dtype=float)[::-1]
-    last_companion_state = state_rows.reshape(-1)
-    level_at_balanced_end = frame.loc[balanced_end].to_numpy(dtype=float)
+    warmup_start = anchor_position - p + 1
+    warmup_differences = differences.iloc[warmup_start : anchor_position + 1].copy()
+    if warmup_differences.shape != (p, len(variables)) or warmup_differences.isna().any().any():
+        raise RuntimeError("The companion-state warm-up block is not fully observed.")
+
+    augmentation_anchor = frame.index[anchor_position]
+    estimation_end = frame.index[estimation_end_position]
+    estimation_dates = frame.index[anchor_position + 1 : estimation_end_position + 1]
+    estimation_levels = frame.reindex(estimation_dates).copy()
+    estimation_difference_template = differences.reindex(estimation_dates).copy()
+    if len(estimation_dates) <= 5:
+        raise ValueError(
+            f"Only {len(estimation_dates)} augmented regression observations remain; "
+            "the sample is too short."
+        )
+
+    initial_companion_state = (
+        warmup_differences.to_numpy(dtype=float)[::-1].reshape(-1)
+    )
+    anchor_level = frame.loc[augmentation_anchor].to_numpy(dtype=float)
+    level_at_balanced_end = frame.loc[estimation_end].to_numpy(dtype=float)
+    if not np.all(np.isfinite(anchor_level)) or not np.all(np.isfinite(level_at_balanced_end)):
+        raise RuntimeError("Augmentation anchor and estimation-end levels must be fully observed.")
+
+    regression_calendar = warmup_differences.index.append(estimation_dates)
+    estimation_exog = (
+        None if exog_frame is None else exog_frame.reindex(regression_calendar).copy()
+    )
+    exog_regression = (
+        None if exog_frame is None else exog_frame.reindex(estimation_dates).copy()
+    )
     exog_names = [] if exog_frame is None else list(exog_frame.columns)
+    k = 1 + len(variables) * p + len(exog_names)
+
+    ragged = differences.loc[differences.index > estimation_end].copy()
+    missing_level_mask = estimation_levels.isna()
+    missing_dates = estimation_dates[missing_level_mask.any(axis=1)]
+    prior_scale_data = differences.iloc[warmup_start : estimation_end_position + 1].copy()
+
+    # Scale-aware DK projection diagnostics are fixed by the observed sample and
+    # therefore computed once here rather than inside every Gibbs sweep.
+    estimation_array = estimation_levels.to_numpy(dtype=float)
+    estimation_mask = np.isfinite(estimation_array)
+    augmentation_level_scale = np.zeros(len(variables), dtype=float)
+    for j in range(len(variables)):
+        col_mask = estimation_mask[:, j]
+        if col_mask.any():
+            augmentation_level_scale[j] = float(
+                np.max(np.abs(estimation_array[col_mask, j]))
+            )
+    augmentation_level_scale = np.maximum(
+        np.maximum(augmentation_level_scale, np.abs(anchor_level)), 1.0
+    )
+
+    levels_for_scale = np.vstack([anchor_level[None, :], estimation_array])
+    augmentation_difference_scale = np.empty(len(variables), dtype=float)
+    for j in range(len(variables)):
+        x = levels_for_scale[:, j]
+        valid = np.isfinite(x[1:]) & np.isfinite(x[:-1])
+        dx = x[1:][valid] - x[:-1][valid]
+        if dx.size >= 2:
+            scale = float(np.std(dx, ddof=1))
+        elif dx.size == 1:
+            scale = float(abs(dx[0]))
+        else:
+            scale = 1.0
+        augmentation_difference_scale[j] = max(scale, 1e-12)
+
+    # ``balanced`` is retained for API compatibility only.  In augmentation mode
+    # it is the estimation-difference template and may contain NaNs; functions
+    # that require completed data use posterior_completed_differences().
+    balanced_template = pd.concat(
+        [warmup_differences, estimation_difference_template], axis=0
+    )
 
     return {
         "levels": frame,
         "differences": differences,
-        "balanced": balanced,
+        "balanced": balanced_template,
+        "prior_scale_data": prior_scale_data,
         "ragged": ragged,
         "exog": exog_frame,
         "exog_regression": exog_regression,
         "exog_names": exog_names,
         "n_exog": len(exog_names),
-        "Y": Y,
-        "X": X,
-        "dates": regression_dates,
+        "Y": None,
+        "X": None,
+        "dates": pd.DatetimeIndex(estimation_dates, name="date"),
         "variables": variables,
+        "frequency": frequency,
+        "calendar_rule": _calendar_rule(frequency),
+        "period_name": _period_name(frequency),
         "p": int(p),
         "n": len(variables),
-        "k": int(X.shape[1]),
-        "balanced_start": balanced.index[0],
-        "balanced_end": balanced_end,
+        "k": int(k),
+        "balanced_start": warmup_differences.index[0],
+        "balanced_end": estimation_end,
         "last_calendar_date": frame.index[-1],
-        "last_companion_state": last_companion_state,
+        "last_companion_state": None,
         "level_at_balanced_end": level_at_balanced_end,
-        "n_balanced_changes": len(balanced),
-        "n_regression_observations": len(Y),
+        "n_balanced_changes": len(balanced_template),
+        "n_regression_observations": len(estimation_dates),
+        "n_ragged_periods": len(ragged),
         "n_ragged_months": len(ragged),
+        "requires_data_augmentation": True,
+        "augmentation_anchor": augmentation_anchor,
+        "augmentation_anchor_level": anchor_level,
+        "initial_companion_state": initial_companion_state,
+        "warmup_differences": warmup_differences,
+        "estimation_levels": estimation_levels,
+        "estimation_difference_template": estimation_difference_template,
+        "estimation_regression_calendar": regression_calendar,
+        "estimation_exog": estimation_exog,
+        "interior_missing_dates": pd.DatetimeIndex(missing_dates, name="date"),
+        "n_interior_missing_dates": int(len(missing_dates)),
+        "n_interior_missing_level_cells": int(missing_level_mask.to_numpy().sum()),
+        "missing_level_mask": missing_level_mask,
+        "augmentation_level_scale": augmentation_level_scale,
+        "augmentation_difference_scale": augmentation_difference_scale,
     }
+
 
 def fit_var_ols_from_prepared(prep: Mapping) -> dict:
     Y = np.asarray(prep["Y"], dtype=float)
@@ -396,13 +665,30 @@ def fit_var_ols_from_prepared(prep: Mapping) -> dict:
 
 
 def ar1_residual_scales(data: pd.DataFrame | np.ndarray) -> np.ndarray:
+    """Preliminary univariate AR(1) scales, allowing internal missing pairs.
+
+    The no-missing branch is byte-for-byte equivalent in algebra to the
+    historical implementation.  With missing data, each series uses only
+    consecutive finite pairs; no interpolation enters the prior.
+    """
     arr = data.to_numpy(dtype=float) if isinstance(data, pd.DataFrame) else np.asarray(data, dtype=float)
     if arr.ndim != 2 or len(arr) < 4:
         raise ValueError("AR(1) scales require a two-dimensional sample with at least four rows.")
     out = np.empty(arr.shape[1])
     for j in range(arr.shape[1]):
-        y = arr[1:, j]
-        x = np.column_stack([np.ones(len(y)), arr[:-1, j]])
+        col = arr[:, j]
+        if np.isfinite(col).all():
+            y = col[1:]
+            x = np.column_stack([np.ones(len(y)), col[:-1]])
+        else:
+            valid = np.isfinite(col[1:]) & np.isfinite(col[:-1])
+            if int(valid.sum()) < 4:
+                raise ValueError(
+                    f"Series {j} has only {int(valid.sum())} consecutive finite "
+                    "pairs; cannot initialise its Minnesota scale."
+                )
+            y = col[1:][valid]
+            x = np.column_stack([np.ones(len(y)), col[:-1][valid]])
         b = np.linalg.lstsq(x, y, rcond=None)[0]
         e = y - x @ b
         out[j] = np.sqrt(e @ e / max(len(e) - 2, 1))
@@ -447,7 +733,7 @@ def make_bvar_svo_prior(
     """
     config = BVARSVOPriorConfig() if config is None else config
     config.validate()
-    data = prep["balanced"]
+    data = prep.get("prior_scale_data", prep["balanced"])
     variables = list(prep["variables"])
     exog_names = list(prep.get("exog_names", []))
     n_exog = len(exog_names)
@@ -514,6 +800,7 @@ def make_bvar_svo_prior(
         "outlier_alpha": float(outlier_alpha),
         "outlier_beta": float(outlier_beta),
         "outlier_grid": grid,
+        "frequency": prep.get("frequency", "monthly"),
         "exog_names": exog_names,
         "exog_prior_scale": float(exog_prior_scale),
         "config": asdict(config),
@@ -915,6 +1202,706 @@ def conditional_log_likelihood(
     )
 
 
+
+def _completed_regression_from_augmented_state(
+    prep: Mapping,
+    state_path: np.ndarray,
+    *,
+    projection_mode: str = "strict",
+    level_relative_gate: float = 1e-6,
+    difference_relative_gate: float = 1e-6,
+    catastrophic_level_relative_gate: float = 1e-4,
+    catastrophic_difference_relative_gate: float = 1e-3,
+    return_diagnostics: bool = False,
+):
+    """Convert one augmented-state draw into complete VAR regression arrays.
+
+    Released levels are exact observations.  The DK smoother can return tiny
+    floating-point discrepancies in long, high-dimensional weekly systems with
+    zero observation noise.  We therefore (i) measure those discrepancies on
+    scale-free diagnostics, (ii) project observed cells back to their exact
+    published values, and (iii) reconstruct differences and the terminal
+    companion state from the projected level path.
+
+    ``projection_mode='record_only'`` is intended for short calibration runs:
+    only catastrophic discrepancies raise, while every sweep is instrumented.
+    ``projection_mode='strict'`` applies the tighter production gates.
+    """
+    n = int(prep["n"])
+    p = int(prep["p"])
+    companion_size = n * p
+    state_path = np.asarray(state_path, dtype=float)
+    if state_path.shape != (len(prep["dates"]), companion_size + n):
+        raise ValueError(
+            "state_path has the wrong shape for the augmented estimation window."
+        )
+    if projection_mode not in {"strict", "record_only"}:
+        raise ValueError("projection_mode must be 'strict' or 'record_only'.")
+
+    raw_differences_path = state_path[:, :n].copy()
+    cumulative_levels = state_path[:, companion_size : companion_size + n]
+    anchor = np.asarray(prep["augmentation_anchor_level"], dtype=float)
+    completed_levels = anchor[None, :] + cumulative_levels
+
+    observed = prep["estimation_levels"].to_numpy(dtype=float)
+    mask = np.isfinite(observed)
+    level_scale = np.asarray(prep["augmentation_level_scale"], dtype=float)
+    difference_scale = np.asarray(
+        prep["augmentation_difference_scale"], dtype=float
+    )
+
+    if mask.any():
+        absolute_level_error = np.abs(completed_levels - observed)
+        relative_level_error = absolute_level_error / level_scale[None, :]
+        level_metric = np.where(mask, relative_level_error, -np.inf)
+        level_position = np.unravel_index(
+            int(np.argmax(level_metric)), level_metric.shape
+        )
+        max_absolute_level_error = float(absolute_level_error[mask].max())
+        max_relative_level_error = float(level_metric[level_position])
+    else:
+        absolute_level_error = np.zeros_like(completed_levels)
+        relative_level_error = np.zeros_like(completed_levels)
+        level_position = (0, 0)
+        max_absolute_level_error = 0.0
+        max_relative_level_error = 0.0
+
+    # Published observations are exact in the statistical model.  The
+    # projection below removes only the smoother's finite-precision discrepancy;
+    # it does not introduce a measurement-error nugget.
+    completed_levels = completed_levels.copy()
+    completed_levels[mask] = observed[mask]
+    relative_levels = completed_levels - anchor[None, :]
+    differences_path = np.diff(
+        np.vstack([np.zeros((1, n), dtype=float), relative_levels]),
+        axis=0,
+    )
+
+    difference_adjustment = np.abs(differences_path - raw_differences_path)
+    relative_difference_adjustment = (
+        difference_adjustment / difference_scale[None, :]
+    )
+    difference_position = np.unravel_index(
+        int(np.argmax(relative_difference_adjustment)),
+        relative_difference_adjustment.shape,
+    )
+    max_absolute_difference_adjustment = float(difference_adjustment.max())
+    max_relative_difference_adjustment = float(
+        relative_difference_adjustment[difference_position]
+    )
+
+    if projection_mode == "record_only":
+        level_gate = float(catastrophic_level_relative_gate)
+        difference_gate = float(catastrophic_difference_relative_gate)
+    else:
+        level_gate = float(level_relative_gate)
+        difference_gate = float(difference_relative_gate)
+
+    if max_relative_level_error > level_gate:
+        raise RuntimeError(
+            "Durbin--Koopman data augmentation failed to reproduce observed "
+            "levels beyond the configured projection gate; "
+            f"maximum absolute error={max_absolute_level_error:.3e}, "
+            f"maximum relative error={max_relative_level_error:.3e}, "
+            f"mode={projection_mode!r}."
+        )
+    if max_relative_difference_adjustment > difference_gate:
+        raise RuntimeError(
+            "Projection of exact observed levels materially changed the DK "
+            "difference state; check augmented-state timing/mapping. "
+            f"Maximum absolute adjustment={max_absolute_difference_adjustment:.3e}, "
+            f"maximum relative adjustment={max_relative_difference_adjustment:.3e}, "
+            f"mode={projection_mode!r}."
+        )
+
+    completed = pd.DataFrame(
+        differences_path,
+        index=prep["dates"],
+        columns=prep["variables"],
+    )
+    complete_differences = pd.concat(
+        [prep["warmup_differences"], completed], axis=0
+    )
+    Y, X, dates = _prepare_var_regression(
+        complete_differences,
+        p,
+        prep.get("estimation_exog"),
+    )
+    if not dates.equals(pd.DatetimeIndex(prep["dates"])):
+        raise RuntimeError("Augmented regression dates are misaligned.")
+    if len(differences_path) < p:
+        raise RuntimeError(
+            "The augmented estimation path is shorter than the VAR lag order."
+        )
+    last_companion_state = differences_path[-p:][::-1].reshape(-1).copy()
+
+    level_row, level_col = (int(level_position[0]), int(level_position[1]))
+    diff_row, diff_col = (int(difference_position[0]), int(difference_position[1]))
+    missing_mask = ~mask
+
+    def _near_missing(row: int, col: int, *, include_previous: bool) -> bool:
+        candidates = [row]
+        if row + 1 < len(mask):
+            candidates.append(row + 1)
+        if include_previous and row - 1 >= 0:
+            candidates.append(row - 1)
+        return bool(any(missing_mask[r, col] for r in candidates))
+
+    L = max(len(prep["dates"]) - 1, 1)
+    diagnostics = {
+        "max_absolute_level_error": max_absolute_level_error,
+        "max_relative_level_error": max_relative_level_error,
+        "level_argmax_row": level_row,
+        "level_argmax_col": level_col,
+        "level_argmax_time_fraction": float(level_row / L),
+        "level_argmax_date": pd.Timestamp(prep["dates"][level_row]),
+        "level_argmax_variable": str(prep["variables"][level_col]),
+        "level_argmax_near_missing": _near_missing(
+            level_row, level_col, include_previous=True
+        ),
+        "max_absolute_difference_adjustment": max_absolute_difference_adjustment,
+        "max_relative_difference_adjustment": max_relative_difference_adjustment,
+        "difference_argmax_row": diff_row,
+        "difference_argmax_col": diff_col,
+        "difference_argmax_time_fraction": float(diff_row / L),
+        "difference_argmax_date": pd.Timestamp(prep["dates"][diff_row]),
+        "difference_argmax_variable": str(prep["variables"][diff_col]),
+        "difference_argmax_near_missing": _near_missing(
+            diff_row, diff_col, include_previous=True
+        ),
+        "projection_mode": projection_mode,
+    }
+
+    output = (
+        complete_differences,
+        Y,
+        X,
+        dates,
+        completed_levels,
+        last_companion_state,
+    )
+    if return_diagnostics:
+        return (*output, diagnostics)
+    return output
+
+def _draw_augmented_estimation_path(
+    prep: Mapping,
+    B: np.ndarray,
+    A: np.ndarray,
+    log_variance_path: np.ndarray,
+    outlier_scales: np.ndarray,
+    rng: np.random.Generator,
+    *,
+    projection_mode: str = "strict",
+    level_relative_gate: float = 1e-6,
+    difference_relative_gate: float = 1e-6,
+    catastrophic_level_relative_gate: float = 1e-4,
+    catastrophic_difference_relative_gate: float = 1e-3,
+    return_diagnostics: bool = False,
+):
+    """Draw the complete in-sample path conditional on current Gibbs states."""
+    covariance_sequence = build_time_varying_covariances(
+        A,
+        np.asarray(log_variance_path, dtype=float)[1:],
+        outlier_scales,
+    )
+    anchor = np.asarray(prep["augmentation_anchor_level"], dtype=float)
+    level_endog = prep["estimation_levels"].to_numpy(dtype=float) - anchor[None, :]
+    exog_regression = prep.get("exog_regression")
+    exog_path = (
+        None
+        if exog_regression is None
+        else exog_regression.to_numpy(dtype=float)
+    )
+    state_path = _durbin_koopman_level_draw(
+        level_endog=level_endog,
+        B=B,
+        covariance_sequence=covariance_sequence,
+        initial_companion_state=np.asarray(prep["initial_companion_state"], dtype=float),
+        rng=rng,
+        exog_path=exog_path,
+        p=int(prep["p"]),
+    )
+    return _completed_regression_from_augmented_state(
+        prep,
+        state_path,
+        projection_mode=projection_mode,
+        level_relative_gate=level_relative_gate,
+        difference_relative_gate=difference_relative_gate,
+        catastrophic_level_relative_gate=catastrophic_level_relative_gate,
+        catastrophic_difference_relative_gate=catastrophic_difference_relative_gate,
+        return_diagnostics=return_diagnostics,
+    )
+
+def _fit_var_ols_arrays(Y: np.ndarray, X: np.ndarray, n: int, p: int) -> dict:
+    B = np.linalg.solve(X.T @ X, X.T @ Y)
+    resid = Y - X @ B
+    Sigma = resid.T @ resid / max(len(Y) - X.shape[1], 1)
+    return {
+        "B": B,
+        "resid": resid,
+        "Sigma": 0.5 * (Sigma + Sigma.T),
+        "spectral_radius": spectral_radius(B, n, p),
+    }
+
+
+def _summarize_dk_projection_records(records: Sequence[Mapping]) -> dict:
+    """Summarise per-sweep DK projection diagnostics for calibration/audit."""
+    if not records:
+        return {
+            "n_sweeps": 0,
+            "level_error": {},
+            "difference_adjustment": {},
+            "level_argmax": {},
+            "difference_argmax": {},
+        }
+
+    def _metric_summary(key: str) -> dict:
+        values = np.asarray([float(r[key]) for r in records], dtype=float)
+        median = float(np.median(values))
+        p95 = float(np.quantile(values, 0.95))
+        p99 = float(np.quantile(values, 0.99))
+        max_idx = int(np.argmax(values))
+        maximum = float(values[max_idx])
+        denom = max(median, np.finfo(float).tiny)
+        return {
+            "median": median,
+            "p95": p95,
+            "p99": p99,
+            "max": maximum,
+            "p99_over_median": float(p99 / denom),
+            "max_over_median": float(maximum / denom),
+            "sweep_of_maximum": int(records[max_idx].get("sweep", max_idx)),
+        }
+
+    def _position_summary(prefix: str, metric_key: str) -> dict:
+        rows = np.asarray([int(r[f"{prefix}_argmax_row"]) for r in records])
+        cols = np.asarray([int(r[f"{prefix}_argmax_col"]) for r in records])
+        fractions = np.asarray(
+            [float(r[f"{prefix}_argmax_time_fraction"]) for r in records],
+            dtype=float,
+        )
+        positions = list(zip(rows.tolist(), cols.tolist()))
+        counts: dict[tuple[int, int], int] = {}
+        for pos in positions:
+            counts[pos] = counts.get(pos, 0) + 1
+        top_pos, top_count = max(counts.items(), key=lambda kv: kv[1])
+        metric_values = np.asarray([float(r[metric_key]) for r in records])
+        max_idx = int(np.argmax(metric_values))
+        near_missing = np.asarray(
+            [bool(r[f"{prefix}_argmax_near_missing"]) for r in records],
+            dtype=float,
+        )
+        return {
+            "unique_positions": int(len(counts)),
+            "top_position_row": int(top_pos[0]),
+            "top_position_col": int(top_pos[1]),
+            "top_position_share": float(top_count / len(records)),
+            "near_missing_share": float(np.mean(near_missing)),
+            "median_time_fraction": float(np.median(fractions)),
+            "p95_time_fraction": float(np.quantile(fractions, 0.95)),
+            "maximum_date": str(records[max_idx][f"{prefix}_argmax_date"]),
+            "maximum_variable": str(records[max_idx][f"{prefix}_argmax_variable"]),
+        }
+
+    level_values = np.asarray(
+        [float(r["max_relative_level_error"]) for r in records], dtype=float
+    )
+    difference_values = np.asarray(
+        [float(r["max_relative_difference_adjustment"]) for r in records],
+        dtype=float,
+    )
+    ratio = difference_values / np.maximum(level_values, np.finfo(float).tiny)
+
+    return {
+        "n_sweeps": int(len(records)),
+        "level_error": _metric_summary("max_relative_level_error"),
+        "difference_adjustment": _metric_summary(
+            "max_relative_difference_adjustment"
+        ),
+        "difference_to_level_ratio": {
+            "median": float(np.median(ratio)),
+            "p99": float(np.quantile(ratio, 0.99)),
+            "max": float(np.max(ratio)),
+        },
+        "level_argmax": _position_summary(
+            "level", "max_relative_level_error"
+        ),
+        "difference_argmax": _position_summary(
+            "difference", "max_relative_difference_adjustment"
+        ),
+    }
+
+
+def dk_projection_diagnostics_frame(result: Mapping) -> pd.DataFrame:
+    """Return one row per augmented Gibbs sweep with DK projection diagnostics."""
+    records = result.get("dk_projection_records", [])
+    if not records:
+        return pd.DataFrame()
+    frame = pd.DataFrame(records).copy()
+    for col in ("level_argmax_date", "difference_argmax_date"):
+        if col in frame:
+            frame[col] = pd.to_datetime(frame[col])
+    return frame
+
+
+def _gibbs_bvar_sv_outlier_with_missing(
+    prep: Mapping,
+    prior: Mapping,
+    prior_config: BVARSVOPriorConfig,
+    sampler_config: SamplerConfig,
+    exog_prior_scale: float,
+) -> dict:
+    """Exact Gibbs sampler with DK data augmentation for interior level gaps."""
+    T = int(prep["n_regression_observations"])
+    n = int(prep["n"])
+    p = int(prep["p"])
+    rng = np.random.default_rng(sampler_config.seed)
+
+    # Start from the prior VAR and data-driven univariate scales.  No
+    # deterministic interpolation is used, even for chain initialisation.
+    B = np.asarray(prior["B0"], dtype=float).copy()
+    A = np.eye(n)
+    initial_variance = np.maximum(np.asarray(prior["scales"], dtype=float) ** 2, 1e-8)
+    h0_mean = np.log(initial_variance)
+    log_variance_path = np.repeat(h0_mean[None, :], T + 1, axis=0)
+    phi = np.full(n, prior["phi_prior_mean"])
+    outlier_scales = np.ones((T, n))
+    outlier_indicators = np.zeros((T, n), dtype=bool)
+    outlier_probabilities = np.full(
+        n,
+        prior["outlier_alpha"] / (prior["outlier_alpha"] + prior["outlier_beta"]),
+    )
+
+    # One stochastic augmentation gives a coherent complete path from which to
+    # initialise B and the KSC offsets.
+    (
+        completed_differences,
+        Y,
+        X,
+        _,
+        completed_levels,
+        last_companion_state,
+        initial_dk_diagnostics,
+    ) = _draw_augmented_estimation_path(
+        prep,
+        B,
+        A,
+        log_variance_path,
+        outlier_scales,
+        rng,
+        projection_mode=sampler_config.dk_projection_mode,
+        level_relative_gate=sampler_config.dk_level_relative_gate,
+        difference_relative_gate=sampler_config.dk_difference_relative_gate,
+        catastrophic_level_relative_gate=sampler_config.dk_catastrophic_level_relative_gate,
+        catastrophic_difference_relative_gate=sampler_config.dk_catastrophic_difference_relative_gate,
+        return_diagnostics=True,
+    )
+    ols = _fit_var_ols_arrays(Y, X, n, p)
+    if var_is_stable(ols["B"], n, p):
+        B = ols["B"].copy()
+    _, u = structural_residuals(Y, X, B, A)
+    base_variance = np.maximum(np.var(u, axis=0, ddof=1), 1e-8)
+    h0_mean = np.log(base_variance)
+    log_variance_path = np.repeat(h0_mean[None, :], T + 1, axis=0)
+    offsets = np.maximum(
+        prior_config.ksc_offset_floor,
+        prior_config.ksc_offset_scale * np.median(np.maximum(u**2, 1e-16), axis=0),
+    )
+
+    out_B: list[np.ndarray] = []
+    out_A: list[np.ndarray] = []
+    out_h: list[np.ndarray] = []
+    out_phi: list[np.ndarray] = []
+    out_o: list[np.ndarray] = []
+    out_z: list[np.ndarray] = []
+    out_p: list[np.ndarray] = []
+    out_radius: list[float] = []
+    out_ll: list[float] = []
+    out_post_outlier_prob: list[np.ndarray] = []
+    out_completed_differences: list[np.ndarray] = []
+    out_missing_levels: list[np.ndarray] = []
+    out_last_companion: list[np.ndarray] = []
+    ksc_counts = np.zeros((n, 7), dtype=np.int64)
+    ksc_move_sum = np.zeros(n)
+    ksc_kept_sweeps = 0
+    total_B_proposals = 0
+    unstable_B_proposals = 0
+    missing_mask = prep["missing_level_mask"].to_numpy(dtype=bool)
+    # Full per-sweep records are retained only for explicit calibration runs.
+    # Production strict mode keeps only the worst level and difference cases.
+    dk_projection_records: list[dict] | None = (
+        [] if sampler_config.dk_projection_mode == "record_only" else None
+    )
+    dk_level_max_record: dict | None = None
+    dk_difference_max_record: dict | None = None
+
+    for iteration in range(sampler_config.reps):
+        # Block 0: latent interior levels / differences.  The observation matrix
+        # sees released levels exactly; NaNs are sampled from their full
+        # conditional under the current B, A, SV and outlier states.
+        (
+            completed_differences,
+            Y,
+            X,
+            _,
+            completed_levels,
+            last_companion_state,
+            dk_diagnostics,
+        ) = _draw_augmented_estimation_path(
+            prep,
+            B,
+            A,
+            log_variance_path,
+            outlier_scales,
+            rng,
+            projection_mode=sampler_config.dk_projection_mode,
+            level_relative_gate=sampler_config.dk_level_relative_gate,
+            difference_relative_gate=sampler_config.dk_difference_relative_gate,
+            catastrophic_level_relative_gate=sampler_config.dk_catastrophic_level_relative_gate,
+            catastrophic_difference_relative_gate=sampler_config.dk_catastrophic_difference_relative_gate,
+            return_diagnostics=True,
+        )
+        dk_diagnostics = dict(dk_diagnostics)
+        dk_diagnostics["sweep"] = int(iteration)
+        if dk_projection_records is not None:
+            dk_projection_records.append(dk_diagnostics)
+        if (
+            dk_level_max_record is None
+            or dk_diagnostics["max_relative_level_error"]
+            > dk_level_max_record["max_relative_level_error"]
+        ):
+            dk_level_max_record = dk_diagnostics.copy()
+        if (
+            dk_difference_max_record is None
+            or dk_diagnostics["max_relative_difference_adjustment"]
+            > dk_difference_max_record["max_relative_difference_adjustment"]
+        ):
+            dk_difference_max_record = dk_diagnostics.copy()
+
+        structural_variance = outlier_scales**2 * np.exp(log_variance_path[1:])
+        B, attempts, radius = draw_bvar_coefficients_sv(
+            Y,
+            X,
+            A,
+            structural_variance,
+            prior,
+            n,
+            p,
+            rng,
+            max_stability_tries=sampler_config.max_stability_tries,
+        )
+        total_B_proposals += attempts
+        unstable_B_proposals += attempts - 1
+
+        reduced, _ = structural_residuals(Y, X, B, A)
+        A = draw_constant_cholesky_A(reduced, structural_variance, prior, rng)
+        _, u = structural_residuals(Y, X, B, A)
+
+        log_variance_path, phi, sv_diagnostics = draw_sv_block(
+            log_variance_path=log_variance_path,
+            phi=phi,
+            structural_residuals_draw=u,
+            outlier_scales=outlier_scales,
+            h0_mean=h0_mean,
+            h0_var=prior["h0_var"],
+            offsets=offsets,
+            prior=prior,
+            rng=rng,
+            method=sampler_config.sv_sampler,
+        )
+        if iteration >= sampler_config.burn:
+            for j, ksc_diag in enumerate(sv_diagnostics):
+                ksc_counts[j] += ksc_diag["component_counts"]
+                ksc_move_sum[j] += ksc_diag["mean_abs_move"]
+
+        lambda_t = np.exp(np.clip(log_variance_path[1:], -745.0, 700.0))
+        standardized = u / np.sqrt(lambda_t)
+        outlier_scales, outlier_indicators, posterior_outlier_probability = draw_outlier_states(
+            standardized,
+            outlier_probabilities,
+            prior["outlier_grid"],
+            rng,
+        )
+        outlier_probabilities = draw_outlier_probabilities(outlier_indicators, prior, rng)
+
+        keep = (
+            iteration >= sampler_config.burn
+            and (iteration - sampler_config.burn) % sampler_config.thin == 0
+        )
+        if keep:
+            out_B.append(B.copy())
+            out_A.append(A.copy())
+            out_h.append(log_variance_path.copy())
+            out_phi.append(phi.copy())
+            out_o.append(outlier_scales.copy())
+            out_z.append(outlier_indicators.copy())
+            out_p.append(outlier_probabilities.copy())
+            out_radius.append(radius)
+            out_ll.append(
+                conditional_log_likelihood(
+                    Y, X, B, A, log_variance_path[1:], outlier_scales
+                )
+            )
+            out_post_outlier_prob.append(posterior_outlier_probability.copy())
+            out_completed_differences.append(completed_differences.to_numpy(dtype=float))
+            out_missing_levels.append(completed_levels[missing_mask].copy())
+            out_last_companion.append(last_companion_state.copy())
+            ksc_kept_sweeps += 1
+
+        if sampler_config.progress_every and (iteration + 1) % sampler_config.progress_every == 0:
+            rejection = unstable_B_proposals / max(total_B_proposals, 1)
+            print(
+                f"iteration {iteration + 1:,}/{sampler_config.reps:,} | "
+                f"B instability rejection {rejection:.2%} | radius {radius:.4f} | "
+                f"DK-DA missing cells {int(missing_mask.sum())}"
+            )
+
+    if not out_B:
+        raise RuntimeError("No posterior draws were retained.")
+
+    missing_positions = []
+    for row, date in enumerate(prep["dates"]):
+        for col, variable in enumerate(prep["variables"]):
+            if missing_mask[row, col]:
+                missing_positions.append((pd.Timestamp(date), str(variable)))
+
+    result = {
+        "B": np.asarray(out_B),
+        "A": np.asarray(out_A),
+        "log_variance": np.asarray(out_h),
+        "phi": np.asarray(out_phi),
+        "outlier_scales": np.asarray(out_o),
+        "outlier_indicators": np.asarray(out_z),
+        "outlier_probabilities": np.asarray(out_p),
+        "posterior_outlier_probability_draws": np.asarray(out_post_outlier_prob),
+        "spectral_radius": np.asarray(out_radius),
+        "log_likelihood": np.asarray(out_ll),
+        "completed_differences_draws": np.asarray(out_completed_differences),
+        "missing_level_draws": np.asarray(out_missing_levels),
+        "missing_level_positions": missing_positions,
+        "last_companion_state_draws": np.asarray(out_last_companion),
+        "prior": prior,
+        "prep": prep,
+        "ols": ols,
+        "prior_config": asdict(prior_config),
+        "sampler_config": asdict(sampler_config),
+        "ksc_offsets": offsets,
+        "ksc_component_counts": ksc_counts,
+        "ksc_mean_abs_move": ksc_move_sum / max(ksc_kept_sweeps, 1),
+        "B_total_proposals": int(total_B_proposals),
+        "B_unstable_proposals": int(unstable_B_proposals),
+        "B_instability_rejection_rate": float(
+            unstable_B_proposals / max(total_B_proposals, 1)
+        ),
+        "n_draws": len(out_B),
+        "variables": list(prep["variables"]),
+        "exog_names": list(prep["exog_names"]),
+        "exog_prior_scale": float(exog_prior_scale),
+        "p": p,
+        "frequency": prep["frequency"],
+        "sv_sampler": sampler_config.sv_sampler,
+        "outlier_support": prior["outlier_grid"].copy(),
+        "data_augmentation": "durbin_koopman_interior_levels",
+        "dk_projection_initialization": initial_dk_diagnostics,
+        "dk_projection_records": (
+            dk_projection_records if dk_projection_records is not None else []
+        ),
+        "dk_projection_diagnostics": (
+            _summarize_dk_projection_records(dk_projection_records)
+            if dk_projection_records is not None
+            else {
+                "n_sweeps": int(sampler_config.reps),
+                "mode": "strict",
+                "level_error": {
+                    "max": float(
+                        dk_level_max_record["max_relative_level_error"]
+                    ),
+                    "sweep_of_maximum": int(dk_level_max_record["sweep"]),
+                    "argmax_date": str(dk_level_max_record["level_argmax_date"]),
+                    "argmax_variable": str(
+                        dk_level_max_record["level_argmax_variable"]
+                    ),
+                    "argmax_near_missing": bool(
+                        dk_level_max_record["level_argmax_near_missing"]
+                    ),
+                },
+                "difference_adjustment": {
+                    "max": float(
+                        dk_difference_max_record[
+                            "max_relative_difference_adjustment"
+                        ]
+                    ),
+                    "sweep_of_maximum": int(
+                        dk_difference_max_record["sweep"]
+                    ),
+                    "argmax_date": str(
+                        dk_difference_max_record["difference_argmax_date"]
+                    ),
+                    "argmax_variable": str(
+                        dk_difference_max_record[
+                            "difference_argmax_variable"
+                        ]
+                    ),
+                    "argmax_near_missing": bool(
+                        dk_difference_max_record[
+                            "difference_argmax_near_missing"
+                        ]
+                    ),
+                },
+            }
+        ),
+    }
+    return result
+
+
+def posterior_completed_differences(
+    result: Mapping,
+    statistic: str = "median",
+) -> pd.DataFrame:
+    """Return a representative complete transformed sample.
+
+    For ordinary balanced models this is the observed balanced sample.  For
+    data-augmented models it summarises the retained completed-difference draws.
+    """
+    prep = result["prep"]
+    if "completed_differences_draws" not in result:
+        return prep["balanced"].copy()
+    draws = np.asarray(result["completed_differences_draws"], dtype=float)
+    key = str(statistic).lower()
+    if key == "median":
+        arr = np.median(draws, axis=0)
+    elif key == "mean":
+        arr = np.mean(draws, axis=0)
+    else:
+        raise ValueError("statistic must be 'median' or 'mean'.")
+    index = prep["warmup_differences"].index.append(prep["dates"])
+    return pd.DataFrame(arr, index=index, columns=prep["variables"])
+
+
+def _regression_data_for_draw(
+    result: Mapping,
+    draw_index: int | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return complete differences, Y and X for diagnostics/decompositions."""
+    prep = result["prep"]
+    p = int(result["p"])
+    if "completed_differences_draws" not in result:
+        return (
+            np.asarray(prep["balanced"], dtype=float),
+            np.asarray(prep["Y"], dtype=float),
+            np.asarray(prep["X"], dtype=float),
+        )
+    if draw_index is None:
+        complete = posterior_completed_differences(result, "median")
+    else:
+        arr = np.asarray(result["completed_differences_draws"], dtype=float)[int(draw_index)]
+        index = prep["warmup_differences"].index.append(prep["dates"])
+        complete = pd.DataFrame(arr, index=index, columns=prep["variables"])
+    Y, X, _ = _prepare_var_regression(complete, p, prep.get("estimation_exog"))
+    return complete.to_numpy(dtype=float), Y, X
+
+
 # -----------------------------------------------------------------------------
 # Gibbs orchestrator
 # -----------------------------------------------------------------------------
@@ -925,6 +1912,7 @@ def gibbs_bvar_sv_outlier(
     p: int = 12,
     variables: Sequence[str] | None = None,
     exog: pd.DataFrame | None = None,
+    frequency: str = "monthly",
     exog_prior_scale: float = 10.0,
     prior_config: BVARSVOPriorConfig | None = None,
     sampler_config: SamplerConfig | None = None,
@@ -934,12 +1922,22 @@ def gibbs_bvar_sv_outlier(
     sampler_config = SamplerConfig() if sampler_config is None else sampler_config
     prior_config.validate()
     sampler_config.validate()
-    prep = prepare_bvar_panel(levels, p=p, variables=variables, exog=exog)
+    prep = prepare_bvar_panel(
+        levels, p=p, variables=variables, exog=exog, frequency=frequency
+    )
     prior = make_bvar_svo_prior(
         prep,
         prior_config,
         exog_prior_scale=exog_prior_scale,
     )
+    if prep.get("requires_data_augmentation", False):
+        return _gibbs_bvar_sv_outlier_with_missing(
+            prep=prep,
+            prior=prior,
+            prior_config=prior_config,
+            sampler_config=sampler_config,
+            exog_prior_scale=exog_prior_scale,
+        )
     Y = prep["Y"]
     X = prep["X"]
     T, n = Y.shape
@@ -1089,6 +2087,7 @@ def gibbs_bvar_sv_outlier(
         "exog_names": list(prep["exog_names"]),
         "exog_prior_scale": float(exog_prior_scale),
         "p": p,
+        "frequency": prep["frequency"],
         "sv_sampler": sampler_config.sv_sampler,
         "outlier_support": prior["outlier_grid"].copy(),
     }
@@ -1271,7 +2270,8 @@ def standardized_structural_residuals(result: Mapping) -> pd.DataFrame:
     A = np.median(np.asarray(result["A"]), axis=0)
     log_h = np.median(np.asarray(result["log_variance"]), axis=0)[1:]
     o = np.median(np.asarray(result["outlier_scales"]), axis=0)
-    _, u = structural_residuals(result["prep"]["Y"], result["prep"]["X"], B, A)
+    _, Y, X = _regression_data_for_draw(result, None)
+    _, u = structural_residuals(Y, X, B, A)
     std = u / (o * np.exp(0.5 * log_h))
     return pd.DataFrame(std, index=result["prep"]["dates"], columns=result["variables"])
 
@@ -1428,16 +2428,15 @@ def _durbin_koopman_level_draw(
 ) -> np.ndarray:
     """Jointly draw missing changes and cumulative levels.
 
-    The VAR is estimated in monthly absolute changes. To condition on future
-    levels without pre-differencing around a ragged edge, the difference
-    companion state is augmented with
+    The first state-space row is an exact anchor at the balanced-sample end:
+    the difference companion equals ``initial_companion_state`` and cumulative
+    levels are zero. The first actual path observation is reached through one
+    transition driven by ``covariance_sequence[0]``. This explicit anchor avoids
+    a timing ambiguity in singular initial-state covariances and guarantees
 
-        cumulative_t = level_t - level_at_balanced_end.
+        level_t = level_at_balanced_end + sum_{s=1}^t difference_s
 
-    ``level_endog`` observes this cumulative-level block directly. Published
-    ragged-edge levels and future level conditions are exact observations;
-    unpublished values remain NaN and are drawn jointly by the simulation
-    smoother.
+    draw by draw, including the first ragged-edge period.
     """
     level_endog = np.asarray(level_endog, dtype=float)
     B = np.asarray(B, dtype=float)
@@ -1453,10 +2452,11 @@ def _durbin_koopman_level_draw(
         raise ValueError("The state-space forecast path is empty.")
     if p < 1:
         raise ValueError("p must be at least 1.")
-    if initial_companion_state.shape != (n * p,):
+    companion_size = n * p
+    if initial_companion_state.shape != (companion_size,):
         raise ValueError(
             "initial_companion_state must have shape "
-            f"{(n * p,)}, got {initial_companion_state.shape}."
+            f"{(companion_size,)}, got {initial_companion_state.shape}."
         )
     if covariance_sequence.shape != (L, n, n):
         raise ValueError(
@@ -1499,7 +2499,6 @@ def _durbin_koopman_level_draw(
             raise ValueError("exog_path must be finite.")
         intercept_path = B[0][None, :] + exog_path @ B[minimum_rows:]
 
-    companion_size = n * p
     F = var_companion(B, n=n, p=p)
     selection = np.vstack(
         [np.eye(n), np.zeros((n * (p - 1), n))]
@@ -1507,25 +2506,6 @@ def _durbin_koopman_level_draw(
     J = np.hstack(
         [np.eye(n), np.zeros((n, companion_size - n))]
     )
-    # Explicit shape contracts. These make any future dimension regression
-    # point at the offending matrix by name instead of surfacing as an
-    # opaque broadcasting error deep inside statsmodels.
-    assert F.shape == (companion_size, companion_size), (
-        f"F must be {(companion_size, companion_size)}, got {F.shape}."
-    )
-    assert selection.shape == (companion_size, n), (
-        f"selection must be {(companion_size, n)}, got {selection.shape}."
-    )
-    assert J.shape == (n, companion_size), (
-        f"J must be {(n, companion_size)}, got {J.shape}."
-    )
-    assert intercept_path.shape == (L, n), (
-        f"intercept_path must be {(L, n)}, got {intercept_path.shape}."
-    )
-
-    # Augmented state:
-    #   [difference companion_t,
-    #    level_t - level_at_balanced_end]
     F_aug = np.block(
         [
             [F, np.zeros((companion_size, n))],
@@ -1537,72 +2517,43 @@ def _durbin_koopman_level_draw(
         [np.zeros((n, companion_size)), np.eye(n)]
     )
 
-    assert F_aug.shape == (companion_size + n, companion_size + n), (
-        f"F_aug must be {(companion_size + n,) * 2}, got {F_aug.shape}."
-    )
-    assert selection_aug.shape == (companion_size + n, n), (
-        f"selection_aug must be {(companion_size + n, n)}, "
-        f"got {selection_aug.shape}."
-    )
-    assert design_aug.shape == (n, companion_size + n), (
-        f"design_aug must be {(n, companion_size + n)}, "
-        f"got {design_aug.shape}."
-    )
+    expected_shapes = {
+        "F": ((companion_size, companion_size), F.shape),
+        "selection": ((companion_size, n), selection.shape),
+        "J": ((n, companion_size), J.shape),
+        "F_aug": ((companion_size + n, companion_size + n), F_aug.shape),
+        "selection_aug": ((companion_size + n, n), selection_aug.shape),
+        "design_aug": ((n, companion_size + n), design_aug.shape),
+        "intercept_path": ((L, n), intercept_path.shape),
+    }
+    for name, (expected, actual) in expected_shapes.items():
+        if actual != expected:
+            raise RuntimeError(f"{name} must have shape {expected}, got {actual}.")
 
-    # State 0 corresponds to the first ragged-edge/path date. The same
-    # innovation drives its current difference and cumulative level.
-    #
-    # The intercept is an n-vector but the companion state has length n*p.
-    # It enters ONLY the leading contemporaneous block; the lag blocks carry
-    # no intercept. Adding it to the whole companion vector is a dimension
-    # error for p > 1 (and silently wrong-free only because n*p == n at p=1).
-    first_companion_mean = F @ initial_companion_state
-    assert first_companion_mean.shape == (companion_size,), (
-        f"F @ initial_companion_state must be {(companion_size,)}, "
-        f"got {first_companion_mean.shape}."
-    )
-    first_companion_mean[:n] += intercept_path[0]
+    # Add an exact balanced-end anchor row before the L path observations.
+    augmented_endog = np.vstack([np.zeros((1, n)), level_endog])
+    n_obs = L + 1
 
-    # cumulative_0 = cumulative_{-1} + delta_0 = 0 + J @ companion_0, since
-    # the cumulative state is measured from level_at_balanced_end.
-    initial_mean = np.concatenate(
-        [first_companion_mean, J @ first_companion_mean]
-    )
-    assert initial_mean.shape == (companion_size + n,), (
-        f"initial_mean must be {(companion_size + n,)}, "
-        f"got {initial_mean.shape}."
-    )
-    initial_cov = (
-        selection_aug
-        @ covariance_sequence[0]
-        @ selection_aug.T
-    )
-
-    # statsmodels column t governs the transition from state t to state t+1.
-    transition_intercepts = np.empty_like(intercept_path)
-    transition_covariance = np.empty_like(covariance_sequence)
-    if L > 1:
-        transition_intercepts[:-1] = intercept_path[1:]
-        transition_covariance[:-1] = covariance_sequence[1:]
-    transition_intercepts[-1] = intercept_path[-1]
-    transition_covariance[-1] = covariance_sequence[-1]
-
-    # Same asymmetry as above, in matrix form: transition_intercepts.T is
-    # (n, L) but the companion block of the state intercept is
-    # (companion_size, L). Embed the n-vector in the leading block and let
-    # the cumulative-level block inherit it through J.
-    companion_intercepts = np.zeros((companion_size, L))
-    companion_intercepts[:n] = transition_intercepts.T
+    # Column t governs transition state_t -> state_{t+1}. Column zero therefore
+    # carries the intercept and covariance of the first path period.
+    companion_intercepts = np.zeros((companion_size, n_obs))
+    companion_intercepts[:n, :L] = intercept_path.T
+    companion_intercepts[:, -1] = companion_intercepts[:, -2]
     state_intercept_aug = np.vstack(
         [companion_intercepts, J @ companion_intercepts]
     )
-    assert state_intercept_aug.shape == (companion_size + n, L), (
-        f"state_intercept_aug must be {(companion_size + n, L)}, "
-        f"got {state_intercept_aug.shape}."
+
+    transition_covariance = np.empty((n_obs, n, n), dtype=float)
+    transition_covariance[:L] = covariance_sequence
+    transition_covariance[-1] = covariance_sequence[-1]
+
+    initial_mean = np.concatenate(
+        [initial_companion_state, np.zeros(n)]
     )
+    initial_cov = np.zeros((companion_size + n, companion_size + n))
 
     model = MLEModel(
-        endog=level_endog,
+        endog=augmented_endog,
         k_states=companion_size + n,
         k_posdef=n,
     )
@@ -1611,17 +2562,19 @@ def _durbin_koopman_level_draw(
     model["transition"] = F_aug
     model["state_intercept"] = state_intercept_aug
     model["selection"] = selection_aug
-    model["state_cov"] = np.moveaxis(
-        transition_covariance, 0, -1
-    )
-    model.initialize_known(
-        initial_mean,
-        0.5 * (initial_cov + initial_cov.T),
-    )
+    model["state_cov"] = np.moveaxis(transition_covariance, 0, -1)
+    model.initialize_known(initial_mean, initial_cov)
 
     simulator = model.simulation_smoother(method="kfs")
     simulator.simulate(random_state=rng)
-    return simulator.simulated_state.T.copy()
+    simulated = simulator.simulated_state.T.copy()
+    if simulated.shape != (n_obs, companion_size + n):
+        raise RuntimeError(
+            "Unexpected simulation-smoother output shape: "
+            f"{simulated.shape}."
+        )
+    return simulated[1:]
+
 
 
 
@@ -1676,14 +2629,20 @@ def _forecast_exog_path(
     future_exog: pd.DataFrame | None,
 ) -> pd.DataFrame | None:
     names = list(prep.get("exog_names", []))
+    frequency = _canonical_frequency(prep.get("frequency", "monthly"))
     if not names:
         if future_exog is not None and future_exog.shape[1]:
-            raise ValueError("future_exog was supplied but the fitted model has no exogenous regressors.")
+            raise ValueError(
+                "future_exog was supplied but the fitted model has no "
+                "exogenous regressors."
+            )
         return None
 
     historical = prep.get("exog")
     if historical is None:
-        raise ValueError("The fitted result is missing its historical exogenous regressors.")
+        raise ValueError(
+            "The fitted result is missing its historical exogenous regressors."
+        )
     historical_tail = historical.reindex(tail_dates)[names]
     if historical_tail.isna().any().any():
         raise ValueError("Historical exogenous values are missing in the ragged edge.")
@@ -1692,17 +2651,19 @@ def _forecast_exog_path(
             "This model contains deterministic/exogenous regressors. Supply "
             "future_exog for every future forecast date."
         )
-    future = _normalise_monthly_exog(future_exog, future_dates)
+    future = _normalise_exog(future_exog, future_dates, frequency)
     if future is None:
         raise ValueError("future_exog must contain the fitted exogenous columns.")
     missing = [name for name in names if name not in future.columns]
     extra = [name for name in future.columns if name not in names]
     if missing or extra:
         raise ValueError(
-            f"future_exog columns must exactly match {names}; missing={missing}, extra={extra}."
+            f"future_exog columns must exactly match {names}; "
+            f"missing={missing}, extra={extra}."
         )
     future = future[names]
     return pd.concat([historical_tail, future]).sort_index()
+
 
 
 def forecast_bvar_sv_outlier(
@@ -1716,16 +2677,16 @@ def forecast_bvar_sv_outlier(
 ) -> dict:
     """Draw ragged-edge nowcasts and future forecasts with DK smoothing.
 
-    Future level conditions enter an augmented state-space directly as exact
-    cumulative-level observations. Missing ragged-edge levels remain NaN and
-    are drawn jointly with the conditioned future path; no fixed-anchor
-    pre-differencing is performed. When the fitted model contains deterministic
-    regressors, ``future_exog`` must provide their known values for every future
-    date, while historical ragged-edge values come from the fitted model object.
+    ``H`` is expressed in model periods: months for monthly models and weeks
+    for weekly models. Future level conditions enter the augmented state-space
+    directly; missing ragged-edge levels remain latent and are drawn jointly.
     """
     if H < 1:
         raise ValueError("H must be at least 1.")
     prep = result["prep"]
+    frequency = _canonical_frequency(
+        prep.get("frequency", result.get("frequency", "monthly"))
+    )
     levels = prep["levels"]
     variables = list(result["variables"])
     n = len(variables)
@@ -1733,26 +2694,30 @@ def forecast_bvar_sv_outlier(
     rng = np.random.default_rng(seed)
 
     tail_dates = levels.index[levels.index > prep["balanced_end"]]
-    future_dates = pd.date_range(levels.index[-1] + pd.offsets.MonthBegin(1), periods=H, freq="MS")
+    future_dates = pd.date_range(
+        _next_period_start(levels.index[-1], frequency),
+        periods=H,
+        freq=_calendar_rule(frequency),
+        name="date",
+    )
     path_dates = tail_dates.append(future_dates)
     tail_length = len(tail_dates)
     L = len(path_dates)
-    exog_path_frame = _forecast_exog_path(prep, tail_dates, future_dates, future_exog)
-    exog_path = None if exog_path_frame is None else exog_path_frame.reindex(path_dates).to_numpy(dtype=float)
-
-    # Conditions are observations of the cumulative-level state, not
-    # pre-computed monthly differences.  Observed ragged-edge levels stay
-    # observed; unpublished months stay NaN and are drawn jointly.
-    base_level = np.asarray(
-        prep["level_at_balanced_end"], dtype=float
+    exog_path_frame = _forecast_exog_path(
+        prep, tail_dates, future_dates, future_exog
     )
+    exog_path = (
+        None
+        if exog_path_frame is None
+        else exog_path_frame.reindex(path_dates).to_numpy(dtype=float)
+    )
+
+    base_level = np.asarray(prep["level_at_balanced_end"], dtype=float)
     level_endog_template = (
-        levels.reindex(path_dates)
-        .to_numpy(dtype=float, copy=True)
+        levels.reindex(path_dates).to_numpy(dtype=float, copy=True)
         - base_level[None, :]
     )
-    if H:
-        level_endog_template[tail_length:] = np.nan
+    level_endog_template[tail_length:] = np.nan
     for variable, path in conditions.items():
         column = variables.index(variable)
         level_endog_template[tail_length:, column] = (
@@ -1763,13 +2728,16 @@ def forecast_bvar_sv_outlier(
     if n_draws is None or n_draws >= available_draws:
         draw_indices = np.arange(available_draws)
     else:
-        draw_indices = np.sort(rng.choice(available_draws, size=int(n_draws), replace=False))
+        if int(n_draws) < 1:
+            raise ValueError("n_draws must be positive.")
+        draw_indices = np.sort(
+            rng.choice(available_draws, size=int(n_draws), replace=False)
+        )
 
     diff_paths = np.empty((len(draw_indices), L, n))
     level_paths = np.empty_like(diff_paths)
     future_log_variance = np.empty_like(diff_paths)
     future_outlier_scales = np.empty_like(diff_paths)
-    base_level = np.asarray(prep["level_at_balanced_end"], dtype=float)
     outlier_grid = np.asarray(result["prior"]["outlier_grid"], dtype=float)
 
     for out_index, draw_index in enumerate(draw_indices):
@@ -1787,29 +2755,35 @@ def forecast_bvar_sv_outlier(
             for j in range(n):
                 count = int(z[:, j].sum())
                 if count:
-                    o_path[z[:, j], j] = rng.choice(outlier_grid, size=count, replace=True)
+                    o_path[z[:, j], j] = rng.choice(
+                        outlier_grid, size=count, replace=True
+                    )
         else:
             o_path = np.ones((L, n))
 
         Sigma_path = build_time_varying_covariances(A, h_path, o_path)
+        if "last_companion_state_draws" in result:
+            initial_companion_state = np.asarray(
+                result["last_companion_state_draws"]
+            )[draw_index]
+        else:
+            initial_companion_state = prep["last_companion_state"]
         state_path = _durbin_koopman_level_draw(
             level_endog_template,
             B,
             Sigma_path,
-            prep["last_companion_state"],
+            initial_companion_state,
             rng,
             exog_path=exog_path,
             p=prep["p"],
         )
-        companion_size = len(prep["last_companion_state"])
+        companion_size = n * prep["p"]
         diff_path = state_path[:, :n]
         cumulative_level_path = state_path[
             :, companion_size:companion_size + n
         ]
         diff_paths[out_index] = diff_path
-        level_paths[out_index] = (
-            base_level[None, :] + cumulative_level_path
-        )
+        level_paths[out_index] = base_level[None, :] + cumulative_level_path
         future_log_variance[out_index] = h_path
         future_outlier_scales[out_index] = o_path
 
@@ -1829,12 +2803,20 @@ def forecast_bvar_sv_outlier(
         "level_conditions": conditions,
         "exog_names": list(prep.get("exog_names", [])),
         "exog_path": exog_path_frame,
-        "future_exog": None if exog_path_frame is None else exog_path_frame.reindex(future_dates),
+        "future_exog": (
+            None
+            if exog_path_frame is None
+            else exog_path_frame.reindex(future_dates)
+        ),
         "simulate_future_outliers": bool(simulate_future_outliers),
         "balanced_end": prep["balanced_end"],
         "last_calendar_date": prep["last_calendar_date"],
+        "frequency": frequency,
+        "calendar_rule": _calendar_rule(frequency),
+        "period_name": _period_name(frequency),
         "H": H,
     }
+
 
 # -----------------------------------------------------------------------------
 # Lightweight posterior predictive check
@@ -1846,10 +2828,14 @@ def posterior_predictive_statistics(
     n_draws: int = 200,
     seed: int = 456,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Compare observed transformed-data statistics with replicated paths."""
+    """Compare transformed-data statistics with posterior replicated paths.
+
+    In data-augmentation models the reference transformed sample is the
+    posterior-median completed path; the raw observed levels remain untouched.
+    """
     rng = np.random.default_rng(seed)
-    Y = result["prep"]["Y"]
-    n = Y.shape[1]
+    _, Y_reference, _ = _regression_data_for_draw(result, None)
+    n = Y_reference.shape[1]
     p = result["p"]
     available = len(result["B"])
     indices = np.arange(available) if n_draws >= available else rng.choice(available, n_draws, replace=False)
@@ -1857,7 +2843,11 @@ def posterior_predictive_statistics(
     exog_regression = result["prep"].get("exog_regression")
     exog_values = None if exog_regression is None else exog_regression.to_numpy(dtype=float)
 
-    initial = result["prep"]["balanced"].iloc[:p].to_numpy(dtype=float)
+    if "completed_differences_draws" in result:
+        initial = np.asarray(result["completed_differences_draws"], dtype=float)[0, :p]
+    else:
+        initial = result["prep"]["balanced"].iloc[:p].to_numpy(dtype=float)
+
     for draw_index in indices:
         B = result["B"][draw_index]
         A = result["A"][draw_index]
@@ -1865,8 +2855,8 @@ def posterior_predictive_statistics(
         log_h = result["log_variance"][draw_index, 1:]
         o = result["outlier_scales"][draw_index]
         history = [row.copy() for row in initial]
-        path = np.empty_like(Y)
-        for t in range(len(Y)):
+        path = np.empty_like(Y_reference)
+        for t in range(len(Y_reference)):
             x_parts = [np.array([1.0]), np.concatenate(history[-p:][::-1])]
             if exog_values is not None:
                 x_parts.append(exog_values[t])
@@ -1888,7 +2878,7 @@ def posterior_predictive_statistics(
             axis=-1,
         )
 
-    observed_stats = stats(Y[None, :, :])[0]
+    observed_stats = stats(Y_reference[None, :, :])[0]
     replicated_stats = stats(replicated)
     labels = []
     obs_values = []
@@ -1909,6 +2899,7 @@ def posterior_predictive_statistics(
     )
     draws = pd.DataFrame(np.column_stack(rep_columns), columns=labels)
     return summary, draws
+
 
 # -----------------------------------------------------------------------------
 # Presentation-oriented tables
@@ -2061,20 +3052,29 @@ def _var_lag_matrices(B: np.ndarray, n: int, p: int) -> list[np.ndarray]:
         )
     return [B[1 + lag * n : 1 + (lag + 1) * n].T for lag in range(p)]
 
-def _reference_regression_index(result: Mapping, reference_date=None) -> tuple[int, pd.Timestamp]:
+def _reference_regression_index(
+    result: Mapping,
+    reference_date=None,
+) -> tuple[int, pd.Timestamp]:
     dates = pd.DatetimeIndex(result["prep"]["dates"])
     if len(dates) == 0:
         raise ValueError("The estimation sample contains no regression dates.")
     if reference_date is None:
         return len(dates) - 1, pd.Timestamp(dates[-1])
-    target = pd.Timestamp(reference_date).to_period("M").to_timestamp(how="start")
+    frequency = _canonical_frequency(
+        result["prep"].get("frequency", result.get("frequency", "monthly"))
+    )
+    target = _normalise_calendar_index(
+        pd.DatetimeIndex([pd.Timestamp(reference_date)]), frequency
+    )[0]
     matches = np.flatnonzero(dates == target)
     if len(matches) == 0:
         raise ValueError(
-            f"reference_date {target.date()} is outside the balanced regression sample "
-            f"[{dates[0].date()}, {dates[-1].date()}]."
+            f"reference_date {target.date()} is outside the balanced regression "
+            f"sample [{dates[0].date()}, {dates[-1].date()}]."
         )
-    return int(matches[0]), target
+    return int(matches[0]), pd.Timestamp(target)
+
 
 
 def _regular_impact_matrix(A: np.ndarray, log_variance: np.ndarray) -> np.ndarray:
@@ -2384,6 +3384,7 @@ def impulse_responses(
         "shock_size": float(shock_size),
         "scale_factors": np.asarray(scale_factors),
         "axes": ("posterior_draw", "horizon", "response", "shock"),
+        "frequency": result["prep"].get("frequency", "monthly"),
     }
 
 
@@ -2457,9 +3458,6 @@ def historical_decomposition(
         )
 
     prep = result["prep"]
-    balanced = np.asarray(prep["balanced"], dtype=float)
-    Y = np.asarray(prep["Y"], dtype=float)
-    X = np.asarray(prep["X"], dtype=float)
     dates = pd.DatetimeIndex(prep["dates"])
     B_draws = np.asarray(result["B"], dtype=float)
     A_draws = np.asarray(result["A"], dtype=float)
@@ -2467,7 +3465,7 @@ def historical_decomposition(
     o_draws = np.asarray(result["outlier_scales"], dtype=float)
     p = int(result["p"])
     n = len(result["variables"])
-    T = len(Y)
+    T = len(dates)
 
     all_contrib = []
     all_base = []
@@ -2483,6 +3481,7 @@ def historical_decomposition(
 
     for Q, draw_index in zip(identified["rotations"], identified["used_draw_indices"]):
         s = int(draw_index)
+        balanced, Y, X = _regression_data_for_draw(result, s)
         B = B_draws[s]
         lag_mats = _var_lag_matrices(B, n, p)
         reduced = Y - X @ B
@@ -2546,6 +3545,7 @@ def historical_decomposition(
         "split_outlier_amplification": bool(split_outlier_amplification),
         "max_reconstruction_error": float(max(max_errors)),
         "axes": ("posterior_draw", "time", "response", "component"),
+        "frequency": result["prep"].get("frequency", "monthly"),
     }
 
 
@@ -2582,10 +3582,12 @@ def hash_run_config(
     *,
     p: int,
     variables: Sequence[str],
+    frequency: str = "monthly",
     exog_names: Sequence[str] | None = None,
     exog_prior_scale: float = 10.0,
 ) -> str:
     payload = {
+        "frequency": _canonical_frequency(frequency),
         "p": int(p),
         "variables": list(variables),
         "prior": asdict(prior_config),
@@ -2600,6 +3602,7 @@ def hash_run_config(
     return hashlib.sha256(_stable_json(payload).encode("utf-8")).hexdigest()
 
 
+
 def build_run_metadata(
     *,
     model_id: str,
@@ -2609,11 +3612,13 @@ def build_run_metadata(
     variables: Sequence[str],
     prior_config: BVARSVOPriorConfig,
     sampler_config: SamplerConfig,
+    frequency: str = "monthly",
     exog: pd.DataFrame | None = None,
     exog_prior_scale: float = 10.0,
     code_version: str = "unversioned",
-    result_schema_version: str = "1.1",
+    result_schema_version: str = "1.2",
 ) -> dict:
+    frequency = _canonical_frequency(frequency)
     exog_names = [] if exog is None else list(exog.columns)
     data_hash = hash_model_data(levels, exog)
     config_hash = hash_run_config(
@@ -2621,6 +3626,7 @@ def build_run_metadata(
         sampler_config,
         p=p,
         variables=variables,
+        frequency=frequency,
         exog_names=exog_names,
         exog_prior_scale=exog_prior_scale,
     )
@@ -2637,7 +3643,8 @@ def build_run_metadata(
         **identity,
         "run_id": run_id,
         "result_schema_version": result_schema_version,
-        "frequency": "monthly",
+        "frequency": frequency,
+        "calendar_rule": _calendar_rule(frequency),
         "variables": list(variables),
         "exog_names": exog_names,
         "exog_prior_scale": float(exog_prior_scale) if exog_names else None,
@@ -2647,6 +3654,7 @@ def build_run_metadata(
     }
 
 
+
 def run_energy_bvar(
     levels: pd.DataFrame,
     *,
@@ -2654,13 +3662,15 @@ def run_energy_bvar(
     vintage: str,
     p: int = 12,
     variables: Sequence[str] | None = None,
+    frequency: str = "monthly",
     exog: pd.DataFrame | None = None,
     exog_prior_scale: float = 10.0,
     prior_config: BVARSVOPriorConfig | None = None,
     sampler_config: SamplerConfig | None = None,
     code_version: str = "unversioned",
 ) -> dict:
-    """Run the generic engine and attach a cache-safe run identity."""
+    """Run the generic monthly/weekly engine and attach a cache-safe identity."""
+    frequency = _canonical_frequency(frequency)
     prior_config = BVARSVOPriorConfig() if prior_config is None else prior_config
     sampler_config = SamplerConfig() if sampler_config is None else sampler_config
     variables = list(levels.columns) if variables is None else list(variables)
@@ -2669,6 +3679,7 @@ def run_energy_bvar(
         p=p,
         variables=variables,
         exog=exog,
+        frequency=frequency,
         exog_prior_scale=exog_prior_scale,
         prior_config=prior_config,
         sampler_config=sampler_config,
@@ -2680,13 +3691,29 @@ def run_energy_bvar(
         levels=result["prep"]["levels"][variables],
         p=p,
         variables=variables,
+        frequency=frequency,
         exog=normalised_exog,
         exog_prior_scale=exog_prior_scale,
         prior_config=prior_config,
         sampler_config=sampler_config,
         code_version=code_version,
     )
+    result["metadata"].update({
+        "data_augmentation": result.get("data_augmentation", "none"),
+        "requires_data_augmentation": bool(
+            result["prep"].get("requires_data_augmentation", False)
+        ),
+        "interior_missing_dates": int(
+            result["prep"].get("n_interior_missing_dates", 0)
+        ),
+        "interior_missing_level_cells": int(
+            result["prep"].get("n_interior_missing_level_cells", 0)
+        ),
+        "dk_projection_mode": sampler_config.dk_projection_mode,
+        "dk_projection_diagnostics": result.get("dk_projection_diagnostics"),
+    })
     return result
+
 
 # Backward-compatible structural aliases. New notebooks should use the generic names.
 recursive_impact_draws_gas = recursive_impact_draws
@@ -2724,6 +3751,8 @@ __all__ = [
     "nowcast_summary_table",
     "path_horizon_table",
     "posterior_predictive_statistics",
+    "posterior_completed_differences",
+    "dk_projection_diagnostics_frame",
     "chain_acf",
     "effective_sample_size",
     "var_companion",

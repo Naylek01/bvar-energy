@@ -26,6 +26,9 @@ _HEAVY_ARRAYS = (
     "posterior_outlier_probability_draws",
     "spectral_radius",
     "log_likelihood",
+    "completed_differences_draws",
+    "missing_level_draws",
+    "last_companion_state_draws",
 )
 
 
