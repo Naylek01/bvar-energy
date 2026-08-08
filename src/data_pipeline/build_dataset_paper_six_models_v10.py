@@ -12,6 +12,7 @@ The normal names are:
     European_Commission
     World_Bank
     Eurostat
+    Eurostat_HICP
     Metadata                 (optional; audit only)
 
 ``Bloomberg`` must be the VALUES-ONLY snapshot used by Python. A separate
@@ -78,7 +79,7 @@ import pandas as pd
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_RAW_ROOT = PROJECT_ROOT / "data" / "raw"
 DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "data" / "processed"
-SCRIPT_VERSION = "2026-08-07-v9-single-workbook"
+SCRIPT_VERSION = "2026-08-08-v10-hicp-aggregation-inputs"
 
 
 # ===========================================================================
@@ -103,6 +104,11 @@ SHEET_ALIASES = {
     "eurostat": (
         "Eurostat",
         "EUROSTAT_ENERGY_VIEW",
+    ),
+    "eurostat_hicp": (
+        "Eurostat_HICP",
+        "Eurostat_hicp",
+        "EUROSTAT_HICP_VIEW",
     ),
     "metadata": ("Metadata",),
 }
@@ -190,6 +196,94 @@ EUROSTAT_REQUIRED = (
     "estat_electricity_household_vat",
     "estat_electricity_household_exc",
 )
+
+
+# Eurostat ECOICOP v2 aggregation inputs. These are validation/aggregation
+# series only; they do not enter the six BVAR estimation datasets.
+EUROSTAT_HICP_SERIES = {
+    "TOTAL": "hicp_total",
+    "NRG": "hicp_energy",
+    "ELC_GAS": "hicp_electricity_gas_solid_heat",
+    "FUEL": "hicp_fuel_special_aggregate",
+    "CP045": "hicp_household_energy",
+    "CP0451": "hicp_electricity",
+    "CP0452": "hicp_gas",
+    "CP0453": "hicp_liquid_fuels",
+    "CP0454": "hicp_solid_fuels",
+    "CP0455": "hicp_heat_cooling_energy",
+    "CP0722": "hicp_fuels_lubricants_personal_transport",
+    "CP07221": "hicp_diesel",
+    "CP07222": "hicp_petrol",
+    "CP07223": "hicp_other_transport_fuels",
+    "CP07224": "hicp_lubricants",
+}
+
+EUROSTAT_HICP_OUTPUT_ORDER = [
+    "hicp_total",
+    "hicp_energy",
+    "hicp_household_energy",
+    "hicp_electricity",
+    "hicp_gas",
+    "hicp_liquid_fuels",
+    "hicp_solid_fuels",
+    "hicp_heat_cooling_energy",
+    "hicp_fuels_lubricants_personal_transport",
+    "hicp_diesel",
+    "hicp_petrol",
+    "hicp_other_transport_fuels",
+    "hicp_lubricants",
+    "hicp_electricity_gas_solid_heat",
+    "hicp_fuel_special_aggregate",
+]
+
+EUROSTAT_HICP_REQUIRED_COLUMNS = (
+    "dataset",
+    "measure",
+    "series",
+    "date",
+    "year",
+    "coicop18",
+    "geo",
+    "statinfo",
+    "freq",
+    "unit",
+    "value",
+    "index_2025",
+    "weight_per_thousand",
+    "flag",
+)
+
+EUROSTAT_HICP_INDEX_DATASET = "prc_hicp_minr"
+EUROSTAT_HICP_WEIGHT_DATASET = "prc_hicp_iw"
+EUROSTAT_HICP_INDEX_UNIT = "I25"
+EUROSTAT_HICP_GEO = "EA"
+EUROSTAT_HICP_WEIGHT_TOLERANCE_PER_THOUSAND = 0.05
+
+# The ECOICOP-v2 back-series is deliberately not forced to have a common
+# start. Most series are backcast to 1996-01; the detailed petrol/diesel
+# split begins in 2016-12. A later start is an error; an earlier backfill is
+# surfaced as a warning and recorded in the manifest.
+EUROSTAT_HICP_EXPECTED_INDEX_START = {
+    series: pd.Timestamp("2016-12-01")
+    if code in {"CP07221", "CP07222", "CP07223", "CP07224"}
+    else pd.Timestamp("1996-01-01")
+    for code, series in EUROSTAT_HICP_SERIES.items()
+}
+
+EUROSTAT_HICP_EXPECTED_WEIGHT_START_YEAR = {
+    series: 2016
+    if code in {"CP07221", "CP07222", "CP07223", "CP07224"}
+    else 1996
+    for code, series in EUROSTAT_HICP_SERIES.items()
+}
+
+# Known ECOICOP-v2 break flag in the Eurostat back-series. Any additional
+# 'b' flag is treated as a contract change requiring review.
+EUROSTAT_HICP_EXPECTED_BREAKS = {
+    "hicp_energy": {pd.Timestamp("2017-01-01")},
+    "hicp_electricity_gas_solid_heat": {pd.Timestamp("2017-01-01")},
+    "hicp_fuel_special_aggregate": {pd.Timestamp("2017-01-01")},
+}
 
 
 # ===========================================================================
@@ -727,13 +821,464 @@ def _read_simple_sheet(
     return frame, stats
 
 
+
+def _flag_tokens(value: object) -> set[str]:
+    text = _clean_text(value).casefold()
+    if not text:
+        return set()
+    return set(re.findall(r"[a-z]+", text))
+
+
+def _read_eurostat_hicp_sheet(
+    xls: pd.ExcelFile,
+    sheet: str,
+) -> tuple[
+    pd.DataFrame,
+    pd.DataFrame,
+    dict[str, object],
+    dict[str, pd.DataFrame],
+]:
+    """Read and validate the standalone Eurostat ECOICOP-v2 HICP view."""
+    raw = pd.read_excel(xls, sheet_name=sheet, dtype=object)
+    raw_rows = len(raw)
+    if raw.empty:
+        raise ValueError(f"eurostat_hicp: sheet {sheet!r} is empty.")
+
+    raw.columns = [str(c).strip() for c in raw.columns]
+    missing_columns = [
+        column for column in EUROSTAT_HICP_REQUIRED_COLUMNS
+        if column not in raw.columns
+    ]
+    if missing_columns:
+        raise ValueError(
+            "eurostat_hicp: missing required column(s) "
+            f"{missing_columns} in sheet {sheet!r}. "
+            f"Available columns: {list(raw.columns)}"
+        )
+
+    data = raw.loc[:, EUROSTAT_HICP_REQUIRED_COLUMNS].copy()
+    for column in ("dataset", "measure", "series", "coicop18", "geo", "statinfo", "freq", "unit", "flag"):
+        data[column] = data[column].map(_clean_text)
+
+    data["date"] = _parse_dates(data["date"])
+    data["year"] = pd.to_numeric(data["year"], errors="coerce").astype("Int64")
+    for column in ("value", "index_2025", "weight_per_thousand"):
+        data[column] = pd.to_numeric(data[column], errors="coerce").replace([np.inf, -np.inf], np.nan)
+
+    allowed_measures = {"hicp_index", "hicp_weight"}
+    measures = set(data["measure"])
+    if measures != allowed_measures:
+        raise ValueError(
+            "eurostat_hicp: expected exactly measures "
+            f"{sorted(allowed_measures)}, found {sorted(measures)}."
+        )
+
+    index_rows = data.loc[data["measure"] == "hicp_index"].copy()
+    weight_rows = data.loc[data["measure"] == "hicp_weight"].copy()
+    if index_rows.empty or weight_rows.empty:
+        raise ValueError("eurostat_hicp: both index and weight blocks must be non-empty.")
+
+    # ------------------------------------------------------------------
+    # Dataset contracts
+    # ------------------------------------------------------------------
+    index_contract = {
+        "dataset": set(index_rows["dataset"]),
+        "freq": set(index_rows["freq"]),
+        "unit": set(index_rows["unit"]),
+        "geo": set(index_rows["geo"]),
+    }
+    expected_index_contract = {
+        "dataset": {EUROSTAT_HICP_INDEX_DATASET},
+        "freq": {"M"},
+        "unit": {EUROSTAT_HICP_INDEX_UNIT},
+        "geo": {EUROSTAT_HICP_GEO},
+    }
+    if index_contract != expected_index_contract:
+        raise ValueError(
+            "eurostat_hicp: monthly index contract changed. "
+            f"Expected {expected_index_contract}, found {index_contract}."
+        )
+
+    weight_contract = {
+        "dataset": set(weight_rows["dataset"]),
+        "freq": set(weight_rows["freq"]),
+        "geo": set(weight_rows["geo"]),
+    }
+    expected_weight_contract = {
+        "dataset": {EUROSTAT_HICP_WEIGHT_DATASET},
+        "freq": {"A"},
+        "geo": {EUROSTAT_HICP_GEO},
+    }
+    if weight_contract != expected_weight_contract:
+        raise ValueError(
+            "eurostat_hicp: annual weight contract changed. "
+            f"Expected {expected_weight_contract}, found {weight_contract}."
+        )
+
+    statinfo_values = sorted(v for v in set(weight_rows["statinfo"]) if v)
+    if len(statinfo_values) != 1:
+        raise ValueError(
+            "eurostat_hicp: expected exactly one non-empty statinfo value "
+            f"for item weights, found {statinfo_values}."
+        )
+    weight_statinfo = statinfo_values[0]
+
+    # ------------------------------------------------------------------
+    # Exact code -> series mapping and coverage
+    # ------------------------------------------------------------------
+    expected_codes = set(EUROSTAT_HICP_SERIES)
+    for label, block in (("indices", index_rows), ("weights", weight_rows)):
+        returned_codes = set(block["coicop18"])
+        missing_codes = sorted(expected_codes - returned_codes)
+        unexpected_codes = sorted(returned_codes - expected_codes)
+        if missing_codes or unexpected_codes:
+            raise ValueError(
+                f"eurostat_hicp {label}: ECOICOP coverage changed. "
+                f"Missing={missing_codes}; unexpected={unexpected_codes}."
+            )
+
+        for code, expected_series in EUROSTAT_HICP_SERIES.items():
+            observed_series = set(block.loc[block["coicop18"] == code, "series"])
+            if observed_series != {expected_series}:
+                raise ValueError(
+                    f"eurostat_hicp {label}: code {code} expected series "
+                    f"{expected_series!r}, found {sorted(observed_series)}."
+                )
+
+    # ------------------------------------------------------------------
+    # Key/value semantics
+    # ------------------------------------------------------------------
+    if index_rows["date"].isna().any() or index_rows["year"].isna().any():
+        raise ValueError("eurostat_hicp: every hicp_index row must have date and year.")
+    index_year = index_rows["date"].dt.year.astype("Int64")
+    if not index_year.equals(index_rows["year"].astype("Int64")):
+        bad = index_rows.loc[index_year != index_rows["year"].astype("Int64"), ["series", "date", "year"]].head()
+        raise ValueError(f"eurostat_hicp: index date/year mismatch:\n{bad}")
+
+    if weight_rows["date"].notna().any() or weight_rows["year"].isna().any():
+        raise ValueError(
+            "eurostat_hicp: hicp_weight rows must have date=null and non-null year."
+        )
+
+    bad_index_values = (
+        index_rows["value"].isna()
+        | index_rows["index_2025"].isna()
+        | index_rows["weight_per_thousand"].notna()
+        | ((index_rows["value"] - index_rows["index_2025"]).abs() > 1e-12)
+    )
+    if bad_index_values.any():
+        raise ValueError(
+            "eurostat_hicp: invalid hicp_index value mapping in "
+            f"{int(bad_index_values.sum())} row(s)."
+        )
+
+    bad_weight_values = (
+        weight_rows["value"].isna()
+        | weight_rows["weight_per_thousand"].isna()
+        | weight_rows["index_2025"].notna()
+        | ((weight_rows["value"] - weight_rows["weight_per_thousand"]).abs() > 1e-12)
+    )
+    if bad_weight_values.any():
+        raise ValueError(
+            "eurostat_hicp: invalid hicp_weight value mapping in "
+            f"{int(bad_weight_values.sum())} row(s)."
+        )
+
+    if index_rows.duplicated(["series", "date", "measure"]).any():
+        raise ValueError("eurostat_hicp: duplicate (series, date, measure) index key.")
+    if weight_rows.duplicated(["series", "year", "measure"]).any():
+        raise ValueError("eurostat_hicp: duplicate (series, year, measure) weight key.")
+
+    # ------------------------------------------------------------------
+    # Calendar continuity + explicit starts
+    # ------------------------------------------------------------------
+    start_status: dict[str, dict[str, object]] = {}
+    for series in EUROSTAT_HICP_OUTPUT_ORDER:
+        idx = index_rows.loc[index_rows["series"] == series].sort_values("date")
+        years = weight_rows.loc[weight_rows["series"] == series].sort_values("year")
+
+        dates = pd.DatetimeIndex(idx["date"])
+        expected_dates = pd.date_range(dates.min(), dates.max(), freq="MS")
+        missing_dates = expected_dates.difference(dates)
+        if len(missing_dates):
+            raise ValueError(
+                f"eurostat_hicp {series}: monthly calendar gap; "
+                f"first missing {missing_dates[0].date()}."
+            )
+
+        year_values = years["year"].astype(int).to_numpy()
+        expected_years = np.arange(year_values.min(), year_values.max() + 1)
+        missing_years = sorted(set(expected_years) - set(year_values))
+        if missing_years:
+            raise ValueError(
+                f"eurostat_hicp {series}: annual weight gap; "
+                f"first missing year {missing_years[0]}."
+            )
+
+        actual_start = dates.min()
+        expected_start = EUROSTAT_HICP_EXPECTED_INDEX_START[series]
+        actual_weight_start = int(year_values.min())
+        expected_weight_start = EUROSTAT_HICP_EXPECTED_WEIGHT_START_YEAR[series]
+
+        if actual_start > expected_start:
+            raise ValueError(
+                f"eurostat_hicp {series}: index starts {actual_start.date()}, "
+                f"later than expected {expected_start.date()}."
+            )
+        if actual_start < expected_start:
+            warnings.warn(
+                f"eurostat_hicp {series}: Eurostat now backfills the index to "
+                f"{actual_start.date()}, earlier than expected {expected_start.date()}. "
+                "Review the historical aggregation contract.",
+                stacklevel=2,
+            )
+
+        if actual_weight_start > expected_weight_start:
+            raise ValueError(
+                f"eurostat_hicp {series}: weights start {actual_weight_start}, "
+                f"later than expected {expected_weight_start}."
+            )
+        if actual_weight_start < expected_weight_start:
+            warnings.warn(
+                f"eurostat_hicp {series}: Eurostat now backfills weights to "
+                f"{actual_weight_start}, earlier than expected {expected_weight_start}. "
+                "Review the historical aggregation contract.",
+                stacklevel=2,
+            )
+
+        start_status[series] = {
+            "expected_index_start": expected_start.date().isoformat(),
+            "actual_index_start": actual_start.date().isoformat(),
+            "expected_weight_start_year": expected_weight_start,
+            "actual_weight_start_year": actual_weight_start,
+        }
+
+    latest_weight_year = int(weight_rows["year"].max())
+    latest_weight_series = set(
+        weight_rows.loc[weight_rows["year"] == latest_weight_year, "series"]
+    )
+    missing_latest_weights = sorted(set(EUROSTAT_HICP_OUTPUT_ORDER) - latest_weight_series)
+    if missing_latest_weights:
+        raise ValueError(
+            f"eurostat_hicp: latest weight year {latest_weight_year} is missing "
+            f"series {missing_latest_weights}."
+        )
+
+    # ------------------------------------------------------------------
+    # Break flags: 2017-01 is a known classification break for NRG/FUEL/ELC_GAS.
+    # Other flags (d, e, ...) are preserved and exported, not discarded.
+    # ------------------------------------------------------------------
+    actual_breaks: dict[str, set[pd.Timestamp]] = {}
+    for row in index_rows.itertuples(index=False):
+        if "b" in _flag_tokens(row.flag):
+            actual_breaks.setdefault(row.series, set()).add(pd.Timestamp(row.date))
+
+    expected_breaks = {
+        series: set(dates)
+        for series, dates in EUROSTAT_HICP_EXPECTED_BREAKS.items()
+    }
+    all_break_series = set(actual_breaks) | set(expected_breaks)
+    for series in sorted(all_break_series):
+        actual = actual_breaks.get(series, set())
+        expected = expected_breaks.get(series, set())
+        if actual != expected:
+            raise ValueError(
+                f"eurostat_hicp {series}: break-flag contract changed. "
+                f"Expected {[d.date().isoformat() for d in sorted(expected)]}, "
+                f"found {[d.date().isoformat() for d in sorted(actual)]}."
+            )
+
+    # ------------------------------------------------------------------
+    # Wide aggregation inputs
+    # ------------------------------------------------------------------
+    indices = (
+        index_rows.pivot(index="date", columns="series", values="index_2025")
+        .sort_index()
+        .reindex(columns=EUROSTAT_HICP_OUTPUT_ORDER)
+    )
+    indices.index = pd.DatetimeIndex(indices.index, name="date")
+
+    weights = (
+        weight_rows.assign(year_int=weight_rows["year"].astype(int))
+        .pivot(index="year_int", columns="series", values="weight_per_thousand")
+        .sort_index()
+        .reindex(columns=EUROSTAT_HICP_OUTPUT_ORDER)
+    )
+    weights.index.name = "year"
+
+    # ------------------------------------------------------------------
+    # Weight identities. Raw Eurostat per-thousand weights are tested BEFORE
+    # any intra-energy renormalization.
+    # ------------------------------------------------------------------
+    by_code = (
+        weight_rows.assign(year_int=weight_rows["year"].astype(int))
+        .pivot(index="year_int", columns="coicop18", values="weight_per_thousand")
+        .sort_index()
+    )
+
+    identity_records: list[dict[str, object]] = []
+
+    def add_identity(
+        name: str,
+        required_codes: list[str],
+        lhs,
+        rhs,
+        *,
+        guard_start_year: int | None = None,
+    ) -> None:
+        available = by_code[required_codes].dropna()
+        if available.empty:
+            raise ValueError(f"eurostat_hicp: no complete years for weight identity {name!r}.")
+        for year, row in available.iterrows():
+            lhs_value = float(lhs(row))
+            rhs_value = float(rhs(row))
+            error = lhs_value - rhs_value
+            guarded = guard_start_year is None or int(year) >= guard_start_year
+            status = (
+                "pass"
+                if guarded and abs(error) <= EUROSTAT_HICP_WEIGHT_TOLERANCE_PER_THOUSAND
+                else "fail"
+                if guarded
+                else "transition_not_guarded"
+            )
+            identity_records.append({
+                "year": int(year),
+                "identity": name,
+                "lhs_per_thousand": lhs_value,
+                "rhs_per_thousand": rhs_value,
+                "error_per_thousand": error,
+                "abs_error_per_thousand": abs(error),
+                "tolerance_per_thousand": EUROSTAT_HICP_WEIGHT_TOLERANCE_PER_THOUSAND,
+                "guarded": bool(guarded),
+                "status": status,
+            })
+            if guarded and abs(error) > EUROSTAT_HICP_WEIGHT_TOLERANCE_PER_THOUSAND:
+                raise ValueError(
+                    f"eurostat_hicp weight identity {name!r} fails in {int(year)}: "
+                    f"lhs={lhs_value:.6f}, rhs={rhs_value:.6f}, "
+                    f"error={error:.6f} per thousand."
+                )
+
+    add_identity(
+        "CP045 = CP0451 + CP0452 + CP0453 + CP0454 + CP0455",
+        ["CP045", "CP0451", "CP0452", "CP0453", "CP0454", "CP0455"],
+        lambda r: r["CP045"],
+        lambda r: r["CP0451"] + r["CP0452"] + r["CP0453"] + r["CP0454"] + r["CP0455"],
+    )
+    add_identity(
+        "NRG = ELC_GAS + FUEL",
+        ["NRG", "ELC_GAS", "FUEL"],
+        lambda r: r["NRG"],
+        lambda r: r["ELC_GAS"] + r["FUEL"],
+    )
+    add_identity(
+        "CP0722 = CP07221 + CP07222 + CP07223 + CP07224",
+        ["CP0722", "CP07221", "CP07222", "CP07223", "CP07224"],
+        lambda r: r["CP0722"],
+        lambda r: r["CP07221"] + r["CP07222"] + r["CP07223"] + r["CP07224"],
+        guard_start_year=2016,
+    )
+    add_identity(
+        "NRG = CP045 + CP0722 - CP07224",
+        ["NRG", "CP045", "CP0722", "CP07224"],
+        lambda r: r["NRG"],
+        lambda r: r["CP045"] + r["CP0722"] - r["CP07224"],
+        guard_start_year=2017,
+    )
+    add_identity(
+        "FUEL = CP0453 + CP0722 - CP07224",
+        ["FUEL", "CP0453", "CP0722", "CP07224"],
+        lambda r: r["FUEL"],
+        lambda r: r["CP0453"] + r["CP0722"] - r["CP07224"],
+        guard_start_year=2017,
+    )
+
+    identity_diagnostics = pd.DataFrame(identity_records).sort_values(["identity", "year"])
+
+    # ------------------------------------------------------------------
+    # Dated flag export and per-series audit metadata
+    # ------------------------------------------------------------------
+    flagged = data.loc[data["flag"].map(bool)].copy()
+    flags = flagged[
+        ["measure", "series", "coicop18", "date", "year", "flag"]
+    ].sort_values(["series", "measure", "date", "year"], na_position="last")
+
+    metadata_rows: list[dict[str, object]] = []
+    for code, series in EUROSTAT_HICP_SERIES.items():
+        idx = index_rows.loc[index_rows["series"] == series].sort_values("date")
+        wt = weight_rows.loc[weight_rows["series"] == series].sort_values("year")
+        index_flag_codes = sorted(
+            set().union(*(_flag_tokens(v) for v in idx["flag"]))
+        )
+        weight_flag_codes = sorted(
+            set().union(*(_flag_tokens(v) for v in wt["flag"]))
+        )
+        break_dates = sorted(
+            pd.Timestamp(r.date).date().isoformat()
+            for r in idx.itertuples(index=False)
+            if "b" in _flag_tokens(r.flag)
+        )
+        metadata_rows.append({
+            "series": series,
+            "coicop18": code,
+            "geo": EUROSTAT_HICP_GEO,
+            "index_dataset": EUROSTAT_HICP_INDEX_DATASET,
+            "index_unit": EUROSTAT_HICP_INDEX_UNIT,
+            "index_first_date": idx["date"].min().date().isoformat(),
+            "index_last_date": idx["date"].max().date().isoformat(),
+            "index_observations": int(len(idx)),
+            "weight_dataset": EUROSTAT_HICP_WEIGHT_DATASET,
+            "weight_statinfo": weight_statinfo,
+            "weight_first_year": int(wt["year"].min()),
+            "weight_last_year": int(wt["year"].max()),
+            "weight_observations": int(len(wt)),
+            "index_flag_codes": "|".join(index_flag_codes),
+            "weight_flag_codes": "|".join(weight_flag_codes),
+            "break_dates": "|".join(break_dates),
+            **start_status[series],
+        })
+    series_metadata = pd.DataFrame(metadata_rows)
+
+    stats = {
+        "raw_rows": int(raw_rows),
+        "retained_rows": int(len(data)),
+        "columns": int(raw.shape[1]),
+        "input_order": "long_by_series",
+        "invalid_date_rows": 0,
+        "duplicate_date_rows": 0,
+        "duplicate_dates": 0,
+        "all_missing_rows_dropped": 0,
+        "error_markers_coerced_to_nan": 0,
+        "first_date": indices.index.min().date().isoformat(),
+        "last_date": indices.index.max().date().isoformat(),
+        "first_weight_year": int(weights.index.min()),
+        "last_weight_year": int(weights.index.max()),
+        "geo": EUROSTAT_HICP_GEO,
+        "index_unit": EUROSTAT_HICP_INDEX_UNIT,
+        "weight_statinfo": weight_statinfo,
+        "index_rows": int(len(index_rows)),
+        "weight_rows": int(len(weight_rows)),
+        "flagged_rows": int(len(flags)),
+    }
+
+    audit = {
+        "series_metadata": series_metadata,
+        "flags": flags,
+        "weight_identities": identity_diagnostics,
+        "weight_statinfo": weight_statinfo,
+        "latest_weight_year": latest_weight_year,
+    }
+    return indices, weights, stats, audit
+
+
 def _read_workbook_sources(raw_path: Path) -> tuple[
     dict[str, pd.DataFrame],
     dict[str, dict[str, object]],
     dict[str, str],
     list[dict[str, object]],
+    dict[str, object],
 ]:
-    """Read all five source blocks directly from one saved workbook."""
+    """Read the model-source blocks plus the standalone HICP aggregation view."""
     try:
         xls = pd.ExcelFile(raw_path, engine="openpyxl")
     except ImportError as exc:
@@ -744,7 +1289,14 @@ def _read_workbook_sources(raw_path: Path) -> tuple[
 
     resolved = {
         logical: _sheet_name(xls, logical)
-        for logical in ("haver", "bloomberg", "european_commission", "world_bank", "eurostat")
+        for logical in (
+            "haver",
+            "bloomberg",
+            "european_commission",
+            "world_bank",
+            "eurostat",
+            "eurostat_hicp",
+        )
     }
 
     frames: dict[str, pd.DataFrame] = {}
@@ -776,6 +1328,16 @@ def _read_workbook_sources(raw_path: Path) -> tuple[
         required_columns=EUROSTAT_REQUIRED,
     )
 
+    (
+        frames["eurostat_hicp_indices"],
+        frames["eurostat_hicp_weights"],
+        stats["eurostat_hicp"],
+        hicp_audit,
+    ) = _read_eurostat_hicp_sheet(
+        xls,
+        resolved["eurostat_hicp"],
+    )
+
     # Metadata is not an input to any transformation. Preserve it only as an
     # audit snapshot in the manifest when present.
     metadata_records: list[dict[str, object]] = []
@@ -788,7 +1350,7 @@ def _read_workbook_sources(raw_path: Path) -> tuple[
                 metadata_records.append({f"column_{i+1}": value for i, value in enumerate(values)})
         resolved["metadata"] = metadata_sheet
 
-    return frames, stats, resolved, metadata_records
+    return frames, stats, resolved, metadata_records, hicp_audit
 
 
 # ===========================================================================
@@ -1471,12 +2033,14 @@ def build_model_datasets(
             "or choose another --build-vintage."
         )
 
-    frames, read_stats, sheets, metadata_records = _read_workbook_sources(raw)
+    frames, read_stats, sheets, metadata_records, hicp_audit = _read_workbook_sources(raw)
     wob = frames["european_commission"]
     world_bank = frames["world_bank"]
     bloomberg = frames["bloomberg"]
     haver = frames["haver"]
     eurostat = frames["eurostat"]
+    hicp_indices = frames["eurostat_hicp_indices"]
+    hicp_weights = frames["eurostat_hicp_weights"]
 
     # ------------------------------------------------------------------
     # Bloomberg: daily inputs -> EUR units -> weekly/monthly aggregation
@@ -1687,6 +2251,22 @@ def build_model_datasets(
     )
     partial_inputs_frame.to_csv(partial_inputs_path, index=False)
 
+    # ------------------------------------------------------------------
+    # HICP aggregation inputs. These are kept separate from the six model
+    # datasets and preserve raw Eurostat item-weight units (per thousand).
+    # ------------------------------------------------------------------
+    hicp_indices_path = output_dir / "hicp_indices_monthly.csv"
+    hicp_weights_path = output_dir / "hicp_weights_annual.csv"
+    hicp_series_metadata_path = output_dir / "hicp_series_metadata.csv"
+    hicp_flags_path = output_dir / "hicp_flags.csv"
+    hicp_weight_identities_path = output_dir / "hicp_weight_identity_diagnostics.csv"
+
+    hicp_indices.to_csv(hicp_indices_path, date_format="%Y-%m-%d")
+    hicp_weights.to_csv(hicp_weights_path, index_label="year")
+    hicp_audit["series_metadata"].to_csv(hicp_series_metadata_path, index=False)
+    hicp_audit["flags"].to_csv(hicp_flags_path, index=False, date_format="%Y-%m-%d")
+    hicp_audit["weight_identities"].to_csv(hicp_weight_identities_path, index=False)
+
     workbook_hash = _sha256(raw)
     snapshot_label = raw.parent.name if snapshot_vintage else "unversioned_workbook"
     source_table = pd.DataFrame([
@@ -1700,13 +2280,25 @@ def build_model_datasets(
             "input_columns": read_stats[source]["columns"],
             "first_observation": read_stats[source]["first_date"],
             "last_observation": read_stats[source]["last_date"],
+            "first_weight_year": read_stats[source].get("first_weight_year"),
+            "last_weight_year": read_stats[source].get("last_weight_year"),
+            "geo_contract": read_stats[source].get("geo"),
+            "statinfo_contract": read_stats[source].get("weight_statinfo"),
+            "unit_contract": read_stats[source].get("index_unit"),
             "input_order_in_excel": read_stats[source]["input_order"],
             "invalid_date_rows": read_stats[source]["invalid_date_rows"],
             "duplicate_date_rows": read_stats[source]["duplicate_date_rows"],
             "all_missing_rows_dropped": read_stats[source]["all_missing_rows_dropped"],
             "error_markers_coerced_to_nan": read_stats[source]["error_markers_coerced_to_nan"],
         }
-        for source in ("haver", "bloomberg", "european_commission", "world_bank", "eurostat")
+        for source in (
+            "haver",
+            "bloomberg",
+            "european_commission",
+            "world_bank",
+            "eurostat",
+            "eurostat_hicp",
+        )
     ])
     source_table.to_csv(sources_path, index=False)
 
@@ -1732,6 +2324,40 @@ def build_model_datasets(
         ),
         "source_read_statistics": read_stats,
         "metadata_sheet_records": metadata_records,
+        "hicp_aggregation_inputs": {
+            "source_sheet": sheets["eurostat_hicp"],
+            "index_dataset": EUROSTAT_HICP_INDEX_DATASET,
+            "weight_dataset": EUROSTAT_HICP_WEIGHT_DATASET,
+            "geo": EUROSTAT_HICP_GEO,
+            "index_unit": EUROSTAT_HICP_INDEX_UNIT,
+            "weight_statinfo": hicp_audit["weight_statinfo"],
+            "weight_unit": "per thousand of total HICP; raw published weights, not renormalized",
+            "latest_weight_year": int(hicp_audit["latest_weight_year"]),
+            "weight_identity_tolerance_per_thousand": EUROSTAT_HICP_WEIGHT_TOLERANCE_PER_THOUSAND,
+            "known_break_contract": {
+                series: [stamp.date().isoformat() for stamp in sorted(dates)]
+                for series, dates in EUROSTAT_HICP_EXPECTED_BREAKS.items()
+            },
+            "historical_regime_note": (
+                "NRG/FUEL/ELC_GAS carry Eurostat definition-differs flags through "
+                "2016 and a break flag in 2017-01. Current ECOICOP-v2 component "
+                "identities are therefore hard-guarded from 2017 onward, while "
+                "the special-aggregate identity NRG = ELC_GAS + FUEL is checked "
+                "over the full available history."
+            ),
+            "future_weight_policy_for_aggregation_module": (
+                "If a forecast crosses into a calendar year whose weights are not "
+                "yet published in the selected vintage, carry forward the latest "
+                "published annual weights. This builder only stores published weights."
+            ),
+            "files": {
+                "indices_monthly": str(hicp_indices_path.resolve()),
+                "weights_annual": str(hicp_weights_path.resolve()),
+                "series_metadata": str(hicp_series_metadata_path.resolve()),
+                "flags": str(hicp_flags_path.resolve()),
+                "weight_identity_diagnostics": str(hicp_weight_identities_path.resolve()),
+            },
+        },
         "bloomberg_mapping": BLOOMBERG_TICKERS,
         "bloomberg_units": BLOOMBERG_UNITS,
         "refined_petroleum_policy": (
@@ -1798,6 +2424,11 @@ def build_model_datasets(
             "source_vintages": str(sources_path.resolve()),
             "aggregation_coverage": str(coverage_path.resolve()),
             "partial_period_inputs": str(partial_inputs_path.resolve()),
+            "hicp_indices_monthly": str(hicp_indices_path.resolve()),
+            "hicp_weights_annual": str(hicp_weights_path.resolve()),
+            "hicp_series_metadata": str(hicp_series_metadata_path.resolve()),
+            "hicp_flags": str(hicp_flags_path.resolve()),
+            "hicp_weight_identity_diagnostics": str(hicp_weight_identities_path.resolve()),
         },
     }
 
@@ -1810,6 +2441,11 @@ def build_model_datasets(
         "source_vintages": _sha256(sources_path),
         "aggregation_coverage": _sha256(coverage_path),
         "partial_period_inputs": _sha256(partial_inputs_path),
+        "hicp_indices_monthly": _sha256(hicp_indices_path),
+        "hicp_weights_annual": _sha256(hicp_weights_path),
+        "hicp_series_metadata": _sha256(hicp_series_metadata_path),
+        "hicp_flags": _sha256(hicp_flags_path),
+        "hicp_weight_identity_diagnostics": _sha256(hicp_weight_identities_path),
     }
     manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
 
@@ -1818,6 +2454,11 @@ def build_model_datasets(
         "source_vintages": sources_path,
         "aggregation_coverage": coverage_path,
         "partial_period_inputs": partial_inputs_path,
+        "hicp_indices_monthly": hicp_indices_path,
+        "hicp_weights_annual": hicp_weights_path,
+        "hicp_series_metadata": hicp_series_metadata_path,
+        "hicp_flags": hicp_flags_path,
+        "hicp_weight_identity_diagnostics": hicp_weight_identities_path,
         "manifest": manifest_path,
     })
 
@@ -1825,12 +2466,24 @@ def build_model_datasets(
     print(f"Raw workbook:  {raw}")
     print(f"Build vintage: {build_vintage}")
     print("Source sheets:")
-    for source in ("haver", "bloomberg", "european_commission", "world_bank", "eurostat"):
+    for source in (
+        "haver",
+        "bloomberg",
+        "european_commission",
+        "world_bank",
+        "eurostat",
+        "eurostat_hicp",
+    ):
         stat = read_stats[source]
+        suffix = (
+            f"; weights {stat['first_weight_year']} -> {stat['last_weight_year']}"
+            if source == "eurostat_hicp"
+            else ""
+        )
         print(
             f"  {source:22s} {sheets[source]:22s} "
             f"{stat['first_date']} -> {stat['last_date']} "
-            f"({stat['retained_rows']:,} rows; Excel order {stat['input_order']})"
+            f"({stat['retained_rows']:,} rows; Excel order {stat['input_order']}{suffix})"
         )
 
     partial = [row for row in aggregation_coverage if not row["final_period_complete"]]
@@ -1851,6 +2504,17 @@ def build_model_datasets(
             f"  {spec['file']:30s} {panel.index.min().date()} -> "
             f"{panel.index.max().date()} | {len(panel):,} rows | {panel.shape[1]} series"
         )
+    print("\nHICP aggregation inputs:")
+    print(
+        f"  {hicp_indices_path.name:30s} {hicp_indices.index.min().date()} -> "
+        f"{hicp_indices.index.max().date()} | {len(hicp_indices):,} months | "
+        f"{hicp_indices.shape[1]} series"
+    )
+    print(
+        f"  {hicp_weights_path.name:30s} {int(hicp_weights.index.min())} -> "
+        f"{int(hicp_weights.index.max())} | {len(hicp_weights):,} years | "
+        f"{hicp_weights.shape[1]} series"
+    )
     print(f"\nOutput directory: {output_dir}")
     return outputs
 

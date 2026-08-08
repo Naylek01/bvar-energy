@@ -922,6 +922,14 @@ def _plot_observed_history(ax, actual: pd.Series, last_obs: int):
     )
 
 
+def _missing_method_title_suffix(obj: Mapping) -> str:
+    """Surface approximate missing-data treatment on forecast figures."""
+    if bool(obj.get("missing_treatment_exact", True)):
+        return ""
+    method = str(obj.get("missing_data_method", "linear")).upper()
+    return f"  [{method} missing-data approximation]"
+
+
 def plot_forecast_fan(
     forecast: Mapping,
     historical_levels: pd.DataFrame,
@@ -983,7 +991,8 @@ def plot_forecast_fan(
             label="Forecast origin",
         )
 
-    ax.set_title(title or f"Ragged-edge nowcast and forecast — {variable}")
+    base_title = title or f"Ragged-edge nowcast and forecast — {variable}"
+    ax.set_title(base_title + _missing_method_title_suffix(forecast))
     ax.set_ylabel(ylabel)
     ax.grid(alpha=0.22)
     ax.legend(frameon=False, ncol=2)
@@ -1039,7 +1048,8 @@ def plot_nowcast_fan(
         linewidth=1.0,
         label="Balanced-sample end",
     )
-    ax.set_title(title or f"Ragged-edge nowcast — {variable}")
+    base_title = title or f"Ragged-edge nowcast — {variable}"
+    ax.set_title(base_title + _missing_method_title_suffix(forecast))
     ax.set_ylabel(ylabel)
     ax.grid(alpha=0.20)
     ax.legend(frameon=False, ncol=2)
@@ -1145,7 +1155,11 @@ def plot_forecast_comparison(
             label="Forecast origin",
         )
 
-    ax.set_title(title or f"Unconditional versus conditional forecast — {variable}")
+    base_title = title or f"Unconditional versus conditional forecast — {variable}"
+    suffix = _missing_method_title_suffix(unconditional)
+    if _missing_method_title_suffix(conditional) != suffix:
+        suffix = "  [mixed missing-data treatments]"
+    ax.set_title(base_title + suffix)
     ax.set_ylabel(ylabel)
     ax.grid(alpha=0.22)
     ax.legend(frameon=False, ncol=2)
@@ -1279,10 +1293,668 @@ def plot_hicp_forecast_fan(
                 label="Forecast origin",
             )
 
-    ax.set_title(title)
+    ax.set_title(title + _missing_method_title_suffix(hicp_forecast))
     ax.set_ylabel(ylabel)
     ax.grid(alpha=0.22)
     ax.legend(frameon=False, ncol=2)
+    fig.tight_layout()
+    return fig
+
+def _validated_tax_inflation_arrays(tax_forecast: Mapping):
+    pre = np.asarray(tax_forecast["pre_tax_inflation_paths"], dtype=float)
+    post = np.asarray(tax_forecast["post_tax_inflation_paths"], dtype=float)
+    baseline_post = np.asarray(
+        tax_forecast.get("baseline_post_tax_inflation_paths", post),
+        dtype=float,
+    )
+    dates = pd.DatetimeIndex(tax_forecast["path_dates"])
+    expected = (pre.ndim == 2 and pre.shape[1] == len(dates))
+    if not expected or post.shape != pre.shape or baseline_post.shape != pre.shape:
+        raise ValueError(
+            "Tax inflation paths must all have shape (n_draws, len(path_dates))."
+        )
+    return pre, post, baseline_post, dates
+
+
+def tax_inflation_spread_table(
+    tax_forecast: Mapping,
+    *,
+    future_only: bool = True,
+) -> pd.DataFrame:
+    """Posterior tax wedge: post-tax inflation minus pre-tax inflation.
+
+    The headline statistic is the median of the draw-wise wedge, not the
+    difference between the two marginal medians. Both are retained so the
+    vertical separation of plotted median curves can still be inspected.
+    """
+    pre, post, _, dates = _validated_tax_inflation_arrays(tax_forecast)
+    wedge = post - pre
+    pre_median = np.nanmedian(pre, axis=0)
+    post_median = np.nanmedian(post, axis=0)
+    frame = pd.DataFrame(
+        {
+            "pre_tax_median": pre_median,
+            "post_tax_median": post_median,
+            "spread_of_medians_pp": post_median - pre_median,
+            "tax_wedge_median_pp": np.nanmedian(wedge, axis=0),
+            "tax_wedge_q16_pp": np.nanquantile(wedge, 0.16, axis=0),
+            "tax_wedge_q84_pp": np.nanquantile(wedge, 0.84, axis=0),
+        },
+        index=dates,
+    )
+    frame.index.name = "date"
+    if future_only:
+        frame = frame.reindex(pd.DatetimeIndex(tax_forecast["future_dates"]))
+    return frame
+
+
+def tax_scenario_impact_table(
+    tax_forecast: Mapping,
+    *,
+    future_only: bool = True,
+) -> pd.DataFrame:
+    """Posterior impact of the tax scenario on full/post-tax inflation."""
+    _, post, baseline_post, dates = _validated_tax_inflation_arrays(tax_forecast)
+    impact = post - baseline_post
+    frame = pd.DataFrame(
+        {
+            "baseline_post_tax_median": np.nanmedian(baseline_post, axis=0),
+            "scenario_post_tax_median": np.nanmedian(post, axis=0),
+            "scenario_impact_median_pp": np.nanmedian(impact, axis=0),
+            "scenario_impact_q16_pp": np.nanquantile(impact, 0.16, axis=0),
+            "scenario_impact_q84_pp": np.nanquantile(impact, 0.84, axis=0),
+        },
+        index=dates,
+    )
+    frame.index.name = "date"
+    if future_only:
+        frame = frame.reindex(pd.DatetimeIndex(tax_forecast["future_dates"]))
+    return frame
+
+
+def _annotation_dates(
+    dates: pd.DatetimeIndex,
+    future_dates: pd.DatetimeIndex,
+    annotations: str | Sequence[pd.Timestamp] | None,
+) -> pd.DatetimeIndex:
+    if annotations is None or annotations == "none":
+        return pd.DatetimeIndex([])
+    if isinstance(annotations, str):
+        key = annotations.lower()
+        if key == "last":
+            return future_dates[-1:]
+        if key == "all":
+            return future_dates
+        raise ValueError("annotations must be 'last', 'all', None, or a date sequence.")
+    selected = pd.DatetimeIndex(annotations)
+    missing = selected.difference(dates)
+    if len(missing):
+        raise ValueError(
+            "Annotation dates are absent from the forecast path: "
+            f"{missing.strftime('%Y-%m-%d').tolist()}"
+        )
+    return selected
+
+
+def _annotate_drawwise_effect(
+    ax,
+    dates: pd.DatetimeIndex,
+    lower_curve: np.ndarray,
+    upper_curve: np.ndarray,
+    effect_median: np.ndarray,
+    effect_q16: np.ndarray,
+    effect_q84: np.ndarray,
+    annotation_dates: pd.DatetimeIndex,
+    decimals: int,
+):
+    positions = {pd.Timestamp(date): i for i, date in enumerate(dates)}
+    for date in annotation_dates:
+        i = positions[pd.Timestamp(date)]
+        y0 = float(lower_curve[i])
+        y1 = float(upper_curve[i])
+        effect = float(effect_median[i])
+        lo = float(effect_q16[i])
+        hi = float(effect_q84[i])
+        if not np.all(np.isfinite([y0, y1, effect, lo, hi])):
+            continue
+        ax.annotate(
+            "",
+            xy=(date, y1),
+            xytext=(date, y0),
+            arrowprops={"arrowstyle": "<->", "color": "0.25", "lw": 1.0},
+            zorder=7,
+        )
+        ax.annotate(
+            f"{effect:+.{decimals}f} pp\n68% [{lo:+.{decimals}f}, {hi:+.{decimals}f}]",
+            xy=(date, 0.5 * (y0 + y1)),
+            xytext=(7, 0),
+            textcoords="offset points",
+            ha="left",
+            va="center",
+            fontsize=8.5,
+            bbox={"boxstyle": "round,pad=0.20", "fc": "white", "ec": "0.70", "alpha": 0.92},
+            zorder=8,
+        )
+
+
+def plot_tax_inflation_comparison(
+    tax_forecast: Mapping,
+    *,
+    last_obs: int = 72,
+    component_label: str = "energy",
+    show_intervals: bool = True,
+    spread_annotations: str | Sequence[pd.Timestamp] | None = "last",
+    decimals: int = 2,
+    title: str | None = None,
+):
+    """Plot pre-tax versus realised post-tax inflation from matched draws."""
+    pre, post, _, dates = _validated_tax_inflation_arrays(tax_forecast)
+    future_dates = pd.DatetimeIndex(tax_forecast["future_dates"])
+    pre_q = np.nanquantile(pre, [0.16, 0.50, 0.84], axis=0)
+    post_q = np.nanquantile(post, [0.16, 0.50, 0.84], axis=0)
+    wedge = post - pre
+    wedge_q = np.nanquantile(wedge, [0.16, 0.50, 0.84], axis=0)
+
+    fig, ax = plt.subplots(figsize=(11.5, 5.0))
+    actual_pre = tax_forecast.get("actual_pre_tax_inflation")
+    actual_post = tax_forecast.get("actual_post_tax_inflation")
+    if actual_pre is not None:
+        series = pd.Series(actual_pre).dropna().iloc[-last_obs:]
+        ax.plot(series.index, series.to_numpy(dtype=float), color=_FORECAST_DARK,
+                linewidth=1.15, alpha=0.60, label="Observed pre-tax inflation")
+    if actual_post is not None:
+        series = pd.Series(actual_post).dropna().iloc[-last_obs:]
+        ax.plot(series.index, series.to_numpy(dtype=float), color=_CONDITIONAL_DARK,
+                linewidth=1.15, alpha=0.60, label="Observed post-tax inflation")
+
+    if show_intervals:
+        ax.fill_between(dates, pre_q[0], pre_q[2], color=_FORECAST_MID, alpha=0.20,
+                        label="Pre-tax 68% interval")
+        ax.fill_between(dates, post_q[0], post_q[2], color=_CONDITIONAL_MID, alpha=0.18,
+                        label="Post-tax 68% interval")
+    ax.plot(dates, pre_q[1], color=_FORECAST_DARK, linewidth=2.0,
+            label="Pre-tax median", zorder=5)
+    ax.plot(dates, post_q[1], color=_CONDITIONAL_DARK, linewidth=2.0,
+            label="Post-tax median", zorder=5)
+
+    if len(future_dates):
+        future_mask = dates.isin(future_dates)
+        ax.fill_between(dates[future_mask], pre_q[1][future_mask], post_q[1][future_mask],
+                        color="0.55", alpha=0.12, label="Median-line separation", zorder=1)
+        ax.axvline(future_dates[0], color="0.50", linestyle=":", linewidth=1.0,
+                   label="First forecast period")
+
+    selected = _annotation_dates(dates, future_dates, spread_annotations)
+    _annotate_drawwise_effect(
+        ax, dates, pre_q[1], post_q[1], wedge_q[1], wedge_q[0], wedge_q[2],
+        selected, decimals,
+    )
+
+    unit = str(tax_forecast.get("inflation_unit", "percent"))
+    base_title = title or f"Pre-tax versus post-tax inflation — {component_label}"
+    ax.set_title(base_title + _missing_method_title_suffix(tax_forecast))
+    ax.set_ylabel(unit)
+    ax.axhline(0.0, color="0.55", linewidth=0.8)
+    ax.grid(alpha=0.20)
+    ax.legend(frameon=False, ncol=2)
+    fig.tight_layout()
+    return fig
+
+
+def plot_tax_scenario_impact(
+    tax_forecast: Mapping,
+    *,
+    last_obs: int = 72,
+    component_label: str = "energy",
+    show_intervals: bool = True,
+    impact_annotations: str | Sequence[pd.Timestamp] | None = "last",
+    decimals: int = 2,
+    title: str | None = None,
+):
+    """Compare baseline full inflation with the conditioned tax scenario."""
+    _, post, baseline_post, dates = _validated_tax_inflation_arrays(tax_forecast)
+    future_dates = pd.DatetimeIndex(tax_forecast["future_dates"])
+    scenario = dict(tax_forecast.get("tax_scenario", {}))
+    if not scenario.get("active", False):
+        raise ValueError("tax_forecast contains no active tax scenario.")
+
+    baseline_q = np.nanquantile(baseline_post, [0.16, 0.50, 0.84], axis=0)
+    scenario_q = np.nanquantile(post, [0.16, 0.50, 0.84], axis=0)
+    impact = post - baseline_post
+    impact_q = np.nanquantile(impact, [0.16, 0.50, 0.84], axis=0)
+
+    fig, ax = plt.subplots(figsize=(11.5, 5.0))
+    actual_post = tax_forecast.get("actual_post_tax_inflation")
+    if actual_post is not None:
+        series = pd.Series(actual_post).dropna().iloc[-last_obs:]
+        ax.plot(series.index, series.to_numpy(dtype=float), color=_OBSERVED_COLOR,
+                linewidth=1.25, label="Observed full inflation")
+
+    if show_intervals:
+        ax.fill_between(dates, baseline_q[0], baseline_q[2], color=_FORECAST_MID,
+                        alpha=0.18, label="Baseline 68% interval")
+        ax.fill_between(dates, scenario_q[0], scenario_q[2], color=_CONDITIONAL_MID,
+                        alpha=0.16, label="Tax scenario 68% interval")
+    ax.plot(dates, baseline_q[1], color=_FORECAST_DARK, linewidth=2.0,
+            label="Baseline full-inflation median")
+    ax.plot(dates, scenario_q[1], color=_CONDITIONAL_DARK, linewidth=2.0,
+            linestyle="--", label="Tax-scenario full-inflation median")
+
+    start = scenario.get("effective_start_date")
+    if start is not None:
+        ax.axvline(pd.Timestamp(start), color="0.45", linestyle=":", linewidth=1.0,
+                   label="Tax scenario start")
+
+    selected = _annotation_dates(dates, future_dates, impact_annotations)
+    _annotate_drawwise_effect(
+        ax, dates, baseline_q[1], scenario_q[1], impact_q[1], impact_q[0], impact_q[2],
+        selected, decimals,
+    )
+
+    unit = str(tax_forecast.get("inflation_unit", "percent"))
+    base_title = title or f"Tax assumption impact on full inflation — {component_label}"
+    ax.set_title(base_title + _missing_method_title_suffix(tax_forecast))
+    ax.set_ylabel(unit)
+    ax.axhline(0.0, color="0.55", linewidth=0.8)
+    ax.grid(alpha=0.20)
+    ax.legend(frameon=False, ncol=2)
+    fig.tight_layout()
+    return fig
+
+
+
+def _tax_context_raw_series(tax_context: Mapping) -> tuple[pd.Series, pd.Series, str]:
+    """Return raw VAT/excise observations and a source label."""
+    if "data" in tax_context:
+        data = tax_context["data"]
+        if not isinstance(data, pd.DataFrame):
+            raise TypeError("tax_context['data'] must be a DataFrame.")
+        required = {"vat_percent", "excise"}
+        missing = required.difference(data.columns)
+        if missing:
+            raise KeyError(f"Weekly tax context is missing {sorted(missing)}.")
+        return (
+            data["vat_percent"].dropna().astype(float).sort_index(),
+            data["excise"].dropna().astype(float).sort_index(),
+            "European Commission Weekly Oil Bulletin",
+        )
+    if "vat_percent" not in tax_context or "excise" not in tax_context:
+        raise KeyError("tax_context must contain VAT and excise history.")
+    return (
+        pd.Series(tax_context["vat_percent"]).dropna().astype(float).sort_index(),
+        pd.Series(tax_context["excise"]).dropna().astype(float).sort_index(),
+        "Eurostat",
+    )
+
+
+def _tax_history_frame(tax_forecast: Mapping) -> pd.DataFrame:
+    history = tax_forecast.get("tax_history")
+    if history is None:
+        raise KeyError(
+            "tax_forecast does not contain 'tax_history'. Re-run tax re-attribution "
+            "with the updated component adapter."
+        )
+    history = pd.DataFrame(history).copy()
+    required = {"applied_vat_percent", "applied_excise"}
+    missing = required.difference(history.columns)
+    if missing:
+        raise KeyError(f"tax_history is missing {sorted(missing)}.")
+    history.index = pd.DatetimeIndex(history.index, name="date")
+    return history.sort_index()
+
+
+def _validate_tax_history_junction(
+    tax_history: pd.DataFrame,
+    tax_path: pd.DataFrame,
+    *,
+    rtol: float = 1e-6,
+    atol: float = 1e-10,
+) -> None:
+    """Guard against VAT/excise unit or dating discontinuities at the join."""
+    overlap = tax_history.index.intersection(tax_path.index)
+    if len(overlap):
+        history_date = path_date = overlap[-1]
+    else:
+        if tax_history.empty or tax_path.empty:
+            return
+        history_date = tax_history.index[-1]
+        path_date = tax_path.index[0]
+        if history_date >= path_date:
+            return
+    checks = (
+        ("VAT", "applied_vat_percent", "baseline_vat_percent"),
+        ("excise", "applied_excise", "baseline_excise"),
+    )
+    for label, history_col, path_col in checks:
+        left = float(tax_history.loc[history_date, history_col])
+        right = float(tax_path.loc[path_date, path_col])
+        if np.isfinite(left) and np.isfinite(right) and not np.isclose(
+            left, right, rtol=rtol, atol=atol
+        ):
+            raise AssertionError(
+                f"{label} history/baseline mismatch across the tax-path junction "
+                f"({history_date.date()} -> {path_date.date()}): "
+                f"historical applied={left:.12g}, baseline={right:.12g}. "
+                "Check tax dating and units before interpreting the scenario."
+            )
+
+
+def _scenario_display_path(
+    tax_path: pd.DataFrame,
+    baseline_col: str,
+    scenario_col: str,
+    future_dates: pd.DatetimeIndex,
+) -> pd.Series | None:
+    baseline = tax_path[baseline_col].reindex(future_dates).astype(float)
+    scenario = tax_path[scenario_col].reindex(future_dates).astype(float)
+    if np.allclose(baseline.to_numpy(), scenario.to_numpy(), rtol=0.0, atol=1e-12):
+        return None
+    different = ~np.isclose(
+        baseline.to_numpy(), scenario.to_numpy(), rtol=0.0, atol=1e-12
+    )
+    positions = np.flatnonzero(different)
+    start = max(int(positions[0]) - 1, 0)
+    return scenario.iloc[start:]
+
+
+def plot_tax_assumptions(
+    tax_context: Mapping,
+    tax_forecast: Mapping,
+    *,
+    component_label: str = "energy",
+    lookback_years: int = 5,
+    title: str | None = None,
+):
+    """Plot historical VAT/excise and the future baseline/scenario assumptions.
+
+    Monthly gas/electricity charts deliberately show two historical objects:
+    semiannual source publications as markers and the monthly path actually
+    applied by the model.  The overlay is a visual validation of the six-month
+    expansion rule.  Weekly fuel taxes are already observed at model frequency,
+    so a single historical line with markers is sufficient.
+    """
+    if lookback_years < 1:
+        raise ValueError("lookback_years must be positive.")
+    tax_path = pd.DataFrame(tax_forecast["tax_path"]).copy()
+    tax_path.index = pd.DatetimeIndex(tax_path.index, name="date")
+    tax_history = _tax_history_frame(tax_forecast)
+    _validate_tax_history_junction(tax_history, tax_path)
+
+    raw_vat, raw_excise, source_label = _tax_context_raw_series(tax_context)
+    future_dates = pd.DatetimeIndex(tax_forecast["future_dates"], name="date")
+    if len(future_dates) == 0:
+        raise ValueError("Tax-assumption plot requires at least one future date.")
+    scenario = dict(tax_forecast.get("tax_scenario", {}))
+    scenario_start = (
+        pd.Timestamp(scenario["effective_start_date"])
+        if scenario.get("effective_start_date") is not None
+        else future_dates[0]
+    )
+    forecast_origin = pd.Timestamp(
+        tax_forecast.get("forecast_origin", future_dates[0])
+    )
+    frequency = str(tax_forecast.get("frequency", "monthly")).lower()
+
+    future_tax_path = tax_path.reindex(future_dates)
+    if future_tax_path.isna().any().any():
+        raise ValueError("Future tax path is incomplete on one or more model dates.")
+
+    fig, axes = plt.subplots(2, 1, figsize=(12, 7), sharex=True)
+    specs = (
+        (
+            axes[0], raw_vat, "applied_vat_percent", "baseline_vat_percent",
+            "scenario_vat_percent", "VAT", "%",
+        ),
+        (
+            axes[1], raw_excise, "applied_excise", "baseline_excise",
+            "scenario_excise", "Excise", str(tax_forecast.get("excise_unit", "source unit")),
+        ),
+    )
+
+    for ax, raw, history_col, baseline_col, scenario_col, name, unit in specs:
+        history = tax_history[history_col].dropna()
+        history = history.loc[history.index <= forecast_origin]
+        if history.empty:
+            raise ValueError(f"No historical applied {name} values are available.")
+
+        if frequency == "monthly":
+            ax.step(
+                history.index,
+                history.to_numpy(dtype=float),
+                where="post",
+                color="0.35",
+                linewidth=1.6,
+                label=f"{name} applied by model (monthly)",
+            )
+            raw_window = raw.loc[raw.index <= forecast_origin]
+            ax.plot(
+                raw_window.index,
+                raw_window.to_numpy(dtype=float),
+                linestyle="none",
+                marker="o",
+                markersize=4.2,
+                color="0.10",
+                label=f"{source_label} publications (semiannual)",
+            )
+        else:
+            ax.plot(
+                history.index,
+                history.to_numpy(dtype=float),
+                marker="o",
+                markersize=2.8,
+                markevery=max(len(history) // 35, 1),
+                color="0.30",
+                linewidth=1.3,
+                label=f"Historical {source_label} observations (weekly)",
+            )
+
+        # Join the last applied historical value to the first future baseline.
+        baseline_future = future_tax_path[baseline_col].astype(float)
+        bridge_index = pd.DatetimeIndex([history.index[-1], *baseline_future.index])
+        bridge_values = np.r_[float(history.iloc[-1]), baseline_future.to_numpy(dtype=float)]
+        ax.plot(
+            bridge_index,
+            bridge_values,
+            linestyle="--",
+            linewidth=1.7,
+            color=_FORECAST_DARK,
+            label="Baseline, carried forward",
+        )
+
+        scenario_path = _scenario_display_path(
+            tax_path, baseline_col, scenario_col, future_dates
+        )
+        if scenario_path is not None:
+            ax.plot(
+                scenario_path.index,
+                scenario_path.to_numpy(dtype=float),
+                linewidth=2.2,
+                color=_CONDITIONAL_DARK,
+                label="Scenario",
+            )
+
+        ax.axvline(
+            forecast_origin,
+            linestyle="--",
+            linewidth=0.9,
+            color="0.55",
+            label="Forecast origin",
+        )
+        if scenario.get("active", False):
+            ax.axvline(
+                scenario_start,
+                linestyle=":",
+                linewidth=1.2,
+                color="0.30",
+                label="Tax scenario start",
+            )
+        ax.set_ylabel(f"{name} ({unit})")
+        ax.grid(alpha=0.22)
+        ax.legend(frameon=False, fontsize=8, loc="upper left", ncol=2)
+
+    start = scenario_start - pd.DateOffset(years=int(lookback_years))
+    end_offset = pd.DateOffset(months=2) if frequency == "monthly" else pd.DateOffset(weeks=8)
+    axes[1].set_xlim(start, future_dates[-1] + end_offset)
+    axes[0].set_title(
+        (title or f"Tax assumptions — {component_label}")
+        + _missing_method_title_suffix(tax_forecast)
+    )
+    axes[1].set_xlabel("Date")
+    fig.tight_layout()
+    return fig
+
+
+def _validated_tax_level_arrays(
+    tax_forecast: Mapping,
+) -> tuple[np.ndarray, np.ndarray, pd.DatetimeIndex]:
+    required = ("post_tax_level_paths", "baseline_post_tax_level_paths", "path_dates")
+    missing = [name for name in required if name not in tax_forecast]
+    if missing:
+        raise KeyError(f"Tax forecast is missing {missing}.")
+    scenario = np.asarray(tax_forecast["post_tax_level_paths"], dtype=float)
+    baseline = np.asarray(tax_forecast["baseline_post_tax_level_paths"], dtype=float)
+    dates = pd.DatetimeIndex(tax_forecast["path_dates"], name="date")
+    if scenario.shape != baseline.shape or scenario.ndim != 2:
+        raise ValueError("Baseline/scenario post-tax level paths must have matching 2D shapes.")
+    if scenario.shape[1] != len(dates):
+        raise ValueError("Post-tax level paths and path_dates have incompatible lengths.")
+    if np.any(np.isclose(baseline, 0.0, rtol=0.0, atol=1e-14)):
+        raise ValueError("Baseline post-tax level contains zero; relative level effect is undefined.")
+    return scenario, baseline, dates
+
+
+def tax_scenario_effect_summary_table(
+    tax_forecast: Mapping,
+    *,
+    horizons: Sequence[int] | None = None,
+) -> pd.DataFrame:
+    """Summarise the tax scenario's price-level and YoY inflation effects."""
+    scenario_level, baseline_level, dates = _validated_tax_level_arrays(tax_forecast)
+    _, scenario_yoy, baseline_yoy, yoy_dates = _validated_tax_inflation_arrays(tax_forecast)
+    if not dates.equals(yoy_dates):
+        raise ValueError("Level and inflation tax paths use different dates.")
+    future_dates = pd.DatetimeIndex(tax_forecast["future_dates"], name="date")
+    frequency = str(tax_forecast.get("frequency", "monthly")).lower()
+    defaults = (1, 3, 6, 12) if frequency == "monthly" else (1, 4, 13, 26, 52)
+    requested = list(defaults if horizons is None else horizons)
+    requested = [int(h) for h in requested if int(h) >= 1 and int(h) <= len(future_dates)]
+    if len(future_dates) and len(future_dates) not in requested:
+        requested.append(len(future_dates))
+    requested = sorted(set(requested))
+    if not requested:
+        raise ValueError("No requested tax-effect horizon lies inside the forecast path.")
+
+    level_effect = 100.0 * (scenario_level / baseline_level - 1.0)
+    yoy_effect = scenario_yoy - baseline_yoy
+    positions = {pd.Timestamp(date): i for i, date in enumerate(dates)}
+    period_word = "month" if frequency == "monthly" else "week"
+    rows = []
+    for horizon in requested:
+        date = pd.Timestamp(future_dates[horizon - 1])
+        i = positions[date]
+        level_q = np.nanquantile(level_effect[:, i], [0.16, 0.50, 0.84])
+        yoy_q = np.nanquantile(yoy_effect[:, i], [0.16, 0.50, 0.84])
+        label = f"{horizon} {period_word}" + ("" if horizon == 1 else "s")
+        if horizon == len(future_dates) and horizon not in defaults:
+            label = f"end ({label})"
+        rows.append(
+            {
+                "horizon": label,
+                "periods_ahead": horizon,
+                "target_date": date,
+                "level_effect_q16_pct": float(level_q[0]),
+                "level_effect_median_pct": float(level_q[1]),
+                "level_effect_q84_pct": float(level_q[2]),
+                "yoy_effect_q16_pp": float(yoy_q[0]),
+                "yoy_effect_median_pp": float(yoy_q[1]),
+                "yoy_effect_q84_pp": float(yoy_q[2]),
+            }
+        )
+    return pd.DataFrame(rows).set_index("horizon")
+
+
+def plot_tax_level_and_inflation_impact(
+    tax_forecast: Mapping,
+    *,
+    component_label: str = "energy",
+    lookback_years: int = 1,
+    title: str | None = None,
+    deterministic_tolerance: float = 1e-10,
+):
+    """Show the permanent price-level effect beside the temporary YoY effect.
+
+    The level effect is computed draw by draw from the actual baseline and
+    scenario post-tax paths, rather than from the VAT ratio alone.  Therefore a
+    VAT-only scenario naturally has zero posterior width, while an excise
+    scenario inherits uncertainty from the pre-tax price path.
+    """
+    scenario = dict(tax_forecast.get("tax_scenario", {}))
+    if not scenario.get("active", False):
+        raise ValueError("tax_forecast contains no active tax scenario.")
+    scenario_level, baseline_level, dates = _validated_tax_level_arrays(tax_forecast)
+    _, scenario_yoy, baseline_yoy, yoy_dates = _validated_tax_inflation_arrays(tax_forecast)
+    if not dates.equals(yoy_dates):
+        raise ValueError("Level and inflation tax paths use different dates.")
+
+    level_effect = 100.0 * (scenario_level / baseline_level - 1.0)
+    yoy_effect = scenario_yoy - baseline_yoy
+    level_q = np.nanquantile(level_effect, [0.16, 0.50, 0.84], axis=0)
+    yoy_q = np.nanquantile(yoy_effect, [0.16, 0.50, 0.84], axis=0)
+    scenario_start = pd.Timestamp(scenario["effective_start_date"])
+
+    fig, axes = plt.subplots(1, 2, figsize=(12.5, 4.5), sharex=True)
+
+    level_width = np.nanmax(level_q[2] - level_q[0])
+    if np.isfinite(level_width) and level_width > deterministic_tolerance:
+        axes[0].fill_between(
+            dates, level_q[0], level_q[2], color=_CONDITIONAL_MID, alpha=0.22,
+            label="68% posterior interval",
+        )
+    axes[0].plot(
+        dates, level_q[1], color=_CONDITIONAL_DARK, linewidth=2.1,
+        label="Median level effect",
+    )
+    if not np.isfinite(level_width) or level_width <= deterministic_tolerance:
+        axes[0].text(
+            0.02, 0.94,
+            "Deterministic conditional on tax path",
+            transform=axes[0].transAxes,
+            ha="left", va="top", fontsize=8.5, color="0.35",
+        )
+    axes[0].set_title("Price-level impact")
+    axes[0].set_ylabel("Scenario − baseline (%)")
+    axes[0].legend(frameon=False, fontsize=8, loc="best")
+
+    axes[1].fill_between(
+        dates, yoy_q[0], yoy_q[2], color=_CONDITIONAL_MID, alpha=0.22,
+        label="68% posterior interval",
+    )
+    axes[1].plot(
+        dates, yoy_q[1], color=_CONDITIONAL_DARK, linewidth=2.1,
+        label="Median YoY effect",
+    )
+    axes[1].set_title("YoY inflation impact — base effect")
+    axes[1].set_ylabel("Scenario − baseline (percentage points)")
+    axes[1].legend(frameon=False, fontsize=8, loc="best")
+
+    for ax in axes:
+        ax.axhline(0.0, color="0.55", linewidth=0.8)
+        ax.axvline(
+            scenario_start, linestyle=":", linewidth=1.2, color="0.35",
+            label="Tax scenario start",
+        )
+        ax.grid(alpha=0.22)
+        ax.set_xlim(
+            scenario_start - pd.DateOffset(years=int(lookback_years)),
+            dates[-1],
+        )
+        ax.set_xlabel("Date")
+
+    fig.suptitle(
+        (title or f"Tax-scenario effect — {component_label}")
+        + _missing_method_title_suffix(tax_forecast),
+        y=1.02,
+    )
     fig.tight_layout()
     return fig
 
@@ -1492,6 +2164,13 @@ __all__ = [
     "plot_short_forecast_fan",
     "plot_forecast_comparison",
     "plot_hicp_forecast_fan",
+    "tax_inflation_spread_table",
+    "tax_scenario_impact_table",
+    "tax_scenario_effect_summary_table",
+    "plot_tax_assumptions",
+    "plot_tax_level_and_inflation_impact",
+    "plot_tax_inflation_comparison",
+    "plot_tax_scenario_impact",
     "plot_standardized_residuals",
     "plot_posterior_predictive_check",
     "plot_gas_irf",

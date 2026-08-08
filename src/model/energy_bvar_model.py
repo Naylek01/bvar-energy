@@ -15,10 +15,12 @@ Conventions
 -----------
 * B has shape (1 + n*p + m, n): constant first, then lag blocks, then m deterministic/exogenous regressors.
 * vec(B) is column-major (order="F"), equation by equation.
-* Panels without interior missing values keep the original maximal-balanced-block
-  estimation path. Panels with interior gaps use exact Gaussian data augmentation:
-  missing levels are drawn inside each Gibbs sweep with the same augmented
-  Durbin--Koopman level smoother used for ragged-edge forecasts.
+* Interior missing levels have a selectable treatment. ``missing_data_method="dk"``
+  preserves the validated exact Gaussian data-augmentation path; missing levels
+  are drawn inside each Gibbs sweep with the augmented Durbin--Koopman smoother.
+  ``missing_data_method="linear"`` is a fast approximation that linearly fills
+  only bounded interior level gaps once before estimation. Ragged-edge nowcasts
+  and conditional forecasts remain Durbin--Koopman state-space problems.
 * The KSC seven-component approximation is used for the log-volatility paths.
 * The continuous U(2, 20) outlier support is represented by a configurable
   finite grid. The default grid is the integer support 2, ..., 20.
@@ -165,6 +167,23 @@ _FREQUENCY_ALIASES = {
     "w": "weekly",
     "w-mon": "weekly",
 }
+
+_MISSING_DATA_METHOD_ALIASES = {
+    "dk": "dk",
+    "durbin_koopman": "dk",
+    "durbin-koopman": "dk",
+    "linear": "linear",
+    "linear_interpolation": "linear",
+    "linear-interpolation": "linear",
+}
+
+
+def _canonical_missing_data_method(method: str) -> str:
+    key = str(method).strip().lower()
+    try:
+        return _MISSING_DATA_METHOD_ALIASES[key]
+    except KeyError as exc:
+        raise ValueError("missing_data_method must be 'dk' or 'linear'.") from exc
 
 
 def _canonical_frequency(frequency: str) -> str:
@@ -395,19 +414,24 @@ def prepare_bvar_panel(
     variables: Sequence[str] | None = None,
     exog: pd.DataFrame | None = None,
     frequency: str = "monthly",
+    missing_data_method: str = "dk",
 ) -> dict:
     """Prepare levels, absolute changes, regressors and missing-data metadata.
 
-    Panels with no interior missing transformed observations follow the original
-    balanced-sample implementation exactly.  If interior gaps are present, they
-    are *not* interpolated or dropped.  Instead the preparation object records an
-    exact observed-level template for Gibbs data augmentation.  A run of ``p``
-    complete changes is used only to initialise the companion state; all later
-    missing levels up to the final fully observed level date are latent states.
+    With ``missing_data_method="dk"`` the original validated path is preserved:
+    interior missing levels remain latent and are redrawn in each Gibbs sweep.
+
+    With ``missing_data_method="linear"`` only bounded interior *levels* are
+    interpolated once before differences are formed. Leading/trailing gaps are
+    never extrapolated, so the ragged edge is still handled by the state-space
+    forecast. Interpolated pseudo-observations enter the likelihood, therefore
+    this mode is explicitly marked as an approximation. Minnesota prior scales
+    continue to use the original, non-interpolated data.
 
     Deterministic regressors must be known over the complete calendar.
     """
     frequency = _canonical_frequency(frequency)
+    missing_data_method = _canonical_missing_data_method(missing_data_method)
     if p < 1:
         raise ValueError("p must be at least 1.")
     if not isinstance(levels, pd.DataFrame):
@@ -440,6 +464,20 @@ def prepare_bvar_panel(
     frame = frame.reindex(full_index)
     if np.isinf(frame.to_numpy()).any():
         raise ValueError("The level panel contains infinite values.")
+
+    # Keep the normalized source panel untouched for prior scaling, provenance,
+    # and regression tests. The linear branch modifies only the effective panel
+    # used by the likelihood.
+    original_frame = frame.copy()
+    original_differences = original_frame.diff()
+    interpolated_level_mask = pd.DataFrame(
+        False, index=frame.index, columns=frame.columns
+    )
+    if missing_data_method == "linear":
+        interpolated = frame.interpolate(method="time", limit_area="inside")
+        interpolated_level_mask = frame.isna() & interpolated.notna()
+        frame = interpolated
+
     exog_frame = _normalise_exog(exog, full_index, frequency)
 
     differences = frame.diff()
@@ -451,9 +489,15 @@ def prepare_bvar_panel(
     first = int(np.flatnonzero(complete)[0])
     last = int(np.flatnonzero(complete)[-1])
     interior_bad = np.flatnonzero(~complete[first:last + 1]) + first
+    if missing_data_method == "linear" and len(interior_bad):
+        bad_dates = frame.index[interior_bad[:10]].strftime("%Y-%m-%d").tolist()
+        raise ValueError(
+            "Linear interpolation could not resolve all interior missing changes. "
+            f"First unresolved dates: {bad_dates}. Use missing_data_method='dk'."
+        )
 
     # ------------------------------------------------------------------
-    # Original path: preserve the validated balanced implementation.
+    # Original path / linear approximation: balanced regression arrays.
     # ------------------------------------------------------------------
     if len(interior_bad) == 0:
         balanced = differences.iloc[first:last + 1].copy()
@@ -477,11 +521,21 @@ def prepare_bvar_panel(
         level_at_balanced_end = frame.loc[balanced_end].to_numpy(dtype=float)
         exog_names = [] if exog_frame is None else list(exog_frame.columns)
 
+        source_prior_scale_data = (
+            original_differences.iloc[first:last + 1].copy()
+            if missing_data_method == "linear"
+            else balanced
+        )
+        interpolated_dates = frame.index[interpolated_level_mask.any(axis=1)]
+        approximation_used = bool(interpolated_level_mask.to_numpy(dtype=bool).any())
+
         return {
             "levels": frame,
+            "levels_original": original_frame,
             "differences": differences,
+            "differences_original": original_differences,
             "balanced": balanced,
-            "prior_scale_data": balanced,
+            "prior_scale_data": source_prior_scale_data,
             "ragged": ragged,
             "exog": exog_frame,
             "exog_regression": exog_regression,
@@ -507,6 +561,15 @@ def prepare_bvar_panel(
             "n_ragged_periods": len(ragged),
             "n_ragged_months": len(ragged),
             "requires_data_augmentation": False,
+            "missing_data_method": missing_data_method,
+            "missing_treatment_exact": not approximation_used,
+            "missing_data_approximation_used": approximation_used,
+            "interpolated_level_mask": interpolated_level_mask,
+            "interpolated_dates": pd.DatetimeIndex(interpolated_dates, name="date"),
+            "n_interpolated_level_cells": int(
+                interpolated_level_mask.to_numpy(dtype=bool).sum()
+            ),
+            "n_interpolated_dates": int(len(interpolated_dates)),
             "interior_missing_dates": pd.DatetimeIndex([], name="date"),
             "n_interior_missing_dates": 0,
             "n_interior_missing_level_cells": 0,
@@ -605,7 +668,9 @@ def prepare_bvar_panel(
 
     return {
         "levels": frame,
+        "levels_original": original_frame,
         "differences": differences,
+        "differences_original": original_differences,
         "balanced": balanced_template,
         "prior_scale_data": prior_scale_data,
         "ragged": ragged,
@@ -633,6 +698,13 @@ def prepare_bvar_panel(
         "n_ragged_periods": len(ragged),
         "n_ragged_months": len(ragged),
         "requires_data_augmentation": True,
+        "missing_data_method": "dk",
+        "missing_treatment_exact": True,
+        "missing_data_approximation_used": False,
+        "interpolated_level_mask": interpolated_level_mask,
+        "interpolated_dates": pd.DatetimeIndex([], name="date"),
+        "n_interpolated_level_cells": 0,
+        "n_interpolated_dates": 0,
         "augmentation_anchor": augmentation_anchor,
         "augmentation_anchor_level": anchor_level,
         "initial_companion_state": initial_companion_state,
@@ -1802,6 +1874,9 @@ def _gibbs_bvar_sv_outlier_with_missing(
         "frequency": prep["frequency"],
         "sv_sampler": sampler_config.sv_sampler,
         "outlier_support": prior["outlier_grid"].copy(),
+        "missing_data_method": "dk",
+        "missing_treatment_exact": True,
+        "ksc_offset_calibration": "initial_structural_residual_median_squared",
         "data_augmentation": "durbin_koopman_interior_levels",
         "dk_projection_initialization": initial_dk_diagnostics,
         "dk_projection_records": (
@@ -1916,14 +1991,21 @@ def gibbs_bvar_sv_outlier(
     exog_prior_scale: float = 10.0,
     prior_config: BVARSVOPriorConfig | None = None,
     sampler_config: SamplerConfig | None = None,
+    missing_data_method: str = "dk",
 ) -> dict:
     """Estimate the constant-coefficient BVAR-SV-outlier model."""
     prior_config = BVARSVOPriorConfig() if prior_config is None else prior_config
     sampler_config = SamplerConfig() if sampler_config is None else sampler_config
     prior_config.validate()
     sampler_config.validate()
+    missing_data_method = _canonical_missing_data_method(missing_data_method)
     prep = prepare_bvar_panel(
-        levels, p=p, variables=variables, exog=exog, frequency=frequency
+        levels,
+        p=p,
+        variables=variables,
+        exog=exog,
+        frequency=frequency,
+        missing_data_method=missing_data_method,
     )
     prior = make_bvar_svo_prior(
         prep,
@@ -2090,6 +2172,14 @@ def gibbs_bvar_sv_outlier(
         "frequency": prep["frequency"],
         "sv_sampler": sampler_config.sv_sampler,
         "outlier_support": prior["outlier_grid"].copy(),
+        "missing_data_method": missing_data_method,
+        "missing_treatment_exact": bool(prep.get("missing_treatment_exact", True)),
+        "ksc_offset_calibration": "initial_structural_residual_median_squared",
+        "data_augmentation": (
+            "linear_interpolation"
+            if prep.get("missing_data_approximation_used", False)
+            else "none"
+        ),
     }
     return result
 
@@ -2815,6 +2905,18 @@ def forecast_bvar_sv_outlier(
         "calendar_rule": _calendar_rule(frequency),
         "period_name": _period_name(frequency),
         "H": H,
+        "missing_data_method": result.get(
+            "missing_data_method", prep.get("missing_data_method", "dk")
+        ),
+        "missing_treatment_exact": bool(
+            result.get(
+                "missing_treatment_exact",
+                prep.get("missing_treatment_exact", True),
+            )
+        ),
+        "missing_data_approximation_used": bool(
+            prep.get("missing_data_approximation_used", False)
+        ),
     }
 
 
@@ -3030,12 +3132,19 @@ def forecast_horizon_table(
     if variable not in variables:
         raise ValueError(f"Unknown variable {variable!r}.")
     j = variables.index(variable)
-    return path_horizon_table(
+    table = path_horizon_table(
         np.asarray(forecast["future_level_paths"], dtype=float)[:, :, j],
         forecast["future_dates"],
         forecast["last_calendar_date"],
         quantiles=quantiles,
     )
+    table["missing_data_method"] = str(
+        forecast.get("missing_data_method", "dk")
+    )
+    table["missing_treatment_exact"] = bool(
+        forecast.get("missing_treatment_exact", True)
+    )
+    return table
 
 # -----------------------------------------------------------------------------
 # Structural analysis: recursive and sign-restricted IRF, FEVD and HD
@@ -3585,9 +3694,11 @@ def hash_run_config(
     frequency: str = "monthly",
     exog_names: Sequence[str] | None = None,
     exog_prior_scale: float = 10.0,
+    missing_data_method: str = "dk",
 ) -> str:
     payload = {
         "frequency": _canonical_frequency(frequency),
+        "missing_data_method": _canonical_missing_data_method(missing_data_method),
         "p": int(p),
         "variables": list(variables),
         "prior": asdict(prior_config),
@@ -3615,12 +3726,19 @@ def build_run_metadata(
     frequency: str = "monthly",
     exog: pd.DataFrame | None = None,
     exog_prior_scale: float = 10.0,
+    missing_data_method: str = "dk",
+    missing_treatment_exact: bool = True,
+    effective_levels: pd.DataFrame | None = None,
     code_version: str = "unversioned",
-    result_schema_version: str = "1.2",
+    result_schema_version: str = "1.4",
 ) -> dict:
     frequency = _canonical_frequency(frequency)
     exog_names = [] if exog is None else list(exog.columns)
     data_hash = hash_model_data(levels, exog)
+    effective_data_hash = hash_model_data(
+        levels if effective_levels is None else effective_levels,
+        exog,
+    )
     config_hash = hash_run_config(
         prior_config,
         sampler_config,
@@ -3629,6 +3747,7 @@ def build_run_metadata(
         frequency=frequency,
         exog_names=exog_names,
         exog_prior_scale=exog_prior_scale,
+        missing_data_method=missing_data_method,
     )
     identity = {
         "model_id": str(model_id),
@@ -3645,6 +3764,10 @@ def build_run_metadata(
         "result_schema_version": result_schema_version,
         "frequency": frequency,
         "calendar_rule": _calendar_rule(frequency),
+        "missing_data_method": _canonical_missing_data_method(missing_data_method),
+        "missing_treatment_exact": bool(missing_treatment_exact),
+        "source_data_hash": data_hash,
+        "effective_estimation_data_hash": effective_data_hash,
         "variables": list(variables),
         "exog_names": exog_names,
         "exog_prior_scale": float(exog_prior_scale) if exog_names else None,
@@ -3667,10 +3790,12 @@ def run_energy_bvar(
     exog_prior_scale: float = 10.0,
     prior_config: BVARSVOPriorConfig | None = None,
     sampler_config: SamplerConfig | None = None,
+    missing_data_method: str = "dk",
     code_version: str = "unversioned",
 ) -> dict:
     """Run the generic monthly/weekly engine and attach a cache-safe identity."""
     frequency = _canonical_frequency(frequency)
+    missing_data_method = _canonical_missing_data_method(missing_data_method)
     prior_config = BVARSVOPriorConfig() if prior_config is None else prior_config
     sampler_config = SamplerConfig() if sampler_config is None else sampler_config
     variables = list(levels.columns) if variables is None else list(variables)
@@ -3683,12 +3808,14 @@ def run_energy_bvar(
         exog_prior_scale=exog_prior_scale,
         prior_config=prior_config,
         sampler_config=sampler_config,
+        missing_data_method=missing_data_method,
     )
     normalised_exog = result["prep"].get("exog")
     result["metadata"] = build_run_metadata(
         model_id=model_id,
         vintage=vintage,
-        levels=result["prep"]["levels"][variables],
+        levels=result["prep"].get("levels_original", result["prep"]["levels"])[variables],
+        effective_levels=result["prep"]["levels"][variables],
         p=p,
         variables=variables,
         frequency=frequency,
@@ -3696,10 +3823,28 @@ def run_energy_bvar(
         exog_prior_scale=exog_prior_scale,
         prior_config=prior_config,
         sampler_config=sampler_config,
+        missing_data_method=missing_data_method,
+        missing_treatment_exact=bool(result.get("missing_treatment_exact", True)),
         code_version=code_version,
     )
     result["metadata"].update({
         "data_augmentation": result.get("data_augmentation", "none"),
+        "missing_data_method": missing_data_method,
+        "missing_treatment_exact": bool(result.get("missing_treatment_exact", True)),
+        "missing_data_approximation_used": bool(
+            result["prep"].get("missing_data_approximation_used", False)
+        ),
+        "interpolated_level_cells": int(
+            result["prep"].get("n_interpolated_level_cells", 0)
+        ),
+        "interpolated_dates": int(
+            result["prep"].get("n_interpolated_dates", 0)
+        ),
+        "ksc_offset_calibration": result.get(
+            "ksc_offset_calibration",
+            "initial_structural_residual_median_squared",
+        ),
+        "ksc_offsets": np.asarray(result.get("ksc_offsets", []), dtype=float).tolist(),
         "requires_data_augmentation": bool(
             result["prep"].get("requires_data_augmentation", False)
         ),

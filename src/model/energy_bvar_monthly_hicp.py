@@ -160,6 +160,15 @@ def forecast_hicp_component(
         "target_variable": target,
         "component": component,
         "component_label": spec["label"],
+        "missing_data_method": forecast.get(
+            "missing_data_method", result.get("missing_data_method", "dk")
+        ),
+        "missing_treatment_exact": bool(
+            forecast.get(
+                "missing_treatment_exact",
+                result.get("missing_treatment_exact", True),
+            )
+        ),
     }
 
 
