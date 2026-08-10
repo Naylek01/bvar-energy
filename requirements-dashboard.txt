@@ -1,0 +1,10 @@
+# Dashboard-only additions. Keep the existing modelling requirements as well.
+dash[diskcache]>=3.0,<5
+plotly>=6.0,<7
+pyarrow>=16
+pandas>=2.2
+numpy>=1.26
+diskcache>=5.6
+multiprocess>=0.70
+psutil>=5.9
+waitress>=3.0

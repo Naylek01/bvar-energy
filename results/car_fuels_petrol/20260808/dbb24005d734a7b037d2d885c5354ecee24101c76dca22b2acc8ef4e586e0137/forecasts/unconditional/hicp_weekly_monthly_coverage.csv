@@ -1,0 +1,8 @@
+,date,expected_mondays,observed_history_mondays,simulated_mondays,available_mondays,complete,retained
+0,2026-08-01,5,1,4,5,True,True
+1,2026-09-01,4,0,4,4,True,True
+2,2026-10-01,4,0,4,4,True,True
+3,2026-11-01,5,0,5,5,True,True
+4,2026-12-01,4,0,4,4,True,True
+5,2027-01-01,4,0,4,4,True,True
+6,2027-02-01,4,0,2,2,False,False

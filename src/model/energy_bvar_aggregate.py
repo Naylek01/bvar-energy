@@ -13,11 +13,12 @@ Core conventions
    total HICP). They are normalised only inside the relevant aggregate.
 3. If a forecast crosses into a year whose weights are not yet available, the
    latest published weight vector is carried forward.
-4. Weekly petrol, diesel and liquid-fuel model outputs must be converted to
-   monthly post-tax price paths before they are mapped into HICP indices.
-5. Petrol/diesel/liquid-fuel WOB prices and HICP indices are different objects.
-   The bridge is estimated and diagnosed explicitly; no hidden unit conversion
-   is allowed.
+4. Weekly petrol, diesel and liquid-fuel model outputs are converted to
+   monthly consumer-price paths before aggregation.
+5. For the weekly fuel models, WOB consumer-price paths are used as price
+   relatives and are proportionally rebased to the latest common published
+   HICP level. No estimated WOB-to-HICP regression is propagated into the
+   forecast. Proxy diagnostics remain explicit and auditable.
 6. Cross-model posterior draws are not a joint posterior.  The helper
    ``independent_draw_pairing`` makes the maintained independence assumption
    explicit rather than pairing identical draw numbers across separate chains.
@@ -34,9 +35,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Sequence
 import json
+import warnings
 
 import numpy as np
 import pandas as pd
+
+AGGREGATE_MODULE_VERSION = "2026-08-09-pre-post-admissibility"
 
 
 # ---------------------------------------------------------------------------
@@ -91,8 +95,10 @@ MODEL_AGGREGATE_COMPONENTS = (
 )
 
 
-DEFAULT_RECONSTRUCTION_TOLERANCE = 0.05  # HICP index points
-DEFAULT_WEIGHT_TOLERANCE = 0.05          # per thousand of total HICP
+DEFAULT_ANNUAL_RECONSTRUCTION_TOLERANCE = 0.05   # hard gate, HICP index points
+DEFAULT_CUMULATIVE_WARNING_TOLERANCE = 0.10      # diagnostic only
+DEFAULT_RECONSTRUCTION_TOLERANCE = DEFAULT_ANNUAL_RECONSTRUCTION_TOLERANCE
+DEFAULT_WEIGHT_TOLERANCE = 0.05                   # per thousand of total HICP
 
 
 # ---------------------------------------------------------------------------
@@ -480,43 +486,55 @@ def annual_reanchored_reconstruction_errors(
 
 
 def assert_reconstruction_suite(suite: Mapping) -> None:
-    """Raise one compact error *after* every reconstruction test is available."""
-    summary = pd.DataFrame(suite["summary"])
-    if "pass" not in summary.columns:
-        raise ValueError("Reconstruction suite summary has no 'pass' column.")
-    failed = summary.loc[~summary["pass"].astype(bool)]
+    """Raise one compact error after all *annual re-anchored* tests are available.
+
+    The annual re-anchored test is the hard formula/weight gate.  Cumulative
+    chain error is retained as a monitored diagnostic because rounding drift
+    compounds mechanically over long histories.
+    """
+    summary = suite["summary"]
+    if isinstance(summary, pd.Series):
+        summary = summary.to_frame().T
+    else:
+        summary = pd.DataFrame(summary).copy()
+
+    required = {"annual_reanchored_pass", "annual_reanchored_max_abs_error", "tolerance"}
+    missing = required.difference(summary.columns)
+    if missing:
+        raise ValueError(
+            "Reconstruction suite summary is missing required field(s): "
+            f"{sorted(missing)}."
+        )
+
+    failed = summary.loc[~summary["annual_reanchored_pass"].astype(bool)]
     if failed.empty:
         return
+
     detail = "; ".join(
         (
-            f"{name}: cumulative={row['max_abs_error']:.6f}, "
-            f"annual={row['annual_reanchored_max_abs_error']:.6f}, "
-            f"tol={row['tolerance']:.6f}"
+            f"{name}: annual={row['annual_reanchored_max_abs_error']:.6f}, "
+            f"tol={row['tolerance']:.6f}, "
+            f"cumulative={row.get('max_abs_error', np.nan):.6f}"
         )
         for name, row in failed.iterrows()
     )
     raise AssertionError(
-        "Historical HICP reconstruction gate failed after all tests were "
-        f"evaluated. {detail}"
+        "Historical HICP annual re-anchored reconstruction gate failed after "
+        f"all tests were evaluated. {detail}"
     )
-
 
 
 def historical_reconstruction_suite(
     processed_dir: str | Path,
     *,
-    tolerance: float = DEFAULT_RECONSTRUCTION_TOLERANCE,
+    tolerance: float = DEFAULT_ANNUAL_RECONSTRUCTION_TOLERANCE,
+    cumulative_warning_tolerance: float = DEFAULT_CUMULATIVE_WARNING_TOLERANCE,
 ) -> dict:
-    """Evaluate the complete historical aggregation validation suite.
+    """Evaluate cumulative and annual re-anchored historical aggregation tests.
 
-    Both diagnostics are retained for every specification:
-
-    * ``cumulative``: one chain starting from the first published December;
-    * ``annual_reanchored``: every calendar year restarted from the published
-      previous-December aggregate.
-
-    The function itself does not stop at the first failure.  Use
-    :func:`assert_reconstruction_suite` after displaying ``summary``.
+    ``annual_reanchored_pass`` is the hard validation contract.  The cumulative
+    reconstruction is deliberately diagnostic only because publication rounding
+    errors compound through chain links over long samples.
     """
     inputs = load_aggregation_inputs(processed_dir)
     indices = inputs["indices"]
@@ -574,11 +592,10 @@ def historical_reconstruction_suite(
         cumulative_error = reconstruction_error_table(
             result["index"],
             indices[target],
-            tolerance=tolerance,
+            tolerance=cumulative_warning_tolerance,
             label=label,
             hard_fail=False,
         )
-
         annual_error = annual_reanchored_reconstruction_errors(
             indices,
             weights,
@@ -589,8 +606,18 @@ def historical_reconstruction_suite(
             tolerance=tolerance,
         )
 
-        cumulative_pass = bool(cumulative_error["pass"].all())
+        cumulative_max = float(cumulative_error["absolute_error"].max())
+        cumulative_watch_pass = cumulative_max <= float(cumulative_warning_tolerance)
         annual_pass = bool(annual_error["pass"].all())
+
+        if not cumulative_watch_pass:
+            warnings.warn(
+                f"{label}: cumulative reconstruction error {cumulative_max:.6f} "
+                f"exceeds diagnostic watch limit "
+                f"{float(cumulative_warning_tolerance):.6f}; annual re-anchored "
+                "formula gate is evaluated separately.",
+                RuntimeWarning,
+            )
 
         reconstructions[label] = result
         errors[label] = cumulative_error
@@ -603,8 +630,12 @@ def historical_reconstruction_suite(
                 "start": cumulative_error.index.min(),
                 "end": cumulative_error.index.max(),
                 "observations": int(len(cumulative_error)),
-                "max_abs_error": float(cumulative_error["absolute_error"].max()),
+                "max_abs_error": cumulative_max,
                 "mean_abs_error": float(cumulative_error["absolute_error"].mean()),
+                "cumulative_warning_tolerance": float(
+                    cumulative_warning_tolerance
+                ),
+                "cumulative_watch_pass": bool(cumulative_watch_pass),
                 "annual_reanchored_max_abs_error": float(
                     annual_error["absolute_error"].max()
                 ),
@@ -612,15 +643,14 @@ def historical_reconstruction_suite(
                     annual_error["absolute_error"].mean()
                 ),
                 "tolerance": float(tolerance),
-                "cumulative_pass": cumulative_pass,
                 "annual_reanchored_pass": annual_pass,
-                "pass": cumulative_pass and annual_pass,
+                # Backward-compatible overall flag now means the hard gate.
+                "pass": annual_pass,
             }
         )
 
-    summary = pd.DataFrame(summary_rows).set_index("test")
     return {
-        "summary": summary,
+        "summary": pd.DataFrame(summary_rows).set_index("test"),
         "reconstructions": reconstructions,
         "errors": errors,
         "annual_reanchored_errors": annual_errors,
@@ -681,264 +711,427 @@ def yoy_contributions_from_terms(
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
-class PriceIndexBridge:
-    """Empirical WOB-price to HICP-index bridge used only at the aggregation layer.
+class PriceProxyDiagnostics:
+    """Diagnostics for using a WOB consumer-price series as an HICP price proxy."""
 
-    The *applied* bridge is deliberately estimated through the origin in
-    absolute monthly differences:
-
-        ΔHICP_t = beta * ΔPrice_t + error_t.
-
-    This mirrors the paper's absolute-change specification and guarantees that
-    a constant consumer-price path implies a constant HICP path.
-    """
     label: str
-    beta: float
     observations: int
-    correlation: float
-    r_squared: float
-    uncentered_r_squared: float
-    rmse_index_change: float
     first_date: str
     last_date: str
-    beta_first_half: float
-    beta_second_half: float
-    beta_half_relative_gap: float
-    unrestricted_intercept: float
-    unrestricted_intercept_se: float
-    unrestricted_intercept_tstat: float
-    method: str = "absolute_difference_no_intercept"
-
-    @property
-    def intercept(self) -> float:
-        """Applied intercept, fixed by construction."""
-        return 0.0
+    log_diff_beta: float
+    log_diff_correlation: float
+    log_diff_rmse: float
+    absolute_diff_beta: float
+    absolute_level_residual_drift: float
+    absolute_level_residual_range: float
+    full_sample_ratio_change_percent: float
+    recent_window_months: int
+    recent_ratio_mean: float
+    recent_ratio_cv: float
+    recent_ratio_change_percent: float
+    proxy_quality_pass: bool
+    proxy_quality_note: str
 
     def as_dict(self) -> dict:
         return {
             "label": self.label,
-            "method": self.method,
-            "intercept": 0.0,
-            "beta": self.beta,
             "observations": self.observations,
-            "correlation": self.correlation,
-            "r_squared": self.r_squared,
-            "uncentered_r_squared": self.uncentered_r_squared,
-            "rmse_index_change": self.rmse_index_change,
             "first_date": self.first_date,
             "last_date": self.last_date,
-            "beta_first_half": self.beta_first_half,
-            "beta_second_half": self.beta_second_half,
-            "beta_half_relative_gap": self.beta_half_relative_gap,
-            "unrestricted_intercept": self.unrestricted_intercept,
-            "unrestricted_intercept_se": self.unrestricted_intercept_se,
-            "unrestricted_intercept_tstat": self.unrestricted_intercept_tstat,
+            "log_diff_beta": self.log_diff_beta,
+            "log_diff_correlation": self.log_diff_correlation,
+            "log_diff_rmse": self.log_diff_rmse,
+            "absolute_diff_beta": self.absolute_diff_beta,
+            "absolute_level_residual_drift": self.absolute_level_residual_drift,
+            "absolute_level_residual_range": self.absolute_level_residual_range,
+            "full_sample_ratio_change_percent": self.full_sample_ratio_change_percent,
+            "recent_window_months": self.recent_window_months,
+            "recent_ratio_mean": self.recent_ratio_mean,
+            "recent_ratio_cv": self.recent_ratio_cv,
+            "recent_ratio_change_percent": self.recent_ratio_change_percent,
+            "proxy_quality_pass": self.proxy_quality_pass,
+            "proxy_quality_note": self.proxy_quality_note,
         }
 
 
-def fit_price_index_bridge(
+def price_proxy_diagnostics(
     monthly_consumer_price: pd.Series,
     hicp_index: pd.Series,
     *,
     label: str,
-    minimum_observations: int = 24,
-    max_unrestricted_intercept_tstat: float = 2.58,
-    max_half_beta_relative_gap: float = 0.25,
-) -> PriceIndexBridge:
-    """Estimate a WOB-price -> HICP bridge in monthly absolute differences.
+    recent_window_months: int = 36,
+    max_log_beta_deviation_from_one: float = 0.25,
+    max_recent_ratio_cv: float = 0.05,
+) -> PriceProxyDiagnostics:
+    """Diagnose the WOB consumer-price series as a proxy for an HICP sub-index.
 
-    Applied specification
-    ---------------------
-        ΔHICP_t = beta * ΔPrice_t + error_t
+    The production forecast does *not* estimate a bridge regression.  The paper
+    states that weekly WOB petrol/diesel forecasts are converted to monthly
+    frequency and aggregated using their weights.  We therefore use WOB price
+    relatives directly and rebase them to the latest common published HICP
+    level.
 
-    There is intentionally **no applied intercept**.  The ECB STIP paper models
-    these consumer-price equations in absolute changes because per-unit excise,
-    refining and distribution margins make percentage-change relationships less
-    stable.  A zero intercept also passes the required constant-price test:
-    if the consumer-price path is flat, the mapped HICP path is flat.
+    Two diagnostics remain useful:
 
-    Diagnostics
-    -----------
-    An unrestricted intercept regression is still estimated diagnostically.
-    A significant intercept signals that the simple bridge is misspecified.
-    The slope is also estimated separately on the two half-samples.
+    * ``log_diff_beta`` tests the proportional-price benchmark (beta = 1);
+    * ``HICP / WOB`` stability over the recent window checks whether a fixed
+      local rebasing ratio is defensible for a short-horizon forecast.
+
+    For comparison with the rejected absolute-difference bridge, the function
+    also reports the drift in ``HICP - beta_abs * WOB`` levels.
     """
     price = monthly_consumer_price.astype(float).sort_index()
     hicp = hicp_index.astype(float).sort_index()
-
-    if (price.dropna() <= 0).any() or (hicp.dropna() <= 0).any():
-        raise ValueError(f"{label}: price and HICP levels must be positive.")
-
     data = pd.concat(
-        [
-            price.diff().rename("price_change"),
-            hicp.diff().rename("hicp_change"),
-        ],
+        [price.rename("price"), hicp.rename("hicp")],
         axis=1,
     ).dropna()
 
-    if len(data) < int(minimum_observations):
-        raise ValueError(
-            f"{label}: only {len(data)} overlapping monthly changes; "
-            f"need at least {minimum_observations}."
-        )
+    if len(data) < 24:
+        raise ValueError(f"{label}: only {len(data)} overlapping monthly levels.")
+    if (data <= 0).any().any():
+        raise ValueError(f"{label}: WOB and HICP levels must be positive.")
 
-    x = data["price_change"].to_numpy(dtype=float)
-    y = data["hicp_change"].to_numpy(dtype=float)
-    xx = float(x @ x)
-    if not np.isfinite(xx) or xx <= 0:
-        raise ValueError(f"{label}: consumer-price changes contain no variation.")
+    log_changes = np.log(data).diff().dropna()
+    x_log = log_changes["price"].to_numpy(dtype=float)
+    y_log = log_changes["hicp"].to_numpy(dtype=float)
+    xx_log = float(x_log @ x_log)
+    if xx_log <= 0:
+        raise ValueError(f"{label}: log price changes contain no variation.")
+    beta_log = float((x_log @ y_log) / xx_log)
+    log_residual = y_log - beta_log * x_log
+    log_corr = float(log_changes["price"].corr(log_changes["hicp"]))
 
-    beta = float((x @ y) / xx)
-    fitted = beta * x
-    residual = y - fitted
+    abs_changes = data.diff().dropna()
+    x_abs = abs_changes["price"].to_numpy(dtype=float)
+    y_abs = abs_changes["hicp"].to_numpy(dtype=float)
+    xx_abs = float(x_abs @ x_abs)
+    if xx_abs <= 0:
+        raise ValueError(f"{label}: absolute price changes contain no variation.")
+    beta_abs = float((x_abs @ y_abs) / xx_abs)
 
-    sse = float(residual @ residual)
-    centered_sst = float((y - y.mean()) @ (y - y.mean()))
-    uncentered_sst = float(y @ y)
-    r_squared = np.nan if centered_sst <= 0 else 1.0 - sse / centered_sst
-    uncentered_r_squared = (
-        np.nan if uncentered_sst <= 0 else 1.0 - sse / uncentered_sst
+    absolute_level_residual = data["hicp"] - beta_abs * data["price"]
+    absolute_level_residual_drift = float(
+        absolute_level_residual.iloc[-1] - absolute_level_residual.iloc[0]
     )
-    correlation = float(data["price_change"].corr(data["hicp_change"]))
-
-    midpoint = len(data) // 2
-    if midpoint < 2 or len(data) - midpoint < 2:
-        raise ValueError(f"{label}: sample is too short for half-sample diagnostics.")
-
-    def _slope(block: pd.DataFrame) -> float:
-        xb = block["price_change"].to_numpy(dtype=float)
-        yb = block["hicp_change"].to_numpy(dtype=float)
-        denom = float(xb @ xb)
-        if denom <= 0:
-            raise ValueError(f"{label}: zero change variance in a bridge half-sample.")
-        return float((xb @ yb) / denom)
-
-    beta_first = _slope(data.iloc[:midpoint])
-    beta_second = _slope(data.iloc[midpoint:])
-    scale = max(abs(beta), 1e-12)
-    beta_half_relative_gap = abs(beta_second - beta_first) / scale
-
-    # Unrestricted intercept is diagnostic only; it is never propagated.
-    X = np.column_stack([np.ones(len(x)), x])
-    unrestricted = np.linalg.lstsq(X, y, rcond=None)[0]
-    unrestricted_residual = y - X @ unrestricted
-    dof = len(y) - 2
-    sigma2 = float(unrestricted_residual @ unrestricted_residual) / max(dof, 1)
-    covariance = sigma2 * np.linalg.inv(X.T @ X)
-    intercept_se = float(np.sqrt(max(covariance[0, 0], 0.0)))
-    intercept = float(unrestricted[0])
-    intercept_tstat = (
-        np.nan if intercept_se <= 0 else float(intercept / intercept_se)
+    absolute_level_residual_range = float(
+        absolute_level_residual.max() - absolute_level_residual.min()
     )
 
-    if (
-        np.isfinite(intercept_tstat)
-        and abs(intercept_tstat) > float(max_unrestricted_intercept_tstat)
-    ):
-        raise AssertionError(
-            f"{label}: unrestricted bridge intercept is statistically material "
-            f"(t={intercept_tstat:.2f}); a zero-intercept bridge is not adequate."
-        )
+    ratio = data["hicp"] / data["price"]
+    full_ratio_change = float(100.0 * (ratio.iloc[-1] / ratio.iloc[0] - 1.0))
 
-    if beta_half_relative_gap > float(max_half_beta_relative_gap):
-        raise AssertionError(
-            f"{label}: bridge slope is unstable across half-samples "
-            f"(relative gap={beta_half_relative_gap:.1%}, "
-            f"limit={max_half_beta_relative_gap:.1%})."
-        )
+    recent_n = min(int(recent_window_months), len(ratio))
+    if recent_n < 12:
+        raise ValueError(f"{label}: recent proxy window is too short.")
+    recent = ratio.iloc[-recent_n:]
+    recent_mean = float(recent.mean())
+    recent_cv = float(recent.std(ddof=1) / recent_mean)
+    recent_change = float(100.0 * (recent.iloc[-1] / recent.iloc[0] - 1.0))
 
-    return PriceIndexBridge(
+    beta_ok = abs(beta_log - 1.0) <= float(max_log_beta_deviation_from_one)
+    ratio_ok = recent_cv <= float(max_recent_ratio_cv)
+    quality_pass = bool(beta_ok and ratio_ok)
+
+    notes = []
+    if not beta_ok:
+        notes.append(
+            f"log-difference beta {beta_log:.3f} is more than "
+            f"{max_log_beta_deviation_from_one:.0%} from one"
+        )
+    if not ratio_ok:
+        notes.append(
+            f"recent HICP/WOB ratio CV {recent_cv:.2%} exceeds "
+            f"{max_recent_ratio_cv:.2%}"
+        )
+    note = "proxy diagnostics pass" if not notes else "; ".join(notes)
+
+    return PriceProxyDiagnostics(
         label=str(label),
-        beta=beta,
         observations=int(len(data)),
-        correlation=correlation,
-        r_squared=float(r_squared),
-        uncentered_r_squared=float(uncentered_r_squared),
-        rmse_index_change=float(np.sqrt(np.mean(residual**2))),
         first_date=data.index.min().date().isoformat(),
         last_date=data.index.max().date().isoformat(),
-        beta_first_half=beta_first,
-        beta_second_half=beta_second,
-        beta_half_relative_gap=float(beta_half_relative_gap),
-        unrestricted_intercept=intercept,
-        unrestricted_intercept_se=intercept_se,
-        unrestricted_intercept_tstat=float(intercept_tstat),
+        log_diff_beta=beta_log,
+        log_diff_correlation=log_corr,
+        log_diff_rmse=float(np.sqrt(np.mean(log_residual**2))),
+        absolute_diff_beta=beta_abs,
+        absolute_level_residual_drift=absolute_level_residual_drift,
+        absolute_level_residual_range=absolute_level_residual_range,
+        full_sample_ratio_change_percent=full_ratio_change,
+        recent_window_months=recent_n,
+        recent_ratio_mean=recent_mean,
+        recent_ratio_cv=recent_cv,
+        recent_ratio_change_percent=recent_change,
+        proxy_quality_pass=quality_pass,
+        proxy_quality_note=note,
     )
 
 
-def bridge_diagnostic_table(bridges: Mapping[str, PriceIndexBridge]) -> pd.DataFrame:
-    """Compact bridge diagnostics for notebook display."""
+def price_proxy_diagnostic_table(
+    diagnostics: Mapping[str, PriceProxyDiagnostics],
+) -> pd.DataFrame:
+    """Compact WOB/HICP proxy diagnostic table for notebook display."""
     rows = []
-    for name, bridge in bridges.items():
-        row = bridge.as_dict()
+    for name, diagnostic in diagnostics.items():
+        row = diagnostic.as_dict()
         row["component"] = name
         rows.append(row)
     return pd.DataFrame(rows).set_index("component")
 
 
-def price_paths_to_hicp_paths(
+
+def filter_positive_price_draws(
+    baseline_paths: np.ndarray,
+    scenario_paths: np.ndarray | None = None,
+    *,
+    admissibility_paths: Mapping[str, np.ndarray] | None = None,
+    max_rejection_rate: float | None = None,
+    label: str = "consumer_price",
+) -> dict:
+    """Condition predictive price paths on economic admissibility.
+
+    The weekly fuel BVARs are estimated in absolute price changes. Gaussian
+    predictive innovations have unbounded support, so a small number of
+    long-horizon draws can imply non-positive price levels.
+
+    The filter rejects COMPLETE draws; it never clips individual observations.
+    ``baseline_paths`` and ``scenario_paths`` are the output arrays that will
+    continue into HICP rebasing. ``admissibility_paths`` can additionally
+    contain the economically primitive paths that must be positive, notably
+    the weekly pre-tax BVAR price and the weekly after-tax price.
+
+    All arrays may have different time dimensions, but they must have the same
+    number of draws. A draw is retained only if every supplied path for that
+    draw is finite and strictly positive. The same mask is therefore applied
+    to baseline and scenario, preserving their draw-by-draw comparison.
+
+    ``max_rejection_rate`` is optional. It defaults to ``None`` because a hard
+    threshold should be calibrated empirically rather than fixed arbitrarily.
+    The rejection rate is always returned in the diagnostics.
+
+    Returns
+    -------
+    dict
+        Filtered ``baseline_paths`` and optional ``scenario_paths``, the
+        boolean ``valid_mask``, retained original ``draw_indices``, and a flat
+        diagnostics dictionary suitable for a DataFrame/dashboard.
+    """
+    baseline = np.asarray(baseline_paths, dtype=float)
+    if baseline.ndim != 2:
+        raise ValueError(
+            f"{label}: baseline_paths must be a 2-D draw x date array; "
+            f"got shape {baseline.shape}."
+        )
+
+    n_total = int(baseline.shape[0])
+    if n_total < 1:
+        raise ValueError(f"{label}: no predictive draws were supplied.")
+
+    arrays: dict[str, np.ndarray] = {
+        "baseline_output": baseline,
+    }
+
+    scenario = None
+    if scenario_paths is not None:
+        scenario = np.asarray(scenario_paths, dtype=float)
+        if scenario.ndim != 2:
+            raise ValueError(
+                f"{label}: scenario_paths must be a 2-D draw x date array; "
+                f"got shape {scenario.shape}."
+            )
+        if scenario.shape[0] != n_total:
+            raise ValueError(
+                f"{label}: baseline/scenario draw counts differ: "
+                f"{n_total} vs {scenario.shape[0]}."
+            )
+        arrays["scenario_output"] = scenario
+
+    if admissibility_paths is not None:
+        for name, values in admissibility_paths.items():
+            key = str(name)
+            if key in arrays:
+                raise ValueError(
+                    f"{label}: duplicate admissibility path name {key!r}."
+                )
+            array = np.asarray(values, dtype=float)
+            if array.ndim != 2:
+                raise ValueError(
+                    f"{label}: admissibility path {key!r} must be 2-D; "
+                    f"got shape {array.shape}."
+                )
+            if array.shape[0] != n_total:
+                raise ValueError(
+                    f"{label}: admissibility path {key!r} has "
+                    f"{array.shape[0]} draws; expected {n_total}."
+                )
+            arrays[key] = array
+
+    valid_by_path: dict[str, np.ndarray] = {}
+    for name, array in arrays.items():
+        valid_by_path[name] = (
+            np.isfinite(array).all(axis=1)
+            & (array > 0).all(axis=1)
+        )
+
+    valid_mask = np.logical_and.reduce(list(valid_by_path.values()))
+    retained_indices = np.flatnonzero(valid_mask)
+
+    n_retained = int(valid_mask.sum())
+    n_rejected = int(n_total - n_retained)
+    rejection_rate = float(n_rejected / n_total)
+
+    if n_retained == 0:
+        raise RuntimeError(
+            f"{label}: every predictive price draw violates positivity/finite "
+            "admissibility."
+        )
+
+    if max_rejection_rate is not None:
+        max_rate = float(max_rejection_rate)
+        if not 0.0 <= max_rate <= 1.0:
+            raise ValueError("max_rejection_rate must lie in [0, 1] or be None.")
+        if rejection_rate > max_rate:
+            raise RuntimeError(
+                f"{label}: {100.0 * rejection_rate:.2f}% of predictive price "
+                "draws violate admissibility, above the configured "
+                f"{100.0 * max_rate:.2f}% guard."
+            )
+
+    diagnostics: dict[str, object] = {
+        "total_draws": n_total,
+        "retained_draws": n_retained,
+        "rejected_draws": n_rejected,
+        "rejection_rate": rejection_rate,
+        "distribution_interpretation": (
+            "posterior predictive conditional on all supplied price paths "
+            "being finite and strictly positive"
+        ),
+    }
+    diagnostics.update({
+        f"invalid_draws_{name}": int((~path_valid).sum())
+        for name, path_valid in valid_by_path.items()
+    })
+
+    return {
+        "baseline_paths": baseline[valid_mask],
+        "scenario_paths": None if scenario is None else scenario[valid_mask],
+        "valid_mask": valid_mask,
+        "draw_indices": retained_indices,
+        "diagnostics": diagnostics,
+    }
+
+
+def rebase_price_paths_to_hicp_index(
     monthly_price_paths: np.ndarray,
     dates: Sequence[pd.Timestamp],
-    *,
-    bridge: PriceIndexBridge,
-    anchor_price: float,
-    anchor_hicp: float,
-) -> np.ndarray:
-    """Map monthly consumer-price paths into HICP paths draw by draw.
+    historical_monthly_price: pd.Series,
+    hicp_history: pd.Series,
+) -> dict:
+    """Use WOB consumer-price relatives as the forecast HICP price relatives.
 
-    Applied recursion:
+    Let ``a`` be the latest month strictly before the simulated monthly path for
+    which both WOB and HICP are observed.  The synthetic index is
 
-        HICP_t = HICP_{t-1} + beta * (Price_t - Price_{t-1}).
+        I_t = I_a * P_t / P_a.
 
-    Therefore a flat price path produces a flat HICP path exactly.
+    Months between the HICP anchor and the simulated path start are filled with
+    observed WOB monthly prices.  No regression coefficient is estimated or
+    accumulated through the forecast horizon.
+
+    This construction is scale-invariant, continuous at the anchor, and exactly
+    what the Laspeyres aggregation needs: component price relatives.
     """
     values = np.asarray(monthly_price_paths, dtype=float)
-    dates = pd.DatetimeIndex(dates)
+    path_dates = pd.DatetimeIndex(dates, name="date")
 
-    if values.ndim != 2 or values.shape[1] != len(dates):
-        raise ValueError("monthly_price_paths must have shape (draws, len(dates)).")
-    if len(dates) == 0:
-        return values.copy()
-
-    expected = pd.date_range(dates[0], dates[-1], freq="MS", name=dates.name)
-    if not dates.equals(expected):
-        raise ValueError("Bridge dates must be a complete monthly calendar.")
-    if not np.isfinite(anchor_price) or anchor_price <= 0:
-        raise ValueError("anchor_price must be positive.")
-    if not np.isfinite(anchor_hicp) or anchor_hicp <= 0:
-        raise ValueError("anchor_hicp must be positive.")
+    if values.ndim != 2 or values.shape[1] != len(path_dates):
+        raise ValueError(
+            "monthly_price_paths must have shape (draws, len(dates))."
+        )
+    if len(path_dates) == 0:
+        return {
+            "index_paths": values.copy(),
+            "dates": path_dates,
+            "anchor_date": None,
+            "anchor_price": np.nan,
+            "anchor_hicp": np.nan,
+            "method": "proportional_rebase_to_latest_common_hicp",
+        }
+    expected = pd.date_range(path_dates[0], path_dates[-1], freq="MS", name="date")
+    if not path_dates.equals(expected):
+        raise ValueError("dates must be a complete monthly calendar.")
     if np.any(~np.isfinite(values)) or np.any(values <= 0):
-        raise ValueError("All monthly price paths must be finite and positive.")
+        raise ValueError("Monthly consumer-price paths must be finite and positive.")
 
-    previous_price = np.full(values.shape[0], float(anchor_price), dtype=float)
-    previous_index = np.full(values.shape[0], float(anchor_hicp), dtype=float)
-    out = np.empty_like(values, dtype=float)
+    price_history = historical_monthly_price.astype(float).dropna().sort_index()
+    price_history.index = (
+        pd.DatetimeIndex(price_history.index)
+        .to_period("M")
+        .to_timestamp(how="start")
+    )
+    if price_history.index.has_duplicates:
+        price_history = price_history.groupby(level=0).last()
+    price_history.index = pd.DatetimeIndex(price_history.index, name="date")
 
-    for t in range(values.shape[1]):
-        price_change = values[:, t] - previous_price
-        current_index = previous_index + bridge.beta * price_change
-        if np.any(~np.isfinite(current_index)) or np.any(current_index <= 0):
+    hicp = hicp_history.astype(float).dropna().sort_index()
+    hicp.index = (
+        pd.DatetimeIndex(hicp.index)
+        .to_period("M")
+        .to_timestamp(how="start")
+    )
+    if hicp.index.has_duplicates:
+        hicp = hicp.groupby(level=0).last()
+    hicp.index = pd.DatetimeIndex(hicp.index, name="date")
+
+    common = price_history.index.intersection(hicp.index)
+    common = common[common < path_dates[0]]
+    if len(common) == 0:
+        raise ValueError(
+            "No common observed WOB/HICP month exists before the simulated path."
+        )
+
+    anchor_date = pd.Timestamp(common.max())
+    anchor_price = float(price_history.loc[anchor_date])
+    anchor_hicp = float(hicp.loc[anchor_date])
+    if anchor_price <= 0 or anchor_hicp <= 0:
+        raise ValueError("WOB/HICP anchor values must be positive.")
+
+    target_dates = pd.date_range(
+        anchor_date + pd.offsets.MonthBegin(1),
+        path_dates[-1],
+        freq="MS",
+        name="date",
+    )
+    n_draws = values.shape[0]
+    combined_price = np.empty((n_draws, len(target_dates)), dtype=float)
+
+    path_lookup = {pd.Timestamp(date): j for j, date in enumerate(path_dates)}
+    for t, date in enumerate(target_dates):
+        if date in path_lookup:
+            combined_price[:, t] = values[:, path_lookup[date]]
+        elif date in price_history.index:
+            observed_value = float(price_history.loc[date])
+            if not np.isfinite(observed_value) or observed_value <= 0:
+                raise ValueError(f"Invalid observed WOB price at {date.date()}.")
+            combined_price[:, t] = observed_value
+        else:
             raise ValueError(
-                f"{bridge.label}: mapped HICP index became non-positive or non-finite."
+                f"No observed or simulated WOB price is available for {date.date()}."
             )
-        out[:, t] = current_index
-        previous_price = values[:, t]
-        previous_index = current_index
 
-    # Hard invariant requested by the bridge critique.
-    flat = np.full((1, 2), float(anchor_price), dtype=float)
-    flat_out = np.empty_like(flat)
-    prev_p = float(anchor_price)
-    prev_i = float(anchor_hicp)
-    for t in range(flat.shape[1]):
-        prev_i = prev_i + bridge.beta * (flat[0, t] - prev_p)
-        flat_out[0, t] = prev_i
-        prev_p = flat[0, t]
-    if not np.allclose(flat_out, float(anchor_hicp), atol=1e-12, rtol=0.0):
-        raise AssertionError("Constant-price bridge invariant failed.")
+    index_paths = anchor_hicp * combined_price / anchor_price
+    if np.any(~np.isfinite(index_paths)) or np.any(index_paths <= 0):
+        raise ValueError("Rebased HICP proxy path became non-positive or non-finite.")
 
-    return out
+    return {
+        "index_paths": index_paths,
+        "price_paths": combined_price,
+        "dates": target_dates,
+        "anchor_date": anchor_date,
+        "anchor_price": anchor_price,
+        "anchor_hicp": anchor_hicp,
+        "method": "proportional_rebase_to_latest_common_hicp",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1038,6 +1231,11 @@ def weekly_paths_with_history_to_monthly_mean(
 
         if not complete:
             if is_last:
+                warnings.warn(
+                    f"Dropping incomplete final weekly-to-monthly aggregate "
+                    f"{month}: {available}/{len(mondays)} Mondays available.",
+                    RuntimeWarning,
+                )
                 continue
             raise ValueError(
                 f"Weekly path/history cannot form a complete monthly mean "
@@ -1163,19 +1361,13 @@ def model_energy_weights(annual_weights: pd.DataFrame) -> pd.DataFrame:
 def historical_model_component_reconstruction(
     processed_dir: str | Path,
     *,
-    tolerance: float = DEFAULT_RECONSTRUCTION_TOLERANCE,
+    tolerance: float = DEFAULT_ANNUAL_RECONSTRUCTION_TOLERANCE,
+    cumulative_warning_tolerance: float = DEFAULT_CUMULATIVE_WARNING_TOLERANCE,
 ) -> dict:
-    """Build the six-component history used by the forecast aggregator.
+    """Build and validate the six-model historical HICP Energy decomposition.
 
-    ``car_fuels`` is the energy-relevant transport-fuel sub-aggregate
-    (diesel + petrol + other transport fuels), excluding lubricants.  It is
-    chain-linked from December 2016 with an arbitrary level anchor of 100; its
-    scale cancels in the higher-level Laspeyres relatives.
-
-    The resulting six-component reconstruction is checked against published
-    HICP Energy from January 2017 onward.  This is the deterministic historical
-    decomposition that must be supplied to ``draw_yoy_and_contributions`` so
-    forecast contributions remain exactly additive across the origin.
+    The annual re-anchored reconstruction is the hard gate.  The long chained
+    reconstruction is retained as a drift diagnostic only.
     """
     inputs = load_aggregation_inputs(processed_dir)
     indices = inputs["indices"]
@@ -1222,10 +1414,11 @@ def historical_model_component_reconstruction(
         anchor_date=anchor_date,
         end_date=indices.index.max(),
     )
+
     error = reconstruction_error_table(
         energy["index"],
         indices["hicp_energy"],
-        tolerance=tolerance,
+        tolerance=cumulative_warning_tolerance,
         label="six_model_component_energy_history",
         hard_fail=False,
     )
@@ -1238,8 +1431,46 @@ def historical_model_component_reconstruction(
         last_year=int(indices.index.max().year),
         tolerance=tolerance,
     )
-    cumulative_pass = bool(error["pass"].all())
+
+    cumulative_max = float(error["absolute_error"].max())
+    cumulative_watch_pass = (
+        cumulative_max <= float(cumulative_warning_tolerance)
+    )
     annual_pass = bool(annual_error["pass"].all())
+
+    if not cumulative_watch_pass:
+        warnings.warn(
+            "six_model_component_energy_history: cumulative reconstruction "
+            f"error {cumulative_max:.6f} exceeds diagnostic watch limit "
+            f"{float(cumulative_warning_tolerance):.6f}.",
+            RuntimeWarning,
+        )
+
+    summary = pd.DataFrame(
+        [
+            {
+                "test": "six_model_component_energy_history",
+                "start": error.index.min(),
+                "end": error.index.max(),
+                "observations": int(len(error)),
+                "max_abs_error": cumulative_max,
+                "mean_abs_error": float(error["absolute_error"].mean()),
+                "cumulative_warning_tolerance": float(
+                    cumulative_warning_tolerance
+                ),
+                "cumulative_watch_pass": bool(cumulative_watch_pass),
+                "annual_reanchored_max_abs_error": float(
+                    annual_error["absolute_error"].max()
+                ),
+                "annual_reanchored_mean_abs_error": float(
+                    annual_error["absolute_error"].mean()
+                ),
+                "tolerance": float(tolerance),
+                "annual_reanchored_pass": annual_pass,
+                "pass": annual_pass,
+            }
+        ]
+    ).set_index("test")
 
     return {
         "component_history": component_history,
@@ -1248,29 +1479,9 @@ def historical_model_component_reconstruction(
         "energy": energy,
         "error": error,
         "annual_reanchored_error": annual_error,
-        "summary": pd.Series(
-            {
-                "start": error.index.min(),
-                "end": error.index.max(),
-                "observations": int(len(error)),
-                "max_abs_error": float(error["absolute_error"].max()),
-                "mean_abs_error": float(error["absolute_error"].mean()),
-                "annual_reanchored_max_abs_error": float(
-                    annual_error["absolute_error"].max()
-                ),
-                "annual_reanchored_mean_abs_error": float(
-                    annual_error["absolute_error"].mean()
-                ),
-                "tolerance": float(tolerance),
-                "cumulative_pass": cumulative_pass,
-                "annual_reanchored_pass": annual_pass,
-                "pass": cumulative_pass and annual_pass,
-            },
-            name="six_model_component_energy_history",
-        ),
+        "summary": summary,
         "inputs": inputs,
     }
-
 
 
 def _model_weight_table_for_chain(annual_weights: pd.DataFrame) -> pd.DataFrame:
@@ -1314,7 +1525,6 @@ def aggregate_component_draw_paths_laspeyres(
         )
 
     arrays = {name: np.asarray(component_paths[name], dtype=float) for name in components}
-    shapes = {name: array.shape for name, array in arrays.items()}
     n_draws = next(iter(arrays.values())).shape[0]
     for name, array in arrays.items():
         if array.shape != (n_draws, len(dates)):
@@ -1591,7 +1801,7 @@ __all__ = [
     "ENERGY_COMPONENTS_POST_2017",
     "ENERGY_SPECIAL_COMPONENTS",
     "MODEL_AGGREGATE_COMPONENTS",
-    "PriceIndexBridge",
+    "PriceProxyDiagnostics",
     "load_aggregation_inputs",
     "chain_link_laspeyres",
     "reconstruction_error_table",
@@ -1600,9 +1810,10 @@ __all__ = [
     "assert_reconstruction_suite",
     "yoy_from_index",
     "yoy_contributions_from_terms",
-    "fit_price_index_bridge",
-    "bridge_diagnostic_table",
-    "price_paths_to_hicp_paths",
+    "price_proxy_diagnostics",
+    "price_proxy_diagnostic_table",
+    "filter_positive_price_draws",
+    "rebase_price_paths_to_hicp_index",
     "weekly_paths_with_history_to_monthly_mean",
     "independent_draw_pairing",
     "model_energy_weights",

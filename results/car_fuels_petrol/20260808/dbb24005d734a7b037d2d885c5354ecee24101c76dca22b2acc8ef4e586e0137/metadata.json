@@ -1,0 +1,41 @@
+{
+  "model_id": "car_fuels_petrol",
+  "vintage": "20260808",
+  "data_hash": "7b39f63417b58f738bc0618d3d73cbb0763d96241f6a84a9ce6f573ba474a9cf",
+  "config_hash": "f547c6940915e6fa87788823c54c60f48638b9ea501191586b83b499cdb7f2fa",
+  "code_version": "energy_bvar_model-v2",
+  "seed": 42,
+  "run_id": "dbb24005d734a7b037d2d885c5354ecee24101c76dca22b2acc8ef4e586e0137",
+  "result_schema_version": "1.4",
+  "frequency": "weekly",
+  "calendar_rule": "W-MON",
+  "missing_data_method": "linear",
+  "missing_treatment_exact": false,
+  "source_data_hash": "7b39f63417b58f738bc0618d3d73cbb0763d96241f6a84a9ce6f573ba474a9cf",
+  "effective_estimation_data_hash": "f4f9c19f99328dcb1bceade968ff9c57dd0343d159153803703f1d4e080c957e",
+  "variables": [
+    "wob_petrol_pre_tax",
+    "crude_oil_eur",
+    "refined_petroleum_eur"
+  ],
+  "exog_names": [],
+  "exog_prior_scale": null,
+  "p": 24,
+  "n_observations": 1128,
+  "created_at_utc": "2026-08-09T03:45:58.108601+00:00",
+  "data_augmentation": "linear_interpolation",
+  "missing_data_approximation_used": true,
+  "interpolated_level_cells": 49,
+  "interpolated_dates": 49,
+  "ksc_offset_calibration": "initial_structural_residual_median_squared",
+  "ksc_offsets": [
+    3.16006443224148e-05,
+    1.7099391967954963e-06,
+    0.00015830095191216593
+  ],
+  "requires_data_augmentation": false,
+  "interior_missing_dates": 0,
+  "interior_missing_level_cells": 0,
+  "dk_projection_mode": "strict",
+  "dk_projection_diagnostics": null
+}

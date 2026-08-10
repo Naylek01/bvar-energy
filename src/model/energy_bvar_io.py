@@ -77,6 +77,106 @@ def diagnostics_frame(result: Mapping) -> pd.DataFrame:
     return pd.concat([mcmc, stability], ignore_index=True, sort=False)
 
 
+def _history_frame(result: Mapping) -> pd.DataFrame:
+    """Return the observed model-level history needed by the dashboard.
+
+    ``levels_original`` is preferred so a linear missing-data approximation is
+    never presented as if it had been observed. Weekly partial-period values
+    have already been masked by the model adapter before estimation, so this
+    frame mirrors the actual model input contract.
+    """
+    prep = result.get("prep", {})
+    levels = prep.get("levels_original", prep.get("levels"))
+    if levels is None:
+        raise ValueError("Result does not contain prep['levels_original'] or prep['levels'].")
+    frame = pd.DataFrame(levels).copy()
+    variables = [str(v) for v in result.get("variables", frame.columns)]
+    missing = [name for name in variables if name not in frame.columns]
+    if missing:
+        raise ValueError(f"Result history is missing variables {missing}.")
+    frame = frame.loc[:, variables].apply(pd.to_numeric, errors="coerce")
+    frame.index = pd.DatetimeIndex(pd.to_datetime(frame.index), name="date")
+    return frame.sort_index()
+
+
+def _save_energy_bvar_history(result: Mapping, run_directory: str | Path) -> Path:
+    directory = Path(run_directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    return _write_table(_history_frame(result), directory / "history")
+
+
+def load_energy_bvar_history(run_directory: str | Path) -> pd.DataFrame:
+    """Load the compact observed history persisted beside a saved run.
+
+    New runs always receive this artefact. Legacy runs remain readable by the
+    dashboard through its one-time processed-data fallback.
+    """
+    directory = Path(run_directory)
+    parquet = directory / "history.parquet"
+    csv = directory / "history.csv"
+    if parquet.is_file():
+        frame = pd.read_parquet(parquet)
+    elif csv.is_file():
+        frame = pd.read_csv(csv, index_col=0, parse_dates=True)
+    else:
+        raise FileNotFoundError(f"No history.parquet/history.csv found in {directory}.")
+    frame.index = pd.DatetimeIndex(pd.to_datetime(frame.index), name="date")
+    return frame.sort_index().apply(pd.to_numeric, errors="coerce")
+
+
+# -----------------------------------------------------------------------------
+# Compact posterior fit cache
+# -----------------------------------------------------------------------------
+
+_FIT_ARRAYS = (
+    "B",
+    "completed_differences_draws",
+)
+
+
+def _save_energy_bvar_fit_cache(result: Mapping, run_directory: str | Path) -> Path:
+    """Persist the minimum posterior information required for in-sample fitted paths.
+
+    This cache is intentionally much smaller than ``draws.npz``.  It is written
+    even by the lightweight forecast-save path so future dashboard fits do not
+    require re-estimating a model merely because structural-analysis draws were
+    not retained.  Exact DK runs also persist draw-specific completed differences
+    because their lagged design matrix is posterior-state dependent.
+    """
+    directory = Path(run_directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    if "B" not in result:
+        raise ValueError("Result does not contain posterior coefficient draws 'B'.")
+    arrays = {
+        name: np.asarray(result[name])
+        for name in _FIT_ARRAYS
+        if name in result
+    }
+    path = directory / "fit_draws.npz"
+    np.savez_compressed(path, **arrays)
+    return path
+
+
+def load_energy_bvar_fit_draws(
+    run_directory: str | Path,
+) -> tuple[dict, dict[str, np.ndarray]]:
+    """Load compact fitted-path draws, falling back to the full Gibbs cache."""
+    directory = Path(run_directory)
+    metadata = json.loads((directory / "metadata.json").read_text(encoding="utf-8"))
+    fit = directory / "fit_draws.npz"
+    full = directory / "draws.npz"
+    path = fit if fit.is_file() else full
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"No fit_draws.npz or draws.npz found in {directory}."
+        )
+    with np.load(path, allow_pickle=False) as archive:
+        arrays = {name: archive[name] for name in archive.files if name in _FIT_ARRAYS}
+    if "B" not in arrays:
+        raise ValueError(f"{path} does not contain posterior B draws.")
+    return metadata, arrays
+
+
 def save_energy_bvar_result(result: Mapping, output_root: str | Path) -> dict[str, Path]:
     metadata = dict(result.get("metadata", {}))
     required = {"model_id", "vintage", "run_id"}
@@ -96,6 +196,8 @@ def save_energy_bvar_result(result: Mapping, output_root: str | Path) -> dict[st
     metadata_path.write_text(json.dumps(metadata, indent=2, default=str), encoding="utf-8")
     summary_path = _write_table(model_summary_frame(result), directory / "summary")
     diagnostics_path = _write_table(diagnostics_frame(result), directory / "diagnostics")
+    history_path = _save_energy_bvar_history(result, directory)
+    fit_draws_path = _save_energy_bvar_fit_cache(result, directory)
     draws_path = directory / "draws.npz"
     np.savez_compressed(
         draws_path,
@@ -106,6 +208,8 @@ def save_energy_bvar_result(result: Mapping, output_root: str | Path) -> dict[st
         "metadata": metadata_path,
         "summary": summary_path,
         "diagnostics": diagnostics_path,
+        "history": history_path,
+        "fit_draws": fit_draws_path,
         "draws": draws_path,
     }
 
@@ -328,9 +432,11 @@ def save_energy_bvar_forecast_for_result(
 
     The fitted result's cache-safe metadata determines the same
     ``model_id / vintage / run_id`` directory used by ``save_energy_bvar_result``.
-    Only ``metadata.json`` plus the forecast store are written. This is the
-    lightweight path used by notebooks 03--09 when Notebook 10 needs predictive
-    draws but the full Gibbs arrays do not need to be persisted.
+    ``metadata.json``, observed model history, the compact ``fit_draws.npz``
+    cache and the forecast store are written. This remains the lightweight path
+    used by notebooks 03--09: structural/SV arrays stay optional, while the
+    posterior coefficient draws needed for true in-sample fitted values survive
+    after the notebook kernel exits.
     """
     metadata = dict(result.get("metadata", {}))
     required = {"model_id", "vintage", "run_id"}
@@ -362,6 +468,13 @@ def save_energy_bvar_forecast_for_result(
             json.dumps(metadata, indent=2, default=str),
             encoding="utf-8",
         )
+
+    # Persist the observed model input and the compact posterior fit cache once.
+    # The latter keeps true in-sample BVAR fitted reconstruction available even
+    # when SAVE_RESULTS=False and the heavy structural draws are intentionally
+    # not stored.
+    _save_energy_bvar_history(result, directory)
+    _save_energy_bvar_fit_cache(result, directory)
 
     return save_energy_bvar_forecast(
         forecast,
@@ -431,12 +544,229 @@ def load_energy_bvar_forecast(
     return forecast
 
 
+# -----------------------------------------------------------------------------
+# Component HICP forecast serialization
+# -----------------------------------------------------------------------------
+
+_HICP_ARRAY_KEYS = (
+    "hicp_level_paths",
+    "hicp_yoy_paths",
+    "draw_indices",
+)
+
+_HICP_METADATA_KEYS = (
+    "hicp_schema_version",
+    "model_id",
+    "vintage",
+    "run_id",
+    "forecast_name",
+    "hicp_series",
+    "hicp_label",
+    "tail_length",
+    "frequency",
+    "source_frequency",
+    "inflation_unit",
+    "level_unit",
+    "transformation_method",
+    "gamma",
+    "price_unit",
+    "excise_unit",
+    "tax_assumption",
+    "anchor_date",
+    "anchor_price",
+    "anchor_hicp",
+    "rebase_method",
+    "total_draws",
+    "retained_draws",
+    "rejected_draws",
+    "rejection_rate",
+    "distribution_interpretation",
+    "missing_data_method",
+    "missing_treatment_exact",
+)
+
+
+def _json_safe_scalar(value):
+    if value is None:
+        return None
+    if isinstance(value, pd.Timestamp):
+        return value.isoformat()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
+def save_energy_bvar_hicp_forecast(
+    hicp: Mapping,
+    forecast_directory: str | Path,
+    *,
+    overwrite: bool = False,
+) -> dict[str, Path]:
+    """Persist one component's monthly HICP level and YoY predictive paths.
+
+    The store lives beside ``forecast_draws.npz`` because it is a deterministic
+    post-processing product of that exact forecast, not a separate model run.
+    """
+    directory = Path(forecast_directory)
+    if not directory.is_dir():
+        raise FileNotFoundError(f"Forecast directory not found: {directory}")
+
+    required = {
+        "hicp_level_paths",
+        "hicp_yoy_paths",
+        "path_dates",
+        "future_dates",
+        "hicp_series",
+        "actual_hicp",
+    }
+    missing = required.difference(hicp)
+    if missing:
+        raise ValueError(f"HICP forecast is missing required keys {sorted(missing)}.")
+
+    level_paths = np.asarray(hicp["hicp_level_paths"], dtype=float)
+    yoy_paths = np.asarray(hicp["hicp_yoy_paths"], dtype=float)
+    dates = pd.DatetimeIndex(hicp["path_dates"], name="date")
+    future_dates = pd.DatetimeIndex(hicp["future_dates"], name="date")
+    if level_paths.ndim != 2 or yoy_paths.shape != level_paths.shape:
+        raise ValueError(
+            "HICP level/yoy paths must be matching two-dimensional draw x date arrays."
+        )
+    if level_paths.shape[1] != len(dates):
+        raise ValueError("HICP path_dates do not match the predictive arrays.")
+    if len(future_dates):
+        positions = dates.get_indexer(future_dates)
+        if (positions < 0).any():
+            raise ValueError("HICP future_dates are not a subset of path_dates.")
+        first = int(positions.min())
+        if not dates[first:].equals(future_dates):
+            raise ValueError("HICP future_dates must be a trailing block of path_dates.")
+        tail_length = first
+    else:
+        tail_length = len(dates)
+
+    metadata_path = directory / "hicp_metadata.json"
+    draws_path = directory / "hicp_draws.npz"
+    history_path = directory / "hicp_history.csv"
+    existing = [path for path in (metadata_path, draws_path, history_path) if path.exists()]
+    if existing and not overwrite:
+        raise FileExistsError(
+            "HICP forecast store already exists: " + ", ".join(map(str, existing))
+        )
+
+    arrays = {
+        "hicp_level_paths": level_paths,
+        "hicp_yoy_paths": yoy_paths,
+        "draw_indices": np.asarray(
+            hicp.get("draw_indices", np.arange(level_paths.shape[0])), dtype=int
+        ),
+    }
+    np.savez_compressed(draws_path, **arrays)
+
+    metadata = {
+        "hicp_schema_version": str(hicp.get("hicp_schema_version", "1.0")),
+        "n_draws": int(level_paths.shape[0]),
+        "n_path_dates": int(level_paths.shape[1]),
+        "path_dates": [stamp.isoformat() for stamp in dates],
+        "future_dates": [stamp.isoformat() for stamp in future_dates],
+        "tail_length": int(tail_length),
+    }
+    for key in _HICP_METADATA_KEYS:
+        if key in hicp:
+            metadata[key] = _json_safe_scalar(hicp[key])
+    metadata_path.write_text(
+        json.dumps(metadata, indent=2, default=str), encoding="utf-8"
+    )
+
+    history = pd.Series(hicp["actual_hicp"], dtype=float).sort_index()
+    history.index = pd.DatetimeIndex(pd.to_datetime(history.index), name="date")
+    history.rename(str(hicp["hicp_series"])).to_frame().to_csv(
+        history_path, date_format="%Y-%m-%d"
+    )
+
+    optional_paths: dict[str, Path] = {}
+    for key in ("tax_path", "tax_history", "weekly_monthly_coverage"):
+        value = hicp.get(key)
+        if value is None:
+            continue
+        frame = pd.DataFrame(value).copy()
+        path = directory / f"hicp_{key}.csv"
+        frame.to_csv(path, index=True, date_format="%Y-%m-%d")
+        optional_paths[key] = path
+
+    return {
+        "directory": directory,
+        "metadata": metadata_path,
+        "draws": draws_path,
+        "history": history_path,
+        **optional_paths,
+    }
+
+
+def load_energy_bvar_hicp_forecast(forecast_directory: str | Path) -> dict:
+    """Reload a component HICP predictive product."""
+    directory = Path(forecast_directory)
+    metadata_path = directory / "hicp_metadata.json"
+    draws_path = directory / "hicp_draws.npz"
+    history_path = directory / "hicp_history.csv"
+    if not metadata_path.is_file():
+        raise FileNotFoundError(metadata_path)
+    if not draws_path.is_file():
+        raise FileNotFoundError(draws_path)
+    if not history_path.is_file():
+        raise FileNotFoundError(history_path)
+
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    with np.load(draws_path, allow_pickle=False) as archive:
+        out = {name: archive[name] for name in archive.files}
+    out.update(metadata)
+    out["path_dates"] = pd.DatetimeIndex(
+        pd.to_datetime(metadata["path_dates"]), name="date"
+    )
+    out["future_dates"] = pd.DatetimeIndex(
+        pd.to_datetime(metadata.get("future_dates", [])), name="date"
+    )
+    history = pd.read_csv(history_path, index_col=0, parse_dates=True)
+    if history.shape[1] != 1:
+        raise ValueError(f"Expected one HICP history column in {history_path}.")
+    history.index = pd.DatetimeIndex(history.index, name="date")
+    out["actual_hicp"] = history.iloc[:, 0].astype(float).rename(
+        str(metadata.get("hicp_series", history.columns[0]))
+    )
+
+    levels = np.asarray(out["hicp_level_paths"], dtype=float)
+    yoy = np.asarray(out["hicp_yoy_paths"], dtype=float)
+    if levels.ndim != 2 or yoy.shape != levels.shape:
+        raise ValueError("Reloaded HICP level/yoy path shapes are inconsistent.")
+    if levels.shape[1] != len(out["path_dates"]):
+        raise ValueError("Reloaded HICP path date count is inconsistent.")
+    tail_length = int(metadata.get("tail_length", len(out["path_dates"])))
+    if not out["path_dates"][tail_length:].equals(out["future_dates"]):
+        raise ValueError("Reloaded HICP future-date contract is inconsistent.")
+
+    for key in ("tax_path", "tax_history", "weekly_monthly_coverage"):
+        path = directory / f"hicp_{key}.csv"
+        if path.is_file():
+            frame = pd.read_csv(path, index_col=0)
+            try:
+                frame.index = pd.DatetimeIndex(pd.to_datetime(frame.index), name="date")
+            except Exception:
+                pass
+            out[key] = frame
+    return out
+
+
 __all__ = [
     "model_summary_frame",
     "diagnostics_frame",
     "save_energy_bvar_result",
     "load_energy_bvar_draws",
+    "load_energy_bvar_history",
+    "load_energy_bvar_fit_draws",
     "save_energy_bvar_forecast",
     "save_energy_bvar_forecast_for_result",
     "load_energy_bvar_forecast",
+    "save_energy_bvar_hicp_forecast",
+    "load_energy_bvar_hicp_forecast",
 ]
