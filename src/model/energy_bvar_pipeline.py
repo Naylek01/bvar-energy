@@ -64,6 +64,7 @@ __all__ = [
     "discover_runs",
     "resolve_run",
     "resolve_forecast_stores",
+    "planned_run_metadata",
     "run_component",
     "run_all_components",
 ]
@@ -940,6 +941,57 @@ def _future_exog(panel: "Panel", last_date, horizon: int) -> pd.DataFrame | None
     return future
 
 
+def planned_run_metadata(
+    name: str,
+    vintage: str | None = None,
+    *,
+    project_root: Path | str | None = None,
+    prior_config=None,
+    sampler_config=None,
+    spec_overrides: Mapping | None = None,
+) -> dict:
+    """Return the exact metadata identity a dashboard run would receive.
+
+    This performs no Gibbs sampling.  It is used by the Estimation page to
+    detect an already-complete deterministic run before spending several
+    minutes re-estimating the same model.  The progress hook is intentionally
+    excluded from the identity and therefore never changes ``run_id``.
+    """
+    from energy_bvar_model import (
+        BVARSVOPriorConfig,
+        SamplerConfig,
+        build_run_metadata,
+    )
+
+    spec = model_spec(name, **(spec_overrides or {}))
+    panel = build_panel(
+        spec.model_id,
+        vintage,
+        project_root=project_root,
+        spec_overrides=spec_overrides,
+    )
+    prior_config = BVARSVOPriorConfig() if prior_config is None else prior_config
+    sampler_config = (
+        SamplerConfig(seed=spec.seed) if sampler_config is None else sampler_config
+    )
+    return build_run_metadata(
+        model_id=spec.model_id,
+        vintage=panel.vintage,
+        levels=panel.levels,
+        p=panel.p,
+        variables=panel.variables,
+        frequency=spec.frequency,
+        exog=panel.exog,
+        exog_prior_scale=(
+            10.0 if panel.exog_prior_scale is None else panel.exog_prior_scale
+        ),
+        prior_config=prior_config,
+        sampler_config=sampler_config,
+        missing_data_method=spec.missing_data_method,
+        code_version=spec.code_version,
+    )
+
+
 def run_component(
     name: str,
     vintage: str | None = None,
@@ -953,6 +1005,7 @@ def run_component(
     persist: bool = True,
     persist_draws: bool = True,
     overwrite: bool = False,
+    progress_callback=None,
 ) -> RunOutcome:
     """Estimate one component and save its unconditional predictive paths.
 
@@ -1016,6 +1069,7 @@ def run_component(
         sampler_config=sampler_config,
         missing_data_method=spec.missing_data_method,
         code_version=spec.code_version,
+        progress_callback=progress_callback,
     )
 
     run_id = str(result["metadata"]["run_id"])
