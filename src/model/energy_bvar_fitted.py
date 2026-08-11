@@ -1,628 +1,1134 @@
-"""Posterior in-sample fitted HICP paths for the Energy BVAR suite.
+"""Historical posterior fitted paths for the Energy BVAR dashboard.
 
-This module is deliberately separate from the dashboard.  It turns retained
-posterior coefficient draws into one-step in-sample conditional-mean paths,
-then sends those paths through exactly the same component HICP bridges used by
-the forecast layer.  Finally it combines the seven BVARs into the six HICP
-Energy blocks and applies the same annual-weight / December chain-linked
-Laspeyres aggregation used by the production aggregate.
+This module materialises the diagnostic the Aggregate page actually needs:
 
-Definition of "fitted"
------------------------
-For each retained posterior draw d and regression date t,
+1. one-step conditional fitted values from each of the seven saved BVARs;
+2. the same tax / frequency / HICP adapters used by the forecast aggregation;
+3. petrol + diesel -> car fuels;
+4. six HICP component fitted paths -> HICP Energy, draw by draw.
 
-    fitted_delta_y[d,t] = X[d,t] @ B[d]
+It intentionally does *not* use ``historical_model_component_reconstruction``
+as a model-fit overlay.  That object is an accounting/chain-linking validation
+based on published HICP component indices, not a BVAR fitted value.
 
-where X contains the realised (or, under DK, draw-specific completed) lagged
-states and deterministic regressors used by the likelihood.  The fitted level
-is the one-step conditional mean
-
-    fitted_level[d,t] = conditioning_level[d,t-1] + fitted_delta_y[d,t].
-
-Innovations are therefore set to zero; this is an in-sample posterior fitted
-value, not a recursively simulated counterfactual forecast.
+No model is re-estimated.  Only persisted posterior coefficient draws and the
+exact processed vintage are read.  The resulting compact cache is stored beside
+the aggregate result so the dashboard never has to reopen heavy ``draws.npz``
+files when a checkbox is toggled.
 """
 
 from __future__ import annotations
 
+import inspect
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping, Sequence
 
 import numpy as np
 import pandas as pd
 
-
-FITTED_SCHEMA_VERSION = "1.0"
-FITTED_COMPONENT_FILENAME = "fitted_hicp_draws.npz"
-FITTED_COMPONENT_METADATA = "fitted_hicp_metadata.json"
-FITTED_AGGREGATE_FILENAME = "bvar_fitted_v1.npz"
-FITTED_AGGREGATE_METADATA = "bvar_fitted_v1_metadata.json"
-
-MODEL_IDS: tuple[str, ...] = (
-    "gas",
-    "electricity",
-    "heat_energy",
-    "solid_fuels",
-    "car_fuels_petrol",
-    "car_fuels_diesel",
-    "liquid_fuels",
+from energy_bvar_aggregate import (
+    MODEL_AGGREGATE_COMPONENTS,
+    aggregate_component_draw_paths_laspeyres,
+    aggregate_draw_paths_laspeyres,
+    historical_model_component_reconstruction,
+    independent_draw_pairing,
+    load_aggregation_inputs,
+    rebase_price_paths_to_hicp_index,
+    weekly_paths_with_history_to_monthly_mean,
 )
-SIX_COMPONENTS: tuple[str, ...] = (
-    "car_fuels",
-    "liquid_fuels",
-    "gas",
-    "electricity",
-    "heat_energy",
-    "solid_fuels",
+from energy_bvar_electricity import (
+    expand_semester_series as expand_electricity_semester_series,
+    load_electricity_tax_context,
+    reattribute_electricity_taxes,
 )
-TRANSPORT_COMPONENTS: tuple[str, ...] = (
+from energy_bvar_gas import (
+    expand_semester_series as expand_gas_semester_series,
+    load_gas_tax_context,
+    reattribute_gas_taxes,
+)
+from energy_bvar_model import prepare_bvar_panel
+from energy_bvar_pipeline import build_panel, model_spec
+from energy_bvar_weekly_fuels import load_weekly_tax_context
+
+try:  # Available in the production model module; kept optional for portability.
+    from energy_bvar_model import hash_model_data as _hash_model_data
+except ImportError:  # pragma: no cover - only for very old model modules.
+    _hash_model_data = None
+
+
+FITTED_CACHE_VERSION = "energy-bvar-fitted-v4"
+FITTED_CACHE_BASENAME = "bvar_fitted_v3"
+FITTED_META_FILENAME = f"{FITTED_CACHE_BASENAME}_metadata.json"
+DEFAULT_START_DATE = pd.Timestamp("2017-01-01")
+DEFAULT_MAX_DRAWS = 300
+DEFAULT_PAIRING_SEED = 2026
+QUANTILES = (0.05, 0.16, 0.50, 0.84, 0.95)
+
+_COMPONENT_RUN_IDS = {
+    "gas": "gas",
+    "electricity": "electricity",
+    "heat_energy": "heat_energy",
+    "solid_fuels": "solid_fuels",
+    "petrol": "car_fuels_petrol",
+    "diesel": "car_fuels_diesel",
+    "liquid_fuels": "liquid_fuels",
+}
+
+_WEEKLY_TARGETS = {
+    "petrol": "wob_petrol_pre_tax",
+    "diesel": "wob_diesel_pre_tax",
+    "liquid_fuels": "wob_heating_oil_pre_tax",
+}
+
+_WEEKLY_HICP_COLUMNS = {
+    "petrol": "hicp_petrol",
+    "diesel": "hicp_diesel",
+    "liquid_fuels": "hicp_liquid_fuels",
+}
+
+_DIRECT_TARGETS = {
+    "heat_energy": "hicp_heat_energy",
+    "solid_fuels": "hicp_solid_fuels",
+}
+
+_TRANSPORT_COMPONENTS = (
     "hicp_diesel",
     "hicp_petrol",
     "hicp_other_transport_fuels",
 )
-MIN_AGGREGATION_DATE = pd.Timestamp("2017-01-01")
 
 
-class FittedReconstructionError(RuntimeError):
-    """Base error for fitted reconstruction failures."""
+class FittedMaterialisationError(RuntimeError):
+    """Raised when a saved aggregate cannot be given a valid fitted history."""
 
 
-class FittedUnavailableError(FittedReconstructionError):
-    """Raised when the saved run does not contain posterior fit information."""
+def _read_json(path: Path) -> dict:
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError(f"{path} does not contain a JSON object.")
+    return value
 
 
-def _json_load(path: Path) -> dict:
-    return json.loads(path.read_text(encoding="utf-8"))
+def _aggregate_metadata(aggregate_directory: Path) -> dict:
+    path = aggregate_directory / "metadata.json"
+    if not path.is_file():
+        fallback = aggregate_directory / "aggregate_config.json"
+        path = fallback if fallback.is_file() else path
+    return _read_json(path)
 
 
-def _run_directory_from_forecast_store(path_value: object) -> Path:
-    path = Path(str(path_value))
-    # .../<run_id>/forecasts/<forecast_name>
-    if path.parent.name != "forecasts":
-        raise FittedReconstructionError(
-            f"Forecast store does not follow <run>/forecasts/<name>: {path}"
+def _results_root_from_aggregate(aggregate_directory: Path) -> Path:
+    # <results>/hicp_energy_aggregate/<vintage>/<aggregate_run_id>
+    try:
+        return aggregate_directory.parents[2]
+    except IndexError as exc:  # pragma: no cover - defensive only.
+        raise FittedMaterialisationError(
+            f"Cannot infer results root from {aggregate_directory}."
+        ) from exc
+
+
+def _source_signature(path: Path) -> dict:
+    stat = path.stat()
+    return {
+        "path": str(path),
+        "size": int(stat.st_size),
+        "mtime_ns": int(stat.st_mtime_ns),
+    }
+
+
+def _component_run_directories(
+    aggregate_directory: Path,
+    aggregate_metadata: Mapping,
+) -> dict[str, Path]:
+    stores = dict(aggregate_metadata.get("component_forecast_stores", {}) or {})
+    if not stores:
+        raise FittedMaterialisationError(
+            "Aggregate metadata does not record component_forecast_stores."
         )
-    return path.parent.parent
 
+    vintage = str(
+        aggregate_metadata.get("vintage")
+        or aggregate_directory.parent.name
+    )
+    results_root = _results_root_from_aggregate(aggregate_directory)
+    out: dict[str, Path] = {}
+    missing: list[str] = []
 
-def _run_id_from_forecast_store(path_value: object) -> str | None:
-    """Extract the run id from ``.../<run_id>/forecasts/<forecast_name>``.
-
-    Paths saved by older notebook aggregates may be absolute paths from another
-    machine/location.  The run id is still useful because the current project
-    tree can then be reconstructed from ``project_root/results``.
-    """
-    text = str(path_value or "").replace("\\", "/").rstrip("/")
-    parts = [piece for piece in text.split("/") if piece]
-    if len(parts) >= 3 and parts[-2] == "forecasts":
-        return str(parts[-3])
-    return None
-
-
-def _metadata_run_id(metadata: Mapping, keys: Sequence[str]) -> str | None:
-    """Read an exact component run id from legacy/new aggregate metadata."""
-    for field in ("component_run_ids", "run_ids", "component_runs"):
-        mapping = metadata.get(field)
-        if not isinstance(mapping, Mapping):
+    for aggregate_key, canonical_model_id in _COMPONENT_RUN_IDS.items():
+        raw = stores.get(aggregate_key)
+        if raw is None:
+            # Backward compatibility: a few experimental stores used canonical
+            # model ids rather than aggregation keys for petrol/diesel.
+            raw = stores.get(canonical_model_id)
+        if raw is None:
+            missing.append(aggregate_key)
             continue
-        for key in keys:
-            value = mapping.get(key)
-            if isinstance(value, Mapping):
-                value = value.get("run_id") or value.get("id")
-            if value not in (None, ""):
-                return str(value)
-    return None
 
+        store_path = Path(str(raw))
+        try:
+            run_id = store_path.parents[1].name
+        except IndexError:
+            run_id = ""
 
-def _resolve_component_forecast_store(
-    metadata: Mapping,
-    model_id: str,
-    *,
-    project_root: str | Path,
-    vintage: str,
-    forecast_name: str,
-) -> Path:
-    """Resolve one component forecast store across all aggregate schemas.
-
-    Production aggregate metadata uses the *aggregate key* for weekly petrol
-    and diesel (``petrol`` / ``diesel``), while the BVAR run directories use
-    canonical model ids (``car_fuels_petrol`` / ``car_fuels_diesel``). Older
-    stores may also contain absolute paths that no longer exist after moving the
-    project.  Resolution therefore follows a deterministic hierarchy:
-
-    1. canonical model-id key;
-    2. model ``aggregate_key`` / ``spec_key`` aliases;
-    3. exact run id recorded elsewhere in aggregate metadata;
-    4. rebuild a stale stored absolute path under the current ``results`` root.
-
-    It never selects "latest" or a promoted run, because that could silently
-    change the provenance of a historical aggregate.
-    """
-    from energy_bvar_pipeline import model_spec
-
-    spec = model_spec(model_id)
-    keys: list[str] = []
-    for value in (
-        str(model_id),
-        str(getattr(spec, "aggregate_key", "") or ""),
-        str(getattr(spec, "spec_key", "") or ""),
-    ):
-        if value and value not in keys:
-            keys.append(value)
-
-    stores = metadata.get("component_forecast_stores", {})
-    stores = dict(stores) if isinstance(stores, Mapping) else {}
-    raw_store = next((stores[key] for key in keys if key in stores), None)
-
-    current_results = Path(project_root) / "results"
-    canonical_store: Path | None = None
-    if raw_store not in (None, ""):
-        raw_path = Path(str(raw_store))
-        if raw_path.is_dir():
-            return raw_path
-        run_id = _run_id_from_forecast_store(raw_store)
-        if run_id:
-            canonical_store = (
-                current_results
-                / str(model_id)
-                / str(vintage)
-                / str(run_id)
-                / "forecasts"
-                / str(forecast_name)
-            )
-            if canonical_store.is_dir():
-                return canonical_store
-
-    run_id = _metadata_run_id(metadata, keys)
-    if run_id:
         candidate = (
-            current_results
-            / str(model_id)
-            / str(vintage)
-            / str(run_id)
-            / "forecasts"
-            / str(forecast_name)
+            store_path.parents[1] if len(store_path.parents) >= 2 else None
         )
-        if candidate.is_dir():
-            return candidate
-        canonical_store = candidate
+        if (candidate is None or not candidate.is_dir()) and run_id:
+            candidate = results_root / canonical_model_id / vintage / run_id
 
-    aliases = ", ".join(repr(key) for key in keys)
-    detail = (
-        f" Recorded path: {raw_store}." if raw_store not in (None, "") else ""
-    )
-    if canonical_store is not None:
-        detail += f" Reconstructed current path: {canonical_store}."
-    raise FittedUnavailableError(
-        f"Aggregate provenance cannot resolve the {model_id!r} forecast store "
-        f"using keys [{aliases}].{detail}"
-    )
+        if candidate is None or not candidate.is_dir():
+            missing.append(
+                f"{aggregate_key} (run directory not found from {raw!s})"
+            )
+            continue
+        if not (candidate / "metadata.json").is_file():
+            missing.append(f"{aggregate_key} (metadata.json missing)")
+            continue
+        if not (candidate / "draws.npz").is_file():
+            missing.append(f"{aggregate_key} (draws.npz missing)")
+            continue
+        out[aggregate_key] = candidate
+
+    if missing:
+        raise FittedMaterialisationError(
+            "Historical BVAR fitted paths require persisted posterior draws for "
+            "all seven component models; missing: " + ", ".join(missing)
+        )
+    return out
 
 
-def _fit_arrays(run_directory: Path) -> tuple[dict, dict[str, np.ndarray], str]:
-    """Load compact fit cache, falling back to the full Gibbs cache."""
-    metadata_path = run_directory / "metadata.json"
-    if not metadata_path.is_file():
-        raise FittedUnavailableError(f"Run metadata missing: {metadata_path}")
-    metadata = _json_load(metadata_path)
+def _draw_subset_indices(n_draws: int, max_draws: int) -> np.ndarray:
+    n = int(n_draws)
+    m = min(n, int(max_draws))
+    if n < 1 or m < 1:
+        raise FittedMaterialisationError("No posterior coefficient draws are available.")
+    if m == n:
+        return np.arange(n, dtype=int)
+    # Spread retained draws across the full stored chain rather than taking a
+    # contiguous prefix.  This is deterministic and cache-reproducible.
+    return np.unique(np.linspace(0, n - 1, m, dtype=int))
 
-    fit_path = run_directory / "fit_draws.npz"
-    full_path = run_directory / "draws.npz"
-    source = None
-    path = None
-    if fit_path.is_file():
-        path = fit_path
-        source = "fit_draws.npz"
-    elif full_path.is_file():
-        path = full_path
-        source = "draws.npz"
-    else:
-        raise FittedUnavailableError(
-            f"{metadata.get('model_id', run_directory.parent.parent.name)} run "
-            f"{metadata.get('run_id', run_directory.name)[:12]} was saved without "
-            "fit_draws.npz or draws.npz. The posterior coefficient draws no longer "
-            "exist on disk; the true BVAR in-sample fit cannot be reconstructed "
-            "without re-running that model once."
+
+def _prepare_saved_run(panel, metadata: Mapping) -> tuple[dict, pd.DataFrame, str]:
+    """Recreate the exact design convention used by a persisted run.
+
+    Older Energy runs stored ``missing_data_method='linear'``.  The newer
+    ``prepare_bvar_panel`` API removed that keyword and makes interior missing
+    observations latent by default.  For those old runs we reproduce the old
+    effective panel *before* calling the new API instead of passing an invalid
+    keyword or silently changing the historical design.
+    """
+    variables = list(metadata.get("variables") or panel.variables)
+    missing = [name for name in variables if name not in panel.levels.columns]
+    if missing:
+        raise FittedMaterialisationError(
+            f"{metadata.get('model_id')}: current processed panel is missing {missing}."
+        )
+    levels = panel.levels[variables].copy().astype(float)
+
+    exog_names = list(metadata.get("exog_names") or [])
+    exog = panel.exog
+    if exog_names:
+        if exog is None:
+            raise FittedMaterialisationError(
+                f"{metadata.get('model_id')}: saved run expects exogenous columns {exog_names}."
+            )
+        missing_exog = [name for name in exog_names if name not in exog.columns]
+        if missing_exog:
+            raise FittedMaterialisationError(
+                f"{metadata.get('model_id')}: current exog is missing {missing_exog}."
+            )
+        exog = exog[exog_names]
+    elif exog is not None and exog.shape[1]:
+        # The saved coefficient matrix has no deterministic block: do not let a
+        # later model-spec change alter the fitted design retrospectively.
+        exog = None
+
+    if _hash_model_data is not None:
+        expected_hash = metadata.get("source_data_hash") or metadata.get("data_hash")
+        if expected_hash:
+            actual_hash = _hash_model_data(levels, exog)
+            if str(actual_hash) != str(expected_hash):
+                raise FittedMaterialisationError(
+                    f"{metadata.get('model_id')}: processed-vintage data no longer "
+                    "match the source data hash of the saved posterior run."
+                )
+
+    missing_method = str(metadata.get("missing_data_method") or "dk").lower()
+    params = inspect.signature(prepare_bvar_panel).parameters
+    kwargs = {
+        "p": int(metadata.get("p") or panel.p),
+        "variables": variables,
+    }
+    if "frequency" in params:
+        kwargs["frequency"] = str(metadata.get("frequency") or panel.frequency)
+    if "exog" in params:
+        kwargs["exog"] = exog
+
+    effective_levels = levels
+    if "missing_data_method" in params:
+        kwargs["missing_data_method"] = missing_method
+    elif missing_method == "linear":
+        effective_levels = levels.interpolate(method="time", limit_area="inside")
+    elif missing_method not in {"dk", "durbin_koopman", "durbin-koopman", ""}:
+        raise FittedMaterialisationError(
+            f"Unsupported saved missing_data_method={missing_method!r}."
         )
 
-    with np.load(path, allow_pickle=False) as archive:
-        arrays = {name: archive[name] for name in archive.files}
-    if "B" not in arrays:
-        raise FittedUnavailableError(f"{path} does not contain posterior B draws.")
-    return metadata, arrays, source
+    prep = prepare_bvar_panel(effective_levels, **kwargs)
+
+    # When we manually recreated the old linear branch, verify the *effective*
+    # panel too when that historical hash is available.
+    if _hash_model_data is not None and missing_method == "linear":
+        expected_effective = metadata.get("effective_estimation_data_hash")
+        if expected_effective:
+            actual_effective = _hash_model_data(prep["levels"][variables], prep.get("exog"))
+            if str(actual_effective) != str(expected_effective):
+                raise FittedMaterialisationError(
+                    f"{metadata.get('model_id')}: recreated linear effective panel "
+                    "does not match the saved estimation-data hash."
+                )
+
+    return prep, effective_levels, missing_method
 
 
-def _select_draw_indices(n_total: int, max_draws: int, seed: int) -> np.ndarray:
-    n = min(int(max_draws), int(n_total))
-    if n < 1:
-        raise FittedReconstructionError("No posterior draws are available for fitted paths.")
-    if n == n_total:
-        return np.arange(n_total, dtype=int)
-    rng = np.random.default_rng(int(seed))
-    return np.sort(rng.choice(n_total, size=n, replace=False)).astype(int)
-
-
-def _previous_levels_balanced(prep: Mapping, dates: pd.DatetimeIndex) -> np.ndarray:
-    levels = pd.DataFrame(prep["levels"]).astype(float).sort_index()
-    positions = levels.index.get_indexer(dates)
-    if (positions <= 0).any():
-        raise FittedReconstructionError(
-            "Could not recover the one-period conditioning levels for fitted values."
-        )
-    previous = levels.iloc[positions - 1].to_numpy(dtype=float)
-    if previous.shape != (len(dates), int(prep["n"])):
-        raise FittedReconstructionError("Conditioning-level shape mismatch.")
-    return previous
-
-
-def _fitted_model_level_paths(
-    run_directory: str | Path,
+def _one_step_fitted_target(
+    panel,
+    metadata: Mapping,
+    draws: Mapping[str, np.ndarray],
     *,
-    project_root: str | Path,
-    max_draws: int = 500,
-    seed: int = 2026,
+    target: str,
+    max_draws: int,
 ) -> dict:
-    """Posterior one-step fitted level paths for one saved BVAR run."""
-    from energy_bvar_model import _prepare_var_regression, prepare_bvar_panel
-    from energy_bvar_pipeline import build_panel
-
-    run_directory = Path(run_directory)
-    metadata, arrays, cache_source = _fit_arrays(run_directory)
-    model_id = str(metadata["model_id"])
-    vintage = str(metadata["vintage"])
-    p = int(metadata["p"])
-    missing_method = str(metadata.get("missing_data_method", "dk"))
-
-    panel = build_panel(model_id, vintage, project_root=project_root)
-    variables = [str(v) for v in metadata.get("variables", panel.variables)]
-    if variables != list(panel.variables):
-        raise FittedReconstructionError(
-            f"{model_id}: stored variables {variables} differ from current panel "
-            f"contract {list(panel.variables)}."
+    """Posterior one-step conditional mean for one saved target equation."""
+    if "B" not in draws:
+        raise FittedMaterialisationError(
+            f"{metadata.get('model_id')}: draws.npz has no coefficient array B."
+        )
+    B_all = np.asarray(draws["B"], dtype=float)
+    if B_all.ndim != 3:
+        raise FittedMaterialisationError(
+            f"{metadata.get('model_id')}: B must have shape (draw, k, n), found {B_all.shape}."
         )
 
-    prep = prepare_bvar_panel(
-        panel.levels,
-        p=p,
-        variables=variables,
-        exog=panel.exog,
-        frequency=panel.frequency,
-        missing_data_method=missing_method,
-    )
-    B_all = np.asarray(arrays["B"], dtype=float)
-    if B_all.ndim != 3:
-        raise FittedReconstructionError(f"{model_id}: B must be 3-D, got {B_all.shape}.")
-    indices = _select_draw_indices(B_all.shape[0], max_draws=max_draws, seed=seed)
-    B = B_all[indices]
-    n_draws = len(indices)
+    variables = list(metadata.get("variables") or panel.variables)
+    if target not in variables:
+        raise FittedMaterialisationError(
+            f"{metadata.get('model_id')}: target {target!r} is not in {variables}."
+        )
+    j = variables.index(target)
+    chosen = _draw_subset_indices(B_all.shape[0], max_draws)
+    B = B_all[chosen]
+
+    prep, _, missing_method = _prepare_saved_run(panel, metadata)
+    if B.shape[1] != int(prep["k"]) or B.shape[2] != len(variables):
+        raise FittedMaterialisationError(
+            f"{metadata.get('model_id')}: saved B shape {B.shape[1:]} is incompatible "
+            f"with recreated design (k={prep['k']}, n={len(variables)})."
+        )
+
+    fit_dates = pd.DatetimeIndex(prep["dates"], name="date")
+    p = int(prep["p"])
     n = len(variables)
 
-    if not prep.get("requires_data_augmentation", False):
+    if not bool(prep.get("requires_data_augmentation", False)):
         X = np.asarray(prep["X"], dtype=float)
-        dates = pd.DatetimeIndex(prep["dates"], name="date")
-        if B.shape[1:] != (X.shape[1], n):
-            raise FittedReconstructionError(
-                f"{model_id}: coefficient shape {B.shape[1:]} does not match "
-                f"design {(X.shape[1], n)}."
+        if X.shape != (len(fit_dates), B.shape[1]):
+            raise FittedMaterialisationError(
+                f"{metadata.get('model_id')}: recreated X has shape {X.shape}, "
+                f"expected {(len(fit_dates), B.shape[1])}."
             )
-        fitted_diff = np.einsum("tk,dkj->dtj", X, B, optimize=True)
-        previous = _previous_levels_balanced(prep, dates)
-        fitted_levels = fitted_diff + previous[None, :, :]
+        fitted_change = np.einsum("tk,dk->dt", X, B[:, :, j], optimize=True)
+        previous = prep["levels"][target].shift(1).reindex(fit_dates).to_numpy(dtype=float)
+        if not np.all(np.isfinite(previous)):
+            raise FittedMaterialisationError(
+                f"{metadata.get('model_id')}: non-finite lagged target levels on fitted dates."
+            )
+        fitted_level = previous[None, :] + fitted_change
+        completed_mode = "observed_or_linear_effective_history"
     else:
-        if "completed_differences_draws" not in arrays:
-            raise FittedUnavailableError(
-                f"{model_id}: this run used exact DK interior-data augmentation, "
-                "but the saved fit cache has no completed_differences_draws. "
-                "Re-run the model once with the updated energy_bvar_io.py."
+        if "completed_differences_draws" not in draws:
+            raise FittedMaterialisationError(
+                f"{metadata.get('model_id')}: DK fitted values require "
+                "completed_differences_draws in draws.npz."
             )
-        completed_all = np.asarray(arrays["completed_differences_draws"], dtype=float)
-        if completed_all.shape[0] != B_all.shape[0]:
-            raise FittedReconstructionError(
-                f"{model_id}: B and completed-difference draw counts differ."
+        completed_all = np.asarray(draws["completed_differences_draws"], dtype=float)
+        if completed_all.ndim != 4 and completed_all.ndim != 3:
+            raise FittedMaterialisationError(
+                f"{metadata.get('model_id')}: unexpected completed_differences_draws "
+                f"shape {completed_all.shape}."
             )
-        completed = completed_all[indices]
-        dates = pd.DatetimeIndex(prep["dates"], name="date")
-        fitted_levels = np.empty((n_draws, len(dates), n), dtype=float)
-        warmup_index = prep["warmup_differences"].index
-        full_index = warmup_index.append(dates)
-        for out_i in range(n_draws):
-            complete = pd.DataFrame(
-                completed[out_i], index=full_index, columns=variables
+        # Production schema is (draw, p+T, n).  A singleton chain dimension was
+        # briefly used in one experimental branch; squeeze it defensively.
+        if completed_all.ndim == 4 and completed_all.shape[1] == 1:
+            completed_all = completed_all[:, 0]
+        if completed_all.ndim != 3:
+            raise FittedMaterialisationError(
+                f"{metadata.get('model_id')}: cannot interpret completed differences "
+                f"shape {completed_all.shape}."
             )
-            _, X, regression_dates = _prepare_var_regression(
-                complete, p, prep.get("estimation_exog")
+        completed = completed_all[chosen]
+        expected_rows = p + len(fit_dates)
+        if completed.shape[1:] != (expected_rows, n):
+            raise FittedMaterialisationError(
+                f"{metadata.get('model_id')}: completed differences shape "
+                f"{completed.shape[1:]} != {(expected_rows, n)}."
             )
-            regression_dates = pd.DatetimeIndex(regression_dates, name="date")
-            if not regression_dates.equals(dates):
-                raise FittedReconstructionError(
-                    f"{model_id}: draw-specific design calendar drifted from prep dates."
-                )
-            fitted_diff = X @ B[out_i]
-            # completed[p:] are the draw-specific realised/latent differences on
-            # the regression dates. They provide the t-1 conditioning level.
-            estimation_diff = complete.iloc[p:].to_numpy(dtype=float)
-            anchor = np.asarray(prep["augmentation_anchor_level"], dtype=float)
-            previous = np.empty((len(dates), n), dtype=float)
-            previous[0] = anchor
-            if len(dates) > 1:
-                previous[1:] = anchor[None, :] + np.cumsum(
-                    estimation_diff[:-1], axis=0
-                )
-            fitted_levels[out_i] = previous + fitted_diff
 
-    if not np.isfinite(fitted_levels).all():
-        raise FittedReconstructionError(f"{model_id}: non-finite fitted levels were produced.")
+        # Compute only the target equation, lag block by lag block.  This avoids
+        # constructing a potentially >300 MB draw x time x regressor tensor for
+        # weekly VAR(24) models.
+        fitted_change = np.repeat(B[:, 0, j][:, None], len(fit_dates), axis=1)
+        for lag in range(1, p + 1):
+            row0 = 1 + (lag - 1) * n
+            coeff = B[:, row0 : row0 + n, j]
+            lag_values = completed[:, p - lag : p - lag + len(fit_dates), :]
+            fitted_change += np.einsum(
+                "dti,di->dt", lag_values, coeff, optimize=True
+            )
 
-    forecast = {
-        "variables": variables,
-        "level_paths": fitted_levels,
-        "path_dates": dates,
-        "future_dates": pd.DatetimeIndex([], name="date"),
-        "tail_length": len(dates),
-        "frequency": panel.frequency,
-        "last_calendar_date": dates[-1],
-        "balanced_end": prep["balanced_end"],
-        "missing_data_method": prep.get("missing_data_method", missing_method),
-        "missing_treatment_exact": prep.get("missing_treatment_exact", True),
-        "missing_data_approximation_used": prep.get(
-            "missing_data_approximation_used", False
-        ),
-    }
-    result = {
-        "prep": prep,
-        "metadata": metadata,
-        "variables": variables,
-        "p": p,
-        "frequency": panel.frequency,
-    }
-    return {
-        "model_id": model_id,
-        "vintage": vintage,
-        "run_id": str(metadata["run_id"]),
-        "draw_indices": indices,
-        "cache_source": cache_source,
-        "forecast": forecast,
-        "result": result,
-        "dataset_path": Path(panel.dataset_path),
-    }
+        exog = prep.get("exog_regression")
+        if exog is not None and exog.shape[1]:
+            exog_values = exog.reindex(fit_dates).to_numpy(dtype=float)
+            row0 = 1 + p * n
+            coeff = B[:, row0 : row0 + exog_values.shape[1], j]
+            fitted_change += np.einsum(
+                "tm,dm->dt", exog_values, coeff, optimize=True
+            )
 
+        anchor = np.asarray(prep["augmentation_anchor_level"], dtype=float)
+        estimation_diffs = completed[:, p:, :]
+        previous_target = np.empty((len(B), len(fit_dates)), dtype=float)
+        previous_target[:, 0] = float(anchor[j])
+        if len(fit_dates) > 1:
+            previous_target[:, 1:] = (
+                float(anchor[j])
+                + np.cumsum(estimation_diffs[:, :-1, j], axis=1)
+            )
+        fitted_level = previous_target + fitted_change
+        completed_mode = "draw_specific_DK_completed_history"
 
-def _valid_positive_hicp(obj: Mapping) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    level = np.asarray(obj["hicp_level_paths"], dtype=float)
-    yoy = np.asarray(obj["hicp_yoy_paths"], dtype=float)
-    draw_indices = np.asarray(
-        obj.get("draw_indices", np.arange(level.shape[0])), dtype=int
-    )
-    valid = np.isfinite(level).all(axis=1) & (level > 0).all(axis=1)
-    if not valid.any():
-        raise FittedReconstructionError(
-            f"{obj.get('model_id')}: no finite positive fitted HICP draws remain."
+    if np.any(~np.isfinite(fitted_level)):
+        raise FittedMaterialisationError(
+            f"{metadata.get('model_id')}: non-finite one-step fitted target levels."
         )
-    return level[valid], yoy[valid], draw_indices[valid]
 
-
-def build_component_fitted_hicp(
-    run_directory: str | Path,
-    *,
-    project_root: str | Path,
-    forecast_name: str = "unconditional",
-    max_draws: int = 500,
-    seed: int = 2026,
-) -> dict:
-    """Create posterior fitted monthly HICP paths for one component run."""
-    from energy_bvar_component_hicp import build_component_hicp_forecast
-
-    raw = _fitted_model_level_paths(
-        run_directory,
-        project_root=project_root,
-        max_draws=max_draws,
-        seed=seed,
-    )
-    hicp = build_component_hicp_forecast(
-        raw["model_id"],
-        raw["forecast"],
-        result=raw["result"],
-        dataset_path=raw["dataset_path"],
-        project_root=project_root,
-        forecast_name=forecast_name,
-    )
-    level, yoy, retained = _valid_positive_hicp(hicp)
-    out = dict(hicp)
-    out["hicp_level_paths"] = level
-    out["hicp_yoy_paths"] = yoy
-    # build_component_hicp_forecast may itself reject weekly paths. Its
-    # draw_indices are positions in the pseudo-forecast draw pool, so map them
-    # back to the original posterior B draws retained from the run.
-    if len(retained) and int(np.max(retained)) < len(raw["draw_indices"]):
-        out["posterior_draw_indices"] = raw["draw_indices"][retained]
-    else:
-        out["posterior_draw_indices"] = retained
-    out["fitted_definition"] = "one_step_posterior_conditional_mean_XB"
-    out["fit_cache_source"] = raw["cache_source"]
-    return out
-
-
-def _save_component_fitted(obj: Mapping, forecast_directory: Path) -> None:
-    forecast_directory.mkdir(parents=True, exist_ok=True)
-    level = np.asarray(obj["hicp_level_paths"], dtype=float)
-    yoy = np.asarray(obj["hicp_yoy_paths"], dtype=float)
-    dates = pd.DatetimeIndex(obj["path_dates"], name="date")
-    np.savez_compressed(
-        forecast_directory / FITTED_COMPONENT_FILENAME,
-        hicp_level_paths=level,
-        hicp_yoy_paths=yoy,
-        path_dates=dates.astype("datetime64[ns]").to_numpy(),
-        posterior_draw_indices=np.asarray(
-            obj.get("posterior_draw_indices", np.arange(level.shape[0])), dtype=int
-        ),
-    )
-    metadata = {
-        "fitted_schema_version": FITTED_SCHEMA_VERSION,
-        "model_id": str(obj.get("model_id")),
-        "vintage": str(obj.get("vintage")),
-        "run_id": str(obj.get("run_id")),
-        "forecast_name": str(obj.get("forecast_name", "unconditional")),
-        "hicp_series": str(obj.get("hicp_series")),
-        "hicp_label": str(obj.get("hicp_label")),
-        "n_draws": int(level.shape[0]),
-        "path_start": None if len(dates) == 0 else dates[0].isoformat(),
-        "path_end": None if len(dates) == 0 else dates[-1].isoformat(),
-        "fitted_definition": str(obj.get("fitted_definition")),
-        "fit_cache_source": str(obj.get("fit_cache_source")),
-        "transformation_method": str(obj.get("transformation_method")),
+    return {
+        "dates": fit_dates,
+        "level_paths": fitted_level,
+        "draw_indices": chosen,
+        "target": target,
+        "variables": variables,
+        "missing_data_method": missing_method,
+        "conditioning_history": completed_mode,
     }
-    (forecast_directory / FITTED_COMPONENT_METADATA).write_text(
-        json.dumps(metadata, indent=2, default=str), encoding="utf-8"
-    )
 
 
-def materialize_component_fitted_hicp(
-    run_directory: str | Path,
-    *,
-    project_root: str | Path,
-    forecast_name: str = "unconditional",
-    max_draws: int = 500,
-    seed: int = 2026,
-    overwrite: bool = False,
-) -> dict:
-    run_directory = Path(run_directory)
-    target = run_directory / "forecasts" / str(forecast_name)
-    meta_path = target / FITTED_COMPONENT_METADATA
-    draws_path = target / FITTED_COMPONENT_FILENAME
-    if meta_path.is_file() and draws_path.is_file() and not overwrite:
-        metadata = _json_load(meta_path)
-        with np.load(draws_path, allow_pickle=False) as archive:
-            arrays = {name: archive[name] for name in archive.files}
-        return {
-            **metadata,
-            "hicp_level_paths": arrays["hicp_level_paths"],
-            "hicp_yoy_paths": arrays["hicp_yoy_paths"],
-            "path_dates": pd.DatetimeIndex(pd.to_datetime(arrays["path_dates"]), name="date"),
-            "posterior_draw_indices": arrays.get("posterior_draw_indices"),
-        }
-
-    obj = build_component_fitted_hicp(
-        run_directory,
-        project_root=project_root,
-        forecast_name=forecast_name,
-        max_draws=max_draws,
-        seed=seed,
-    )
-    _save_component_fitted(obj, target)
-    return obj
+def _slice_object(obj: Mapping, dates: pd.DatetimeIndex) -> np.ndarray:
+    source_dates = pd.DatetimeIndex(obj["dates"], name="date")
+    positions = source_dates.get_indexer(dates)
+    if (positions < 0).any():
+        missing = dates[positions < 0]
+        raise FittedMaterialisationError(
+            f"Requested fitted dates are absent from a component path: {list(missing[:5])}."
+        )
+    return np.asarray(obj["paths"], dtype=float)[:, positions]
 
 
-def _intersection_calendar(objects: Sequence[Mapping], *, start: pd.Timestamp) -> pd.DatetimeIndex:
-    common: pd.DatetimeIndex | None = None
-    for obj in objects:
-        dates = pd.DatetimeIndex(obj["path_dates"], name="date")
-        dates = dates[dates >= start]
-        common = dates if common is None else common.intersection(dates)
-    if common is None or len(common) == 0:
-        raise FittedReconstructionError("No common monthly fitted calendar exists.")
-    common = common.sort_values()
-    expected = pd.date_range(common[0], common[-1], freq="MS", name="date")
-    common = common.intersection(expected)
-    if not common.equals(expected):
-        raise FittedReconstructionError("Common fitted calendar contains monthly gaps.")
-    return common
-
-
-def _align(obj: Mapping, dates: pd.DatetimeIndex, key: str = "hicp_level_paths") -> np.ndarray:
-    source_dates = pd.DatetimeIndex(obj["path_dates"], name="date")
-    pos = source_dates.get_indexer(dates)
-    if (pos < 0).any():
-        raise FittedReconstructionError("A fitted component is missing common aggregation dates.")
-    return np.asarray(obj[key], dtype=float)[:, pos]
-
-
-def _yoy_paths(paths: np.ndarray, dates: pd.DatetimeIndex, history: pd.Series) -> np.ndarray:
-    values = np.asarray(paths, dtype=float)
-    history = history.astype(float).dropna().sort_index()
-    full = pd.date_range(
-        min(history.index.min(), dates.min()),
-        max(history.index.max(), dates.max()),
+def _common_monthly_dates(objects: Sequence[Mapping], start_date: pd.Timestamp) -> pd.DatetimeIndex:
+    if not objects:
+        raise FittedMaterialisationError("No component fitted paths were supplied.")
+    starts = [pd.DatetimeIndex(obj["dates"]).min() for obj in objects]
+    ends = [pd.DatetimeIndex(obj["dates"]).max() for obj in objects]
+    start = max([pd.Timestamp(start_date), *map(pd.Timestamp, starts)])
+    end = min(map(pd.Timestamp, ends))
+    if end < start:
+        raise FittedMaterialisationError(
+            f"No common fitted monthly window after {pd.Timestamp(start_date).date()}."
+        )
+    dates = pd.date_range(
+        start.to_period("M").to_timestamp(how="start"),
+        end.to_period("M").to_timestamp(how="start"),
         freq="MS",
+        name="date",
     )
-    out = np.full_like(values, np.nan, dtype=float)
-    for d in range(values.shape[0]):
-        s = history.reindex(full)
-        s.loc[dates] = values[d]
-        out[d] = (100.0 * (s / s.shift(12) - 1.0)).reindex(dates).to_numpy(dtype=float)
+    for obj in objects:
+        source = pd.DatetimeIndex(obj["dates"], name="date")
+        if (source.get_indexer(dates) < 0).any():
+            raise FittedMaterialisationError(
+                "A component fitted path has an interior monthly calendar gap."
+            )
+    return dates
+
+
+def _drop_bad_draws(paths: np.ndarray, *, label: str) -> np.ndarray:
+    values = np.asarray(paths, dtype=float)
+    keep = np.all(np.isfinite(values) & (values > 0.0), axis=1)
+    if not keep.any():
+        raise FittedMaterialisationError(
+            f"{label}: no fitted draw remains finite and positive over the display window."
+        )
+    return values[keep]
+
+
+def _monthly_pretax_to_hicp(
+    fitted: Mapping,
+    *,
+    tax_context: Mapping,
+    expand_function,
+    reattribute_function,
+    start_date: pd.Timestamp,
+) -> dict:
+    dates = pd.DatetimeIndex(fitted["dates"], name="date")
+    mask = dates >= pd.Timestamp(start_date)
+    dates = dates[mask]
+    pre_tax = np.asarray(fitted["level_paths"], dtype=float)[:, mask]
+    if len(dates) == 0:
+        raise FittedMaterialisationError("No monthly fitted dates survive the display start date.")
+
+    vat = expand_function(tax_context["vat_percent"], dates).to_numpy(dtype=float)
+    excise = expand_function(tax_context["excise"], dates).to_numpy(dtype=float)
+    finite_dates = np.isfinite(vat) & np.isfinite(excise)
+    if not finite_dates.any():
+        raise FittedMaterialisationError("No tax observations overlap the fitted history.")
+    # Tax series can start after the statistical model.  Retain one contiguous
+    # suffix rather than silently punching holes in the monthly path.
+    first = int(np.flatnonzero(finite_dates)[0])
+    if not finite_dates[first:].all():
+        raise FittedMaterialisationError("Tax context has an interior gap in the fitted window.")
+    dates = dates[first:]
+    pre_tax = pre_tax[:, first:]
+    vat = vat[first:]
+    excise = excise[first:]
+    hicp = reattribute_function(
+        pre_tax,
+        float(tax_context["gamma"]),
+        vat[None, :],
+        excise[None, :],
+    )
+    hicp = _drop_bad_draws(hicp, label="monthly pre-tax -> HICP")
+    return {"dates": dates, "paths": hicp}
+
+
+def _carry_weekly_series(series: pd.Series, dates: pd.DatetimeIndex) -> np.ndarray:
+    observed = series.astype(float).dropna().sort_index()
+    observed.index = pd.DatetimeIndex(observed.index).to_period("W-SUN").start_time
+    union = observed.index.union(dates).sort_values()
+    carried = observed.reindex(union).ffill().reindex(dates)
+    if carried.isna().any():
+        first_bad = carried.index[carried.isna()][0]
+        raise FittedMaterialisationError(
+            f"No weekly tax observation exists on or before {first_bad.date()}."
+        )
+    return carried.to_numpy(dtype=float)
+
+
+def _monthly_mean_history(series: pd.Series) -> pd.Series:
+    s = series.astype(float).dropna().sort_index()
+    idx = pd.DatetimeIndex(s.index).to_period("W-SUN").start_time
+    s.index = idx
+    if s.index.has_duplicates:
+        s = s.groupby(level=0).last()
+    out = s.groupby(s.index.to_period("M")).mean()
+    out.index = out.index.to_timestamp(how="start")
+    out.index = pd.DatetimeIndex(out.index, name="date")
+    return out.sort_index()
+
+
+def _weekly_pretax_to_hicp(
+    fitted: Mapping,
+    *,
+    context: Mapping,
+    hicp_history: pd.Series,
+    start_date: pd.Timestamp,
+    label: str,
+) -> dict:
+    dates = pd.DatetimeIndex(fitted["dates"], name="date")
+    weekly_start = pd.Timestamp(start_date).to_period("M").to_timestamp(how="start")
+    mask = dates >= weekly_start
+    dates = dates[mask]
+    pre_tax = np.asarray(fitted["level_paths"], dtype=float)[:, mask]
+    if len(dates) == 0:
+        raise FittedMaterialisationError(f"{label}: no fitted weekly dates after display start.")
+
+    data = context["data"]
+    excise = _carry_weekly_series(data["excise"], dates)
+    vat = _carry_weekly_series(data["vat_percent"], dates)
+    after_tax = (pre_tax + excise[None, :]) * (1.0 + vat[None, :] / 100.0)
+
+    # A one-step conditional fit can occasionally be economically inadmissible
+    # for an individual posterior coefficient draw.  Use the same positivity
+    # principle as the forecast aggregator and document the retained pool.
+    keep = np.all(np.isfinite(after_tax) & (after_tax > 0.0), axis=1)
+    if not keep.any():
+        raise FittedMaterialisationError(f"{label}: all fitted after-tax price draws are invalid.")
+    after_tax = after_tax[keep]
+
+    monthly, monthly_dates = weekly_paths_with_history_to_monthly_mean(
+        after_tax,
+        dates,
+        data["after_tax"],
+    )
+    monthly = _drop_bad_draws(monthly, label=f"{label} monthly after-tax")
+    historical_monthly_price = _monthly_mean_history(data["after_tax"])
+    rebased = rebase_price_paths_to_hicp_index(
+        monthly,
+        monthly_dates,
+        historical_monthly_price,
+        hicp_history,
+    )
+    return {
+        "dates": pd.DatetimeIndex(rebased["dates"], name="date"),
+        "paths": _drop_bad_draws(rebased["index_paths"], label=f"{label} HICP proxy"),
+    }
+
+
+def _historical_actual_paths(
+    series: pd.Series,
+    dates: pd.DatetimeIndex,
+    n_draws: int,
+    *,
+    label: str = "observed residual HICP component",
+) -> dict:
+    """Observed residual levels on the maximal honest historical overlap.
+
+    ``hicp_other_transport_fuels`` has no dedicated BVAR.  It is therefore an
+    observed residual input when Petrol and Diesel fitted paths are combined
+    into historical fitted Car fuels.  A trailing publication ragged edge is
+    not an interior-data failure: the fitted diagnostic is trimmed to the last
+    published positive residual month.  We never forward-fill an unpublished
+    *historical* residual.  Missing/non-positive observations inside the
+    overlap remain a hard error.
+    """
+    requested = pd.DatetimeIndex(dates, name="date")
+    if requested.empty:
+        raise FittedMaterialisationError(f"{label}: requested fitted window is empty.")
+
+    observed = series.astype(float).copy().sort_index()
+    observed.index = (
+        pd.DatetimeIndex(observed.index)
+        .to_period("M")
+        .to_timestamp(how="start")
+    )
+    observed.index = pd.DatetimeIndex(observed.index, name="date")
+    if observed.index.has_duplicates:
+        observed = observed.groupby(level=0).last()
+
+    valid_observed = observed.where(
+        np.isfinite(observed) & (observed > 0.0)
+    ).dropna()
+    if valid_observed.empty:
+        raise FittedMaterialisationError(
+            f"{label}: no finite positive published HICP observations are available."
+        )
+
+    start = max(pd.Timestamp(requested.min()), pd.Timestamp(valid_observed.index.min()))
+    end = min(pd.Timestamp(requested.max()), pd.Timestamp(valid_observed.index.max()))
+    if end < start:
+        raise FittedMaterialisationError(
+            f"{label}: no overlap between fitted dates "
+            f"{requested.min().date()}–{requested.max().date()} and published "
+            f"HICP history {valid_observed.index.min().date()}–"
+            f"{valid_observed.index.max().date()}."
+        )
+
+    overlap = pd.date_range(
+        start.to_period("M").to_timestamp(how="start"),
+        end.to_period("M").to_timestamp(how="start"),
+        freq="MS",
+        name="date",
+    )
+    if (requested.get_indexer(overlap) < 0).any():
+        raise FittedMaterialisationError(
+            f"{label}: fitted source has an interior monthly calendar gap."
+        )
+
+    aligned = observed.reindex(overlap)
+    bad = aligned.isna() | ~np.isfinite(aligned) | (aligned <= 0.0)
+    if bad.any():
+        first_bad = pd.Timestamp(aligned.index[bad][0])
+        raise FittedMaterialisationError(
+            f"{label}: published HICP has an interior missing/non-positive "
+            f"observation at {first_bad.date()} inside the fitted overlap."
+        )
+
+    paths = np.repeat(
+        aligned.to_numpy(dtype=float)[None, :],
+        int(n_draws),
+        axis=0,
+    )
+    return {
+        "dates": overlap,
+        "paths": paths,
+        "published_start": pd.Timestamp(valid_observed.index.min()),
+        "published_end": pd.Timestamp(valid_observed.index.max()),
+        "trimmed_leading_months": int((requested < overlap.min()).sum()),
+        "trimmed_trailing_months": int((requested > overlap.max()).sum()),
+    }
+
+
+def _yoy_paths(
+    level_paths: np.ndarray,
+    dates: pd.DatetimeIndex,
+    actual_history: pd.Series,
+) -> np.ndarray:
+    values = np.asarray(level_paths, dtype=float)
+    dates = pd.DatetimeIndex(dates, name="date")
+    out = np.full(values.shape, np.nan, dtype=float)
+    lookup = {pd.Timestamp(date): j for j, date in enumerate(dates)}
+    history = actual_history.astype(float).sort_index()
+    history.index = pd.DatetimeIndex(history.index).to_period("M").to_timestamp(how="start")
+    if history.index.has_duplicates:
+        history = history.groupby(level=0).last()
+
+    for t, date in enumerate(dates):
+        lag_date = pd.Timestamp(date) - pd.DateOffset(months=12)
+        lag_date = lag_date.to_period("M").to_timestamp(how="start")
+        if lag_date in lookup:
+            denominator = values[:, lookup[lag_date]]
+        elif lag_date in history.index and np.isfinite(history.loc[lag_date]):
+            denominator = np.repeat(float(history.loc[lag_date]), len(values))
+        else:
+            continue
+        valid = np.isfinite(denominator) & (denominator > 0.0)
+        out[valid, t] = 100.0 * (values[valid, t] / denominator[valid] - 1.0)
     return out
 
 
-def build_aggregate_bvar_fitted(
+def _summary_frame(
+    paths: np.ndarray,
+    dates: pd.DatetimeIndex,
+    *,
+    series: str,
+    metric: str,
+    basis: str,
+) -> pd.DataFrame:
+    values = np.asarray(paths, dtype=float)
+    rows = []
+    for t, date in enumerate(pd.DatetimeIndex(dates, name="date")):
+        x = values[:, t]
+        x = x[np.isfinite(x)]
+        if len(x):
+            q = np.quantile(x, QUANTILES)
+            row = {
+                "q05": float(q[0]),
+                "q16": float(q[1]),
+                "q50": float(q[2]),
+                "q84": float(q[3]),
+                "q95": float(q[4]),
+                "n_draws": int(len(x)),
+            }
+        else:
+            row = {"q05": np.nan, "q16": np.nan, "q50": np.nan, "q84": np.nan, "q95": np.nan, "n_draws": 0}
+        rows.append(
+            {
+                "date": pd.Timestamp(date),
+                "basis": basis,
+                "series": series,
+                "metric": metric,
+                **row,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def validate_fitted_frame(frame: pd.DataFrame) -> dict:
+    """Validate the compact fitted-overlay contract before it reaches Dash.
+
+    ``basis`` is the canonical discriminator.  ``record_type`` is deliberately
+    absent from this cache contract so a display artefact cannot become a
+    second source of truth for fitted availability.
+    """
+    required = {
+        "date", "basis", "series", "metric",
+        "q05", "q16", "q50", "q84", "q95", "n_draws",
+    }
+    missing = sorted(required.difference(frame.columns))
+    if missing:
+        raise FittedMaterialisationError(
+            f"Fitted cache is missing required column(s): {missing}."
+        )
+    if frame.empty:
+        raise FittedMaterialisationError("Fitted cache is empty.")
+
+    allowed_basis = {"component_bvar_fitted", "aggregate_bvar_fitted"}
+    basis = set(frame["basis"].dropna().astype(str))
+    if basis != allowed_basis:
+        raise FittedMaterialisationError(
+            f"Unexpected fitted basis contract {sorted(basis)}; "
+            f"expected {sorted(allowed_basis)}."
+        )
+
+    component_rows = frame.loc[frame["basis"].astype(str) == "component_bvar_fitted"]
+    component_series = set(component_rows["series"].dropna().astype(str))
+    expected_components = set(MODEL_AGGREGATE_COMPONENTS)
+    if component_series != expected_components:
+        raise FittedMaterialisationError(
+            "Component fitted cache does not contain exactly the six HICP Energy "
+            f"components; got {sorted(component_series)}."
+        )
+
+    aggregate_rows = frame.loc[frame["basis"].astype(str) == "aggregate_bvar_fitted"]
+    aggregate_series = set(aggregate_rows["series"].dropna().astype(str))
+    if aggregate_series != {"hicp_energy"}:
+        raise FittedMaterialisationError(
+            "Aggregate fitted cache must contain only series='hicp_energy'."
+        )
+
+    metrics = set(frame["metric"].dropna().astype(str))
+    if metrics != {"level", "yoy"}:
+        raise FittedMaterialisationError(
+            f"Unexpected fitted metrics {sorted(metrics)}; expected ['level', 'yoy']."
+        )
+
+    dates = pd.to_datetime(frame["date"], errors="coerce")
+    if dates.isna().any():
+        raise FittedMaterialisationError("Fitted cache contains invalid dates.")
+
+    qcols = ["q05", "q16", "q50", "q84", "q95"]
+    numeric = frame[qcols].apply(pd.to_numeric, errors="coerce")
+    finite_rows = numeric.notna().all(axis=1)
+    if not finite_rows.any():
+        raise FittedMaterialisationError("Fitted cache contains no finite posterior summaries.")
+    q = numeric.loc[finite_rows].to_numpy(dtype=float)
+    if np.any(np.diff(q, axis=1) < -1e-12):
+        raise FittedMaterialisationError("Fitted posterior quantiles are not ordered.")
+
+    level = frame.loc[frame["metric"].astype(str) == "level", "q50"]
+    level = pd.to_numeric(level, errors="coerce").dropna()
+    if level.empty or (level <= 0.0).any():
+        raise FittedMaterialisationError(
+            "Fitted HICP level medians must be finite and strictly positive."
+        )
+
+    # ``n_draws == 0`` is legitimate only for leading YoY dates for which a
+    # 12-month denominator does not yet exist.  The previous validator rejected
+    # those structurally unavailable YoY rows and therefore failed even when
+    # the fitted level paths had been materialised correctly.
+    draw_counts = pd.to_numeric(frame["n_draws"], errors="coerce")
+    if draw_counts.isna().any() or (draw_counts < 0).any():
+        raise FittedMaterialisationError(
+            "Fitted cache contains an invalid/negative draw count."
+        )
+
+    any_quantile = numeric.notna().any(axis=1)
+    all_quantiles = numeric.notna().all(axis=1)
+    partial_quantiles = any_quantile & ~all_quantiles
+    if partial_quantiles.any():
+        raise FittedMaterialisationError(
+            "Fitted cache contains a row with only a partial posterior summary."
+        )
+
+    positive_draws = draw_counts > 0
+    if not positive_draws.any():
+        raise FittedMaterialisationError(
+            "Fitted cache contains no row with a positive posterior draw count."
+        )
+    if (positive_draws & ~all_quantiles).any():
+        raise FittedMaterialisationError(
+            "Fitted cache has positive n_draws but missing posterior quantiles."
+        )
+    if ((draw_counts == 0) & any_quantile).any():
+        raise FittedMaterialisationError(
+            "Fitted cache has n_draws=0 but finite posterior quantiles."
+        )
+
+    level_mask = frame["metric"].astype(str) == "level"
+    if (draw_counts.loc[level_mask] <= 0).any():
+        raise FittedMaterialisationError(
+            "Fitted HICP level rows must always have a positive draw count."
+        )
+
+    # For YoY, zero-draw rows are permitted only as a contiguous leading block
+    # within each fitted series.  Once a 12-month denominator exists, a later
+    # zero-draw month would represent a genuine interior contract failure.
+    yoy_mask = frame["metric"].astype(str) == "yoy"
+    for keys, block in frame.loc[yoy_mask].groupby(
+        ["basis", "series"], dropna=False
+    ):
+        block = block.sort_values("date")
+        counts = pd.to_numeric(block["n_draws"], errors="coerce").to_numpy(dtype=float)
+        positive_positions = np.flatnonzero(counts > 0)
+        if len(positive_positions) == 0:
+            raise FittedMaterialisationError(
+                f"Fitted YoY block {keys} contains no computable posterior month."
+            )
+        first_positive = int(positive_positions[0])
+        if np.any(counts[first_positive:] <= 0):
+            raise FittedMaterialisationError(
+                f"Fitted YoY block {keys} contains an interior unavailable month "
+                "after YoY becomes computable."
+            )
+
+    # Every basis/series/metric block must use a complete, strictly increasing
+    # monthly calendar.  Different series are allowed to start later only if
+    # their YoY summary lacks the first twelve denominators; the level calendar
+    # itself is common by construction.
+    for keys, block in frame.groupby(["basis", "series", "metric"], dropna=False):
+        block_dates = pd.DatetimeIndex(pd.to_datetime(block["date"])).sort_values()
+        if block_dates.has_duplicates:
+            raise FittedMaterialisationError(f"Duplicate fitted dates in block {keys}.")
+        if len(block_dates) > 1:
+            expected = pd.date_range(block_dates.min(), block_dates.max(), freq="MS")
+            if not block_dates.equals(expected):
+                raise FittedMaterialisationError(
+                    f"Interior monthly date gap in fitted block {keys}."
+                )
+
+    level_blocks = frame.loc[frame["metric"].astype(str) == "level"]
+    calendars = {
+        tuple(pd.DatetimeIndex(pd.to_datetime(block["date"])).sort_values())
+        for _, block in level_blocks.groupby(["basis", "series"], dropna=False)
+    }
+    if len(calendars) != 1:
+        raise FittedMaterialisationError(
+            "Fitted level blocks do not share one common historical calendar."
+        )
+
+    common_calendar = next(iter(calendars))
+    return {
+        "basis": sorted(basis),
+        "components": list(MODEL_AGGREGATE_COMPONENTS),
+        "metrics": sorted(metrics),
+        "fit_start": pd.Timestamp(common_calendar[0]),
+        "fit_end": pd.Timestamp(common_calendar[-1]),
+        "n_months": int(len(common_calendar)),
+        "minimum_positive_summary_draws": int(draw_counts.loc[draw_counts > 0].min()),
+        "leading_unavailable_yoy_rows": int(
+            ((frame["metric"].astype(str) == "yoy") & (draw_counts == 0)).sum()
+        ),
+    }
+
+
+def _write_cache(frame: pd.DataFrame, aggregate_directory: Path) -> Path:
+    parquet = aggregate_directory / f"{FITTED_CACHE_BASENAME}.parquet"
+    csv = aggregate_directory / f"{FITTED_CACHE_BASENAME}.csv"
+    try:
+        frame.to_parquet(parquet, index=False)
+        if csv.exists():
+            csv.unlink()
+        return parquet
+    except (ImportError, ModuleNotFoundError):
+        frame.to_csv(csv, index=False)
+        return csv
+
+
+def _read_cache(aggregate_directory: Path) -> tuple[pd.DataFrame, Path]:
+    parquet = aggregate_directory / f"{FITTED_CACHE_BASENAME}.parquet"
+    csv = aggregate_directory / f"{FITTED_CACHE_BASENAME}.csv"
+    if parquet.is_file():
+        frame = pd.read_parquet(parquet)
+        path = parquet
+    elif csv.is_file():
+        frame = pd.read_csv(csv, parse_dates=["date"])
+        path = csv
+    else:
+        raise FileNotFoundError(parquet)
+    frame["date"] = pd.to_datetime(frame["date"], errors="raise")
+    return frame, path
+
+
+def _cache_signature(
+    aggregate_directory: Path,
+    aggregate_metadata: Mapping,
+    run_directories: Mapping[str, Path],
+    *,
+    max_draws: int,
+    pairing_seed: int,
+    start_date: pd.Timestamp,
+) -> dict:
+    components = {}
+    for key, directory in sorted(run_directories.items()):
+        components[key] = {
+            "metadata": _source_signature(directory / "metadata.json"),
+            "draws": _source_signature(directory / "draws.npz"),
+        }
+    return {
+        "cache_version": FITTED_CACHE_VERSION,
+        "aggregate_run_id": str(
+            aggregate_metadata.get("aggregate_run_id") or aggregate_directory.name
+        ),
+        "vintage": str(
+            aggregate_metadata.get("vintage") or aggregate_directory.parent.name
+        ),
+        "max_draws": int(max_draws),
+        "pairing_seed": int(pairing_seed),
+        "start_date": pd.Timestamp(start_date).date().isoformat(),
+        "components": components,
+    }
+
+
+def _cache_is_current(meta: Mapping, signature: Mapping) -> bool:
+    return dict(meta.get("source_signature", {}) or {}) == dict(signature)
+
+
+def build_energy_aggregate_fitted(
     aggregate_directory: str | Path,
     *,
     project_root: str | Path,
-    max_draws: int = 500,
-    seed: int = 2026,
-) -> dict:
-    """Build six fitted component paths and their fitted HICP Energy aggregate."""
-    from energy_bvar_aggregate import (
-        aggregate_component_draw_paths_laspeyres,
-        historical_model_component_reconstruction,
-        independent_draw_pairing,
-        load_aggregation_inputs,
-    )
+    max_draws: int = DEFAULT_MAX_DRAWS,
+    pairing_seed: int = DEFAULT_PAIRING_SEED,
+    start_date: str | pd.Timestamp = DEFAULT_START_DATE,
+    overwrite: bool = False,
+    persist_cache: bool = True,
+) -> tuple[pd.DataFrame, dict, bool]:
+    """Build or load the compact historical BVAR fitted cache.
 
+    Returns ``(frame, metadata, materialised_now)``.
+    """
     aggregate_directory = Path(aggregate_directory)
-    metadata = _json_load(aggregate_directory / "metadata.json")
-    vintage = str(metadata["vintage"])
-    forecast_name = str(metadata.get("forecast_name", "unconditional"))
-    # Resolve stores through the pipeline's canonical/aggregate-key contract.
-    # In particular, notebook/production aggregate metadata stores the weekly
-    # car-fuel paths under ``petrol`` and ``diesel``, whereas their BVAR model
-    # ids on disk are ``car_fuels_petrol`` and ``car_fuels_diesel``.
-    stores = {
-        name: _resolve_component_forecast_store(
-            metadata,
-            name,
-            project_root=project_root,
-            vintage=vintage,
-            forecast_name=forecast_name,
-        )
-        for name in MODEL_IDS
-    }
+    project_root = Path(project_root)
+    start_date = pd.Timestamp(start_date).to_period("M").to_timestamp(how="start")
+    aggregate_metadata = _aggregate_metadata(aggregate_directory)
+    run_directories = _component_run_directories(aggregate_directory, aggregate_metadata)
+    signature = _cache_signature(
+        aggregate_directory,
+        aggregate_metadata,
+        run_directories,
+        max_draws=max_draws,
+        pairing_seed=pairing_seed,
+        start_date=start_date,
+    )
+    meta_path = aggregate_directory / FITTED_META_FILENAME
 
-    fitted = {}
-    cache_sources = {}
-    for i, name in enumerate(MODEL_IDS):
-        run_dir = _run_directory_from_forecast_store(stores[name])
-        obj = materialize_component_fitted_hicp(
-            run_dir,
-            project_root=project_root,
-            forecast_name=forecast_name,
-            max_draws=max_draws,
-            seed=seed + 17 * i,
-        )
-        fitted[name] = obj
-        cache_sources[name] = obj.get("fit_cache_source")
+    if persist_cache and not overwrite and meta_path.is_file():
+        try:
+            old_meta = _read_json(meta_path)
+            if _cache_is_current(old_meta, signature):
+                frame, cache_path = _read_cache(aggregate_directory)
+                old_meta["cache_path"] = str(cache_path)
+                old_meta["available"] = True
+                return frame, old_meta, False
+        except Exception:
+            # A corrupt/stale fitted cache is safe to rebuild; the underlying
+            # aggregate forecast remains untouched.
+            pass
 
-    processed = Path(project_root) / "data" / "processed" / vintage
-    inputs = load_aggregation_inputs(processed)
+    processed_dir = project_root / "data" / "processed" / str(
+        aggregate_metadata.get("vintage") or aggregate_directory.parent.name
+    )
+    inputs = load_aggregation_inputs(processed_dir)
     indices = inputs["indices"]
     weights = inputs["weights"]
-    model_history = historical_model_component_reconstruction(processed)
+    model_history = historical_model_component_reconstruction(processed_dir)
 
-    # Petrol + diesel -> fitted car-fuels HICP.  The small unmodelled residual
-    # "other transport fuels" remains observed historically, because the paper
-    # suite has no BVAR for it.
-    transport_dates = _intersection_calendar(
-        [fitted["car_fuels_petrol"], fitted["car_fuels_diesel"]],
-        start=MIN_AGGREGATION_DATE,
-    )
-    petrol = _align(fitted["car_fuels_petrol"], transport_dates)
-    diesel = _align(fitted["car_fuels_diesel"], transport_dates)
-    n_transport = min(max_draws, petrol.shape[0], diesel.shape[0])
-    other_series = indices["hicp_other_transport_fuels"].reindex(transport_dates)
-    if other_series.isna().any():
-        raise FittedReconstructionError(
-            "Observed other-transport-fuels HICP is incomplete on the fitted calendar."
+    fitted_raw: dict[str, dict] = {}
+    preparation_audit: dict[str, dict] = {}
+    for aggregate_key, run_directory in run_directories.items():
+        metadata = _read_json(run_directory / "metadata.json")
+        canonical_model_id = _COMPONENT_RUN_IDS[aggregate_key]
+        panel = build_panel(
+            canonical_model_id,
+            str(metadata.get("vintage") or aggregate_directory.parent.name),
+            project_root=project_root,
         )
-    other = np.repeat(other_series.to_numpy(dtype=float)[None, :], n_transport, axis=0)
+        target = (
+            _WEEKLY_TARGETS[aggregate_key]
+            if aggregate_key in _WEEKLY_TARGETS
+            else _DIRECT_TARGETS.get(aggregate_key, panel.target)
+        )
+        with np.load(run_directory / "draws.npz", allow_pickle=False) as archive:
+            draws = {name: archive[name] for name in archive.files if name in {"B", "completed_differences_draws"}}
+        fitted = _one_step_fitted_target(
+            panel,
+            metadata,
+            draws,
+            target=target,
+            max_draws=max_draws,
+        )
+        fitted_raw[aggregate_key] = fitted
+        preparation_audit[aggregate_key] = {
+            "model_id": canonical_model_id,
+            "run_id": str(metadata.get("run_id") or run_directory.name),
+            "target": target,
+            "posterior_draws_used": int(len(fitted["draw_indices"])),
+            "missing_data_method": fitted["missing_data_method"],
+            "conditioning_history": fitted["conditioning_history"],
+            "fit_start": pd.Timestamp(fitted["dates"].min()).isoformat(),
+            "fit_end": pd.Timestamp(fitted["dates"].max()).isoformat(),
+        }
+
+    # --- Same HICP adapters as forecast aggregation ---------------------
+    gas_context = load_gas_tax_context(processed_dir / model_spec("gas").dataset_file)
+    electricity_context = load_electricity_tax_context(
+        processed_dir / model_spec("electricity").dataset_file
+    )
+    components: dict[str, dict] = {}
+    components["gas"] = _monthly_pretax_to_hicp(
+        fitted_raw["gas"],
+        tax_context=gas_context,
+        expand_function=expand_gas_semester_series,
+        reattribute_function=reattribute_gas_taxes,
+        start_date=start_date,
+    )
+    components["electricity"] = _monthly_pretax_to_hicp(
+        fitted_raw["electricity"],
+        tax_context=electricity_context,
+        expand_function=expand_electricity_semester_series,
+        reattribute_function=reattribute_electricity_taxes,
+        start_date=start_date,
+    )
+
+    for name in ("heat_energy", "solid_fuels"):
+        obj = fitted_raw[name]
+        dates = pd.DatetimeIndex(obj["dates"], name="date")
+        mask = dates >= start_date
+        components[name] = {
+            "dates": dates[mask],
+            "paths": _drop_bad_draws(
+                np.asarray(obj["level_paths"], dtype=float)[:, mask],
+                label=f"{name} fitted HICP",
+            ),
+        }
+
+    weekly_components: dict[str, dict] = {}
+    for name in ("petrol", "diesel", "liquid_fuels"):
+        context = load_weekly_tax_context(
+            processed_dir / model_spec(name).dataset_file,
+            name,
+        )
+        weekly_components[name] = _weekly_pretax_to_hicp(
+            fitted_raw[name],
+            context=context,
+            hicp_history=indices[_WEEKLY_HICP_COLUMNS[name]],
+            start_date=start_date,
+            label=name,
+        )
+    components["liquid_fuels"] = weekly_components["liquid_fuels"]
+
+    # --- petrol + diesel + OBSERVED other-transport residual -> car fuels --
+    #
+    # Other transport fuels has no dedicated BVAR.  For a historical fitted
+    # diagnostic it is an observed residual input.  Unlike the future forecast
+    # convention (last published level held flat), an unpublished historical
+    # residual month is never invented: the transport fitted window is trimmed
+    # to the maximal published overlap.
+    transport_candidate_dates = _common_monthly_dates(
+        [weekly_components["petrol"], weekly_components["diesel"]], start_date
+    )
+    petrol_candidate = _slice_object(
+        weekly_components["petrol"], transport_candidate_dates
+    )
+    diesel_candidate = _slice_object(
+        weekly_components["diesel"], transport_candidate_dates
+    )
+    n_transport = min(
+        int(max_draws), len(petrol_candidate), len(diesel_candidate)
+    )
+    other_obj = _historical_actual_paths(
+        indices["hicp_other_transport_fuels"],
+        transport_candidate_dates,
+        n_transport,
+        label="HICP other transport fuels",
+    )
+    transport_dates = pd.DatetimeIndex(other_obj["dates"], name="date")
+    petrol = _slice_object(weekly_components["petrol"], transport_dates)
+    diesel = _slice_object(weekly_components["diesel"], transport_dates)
+    other = np.asarray(other_obj["paths"], dtype=float)
     transport_paired, _ = independent_draw_pairing(
         {
             "hicp_petrol": petrol,
@@ -630,9 +1136,9 @@ def build_aggregate_bvar_fitted(
             "hicp_other_transport_fuels": other,
         },
         n_draws=n_transport,
-        seed=seed + 1001,
+        seed=int(pairing_seed),
     )
-    transport_history_index = pd.concat(
+    transport_history = pd.concat(
         [
             pd.Series(
                 [100.0],
@@ -641,133 +1147,188 @@ def build_aggregate_bvar_fitted(
             model_history["transport_energy"]["index"],
         ]
     ).sort_index()
-    transport_component_history = indices[list(TRANSPORT_COMPONENTS)]
-    transport_weights = weights[list(TRANSPORT_COMPONENTS)]
-    car = aggregate_component_draw_paths_laspeyres(
-        transport_component_history,
+    transport_history.name = "car_fuels"
+    car_fuels = aggregate_component_draw_paths_laspeyres(
+        indices[list(_TRANSPORT_COMPONENTS)],
         transport_paired,
         transport_dates,
-        transport_weights,
-        transport_history_index,
-        components=TRANSPORT_COMPONENTS,
+        weights[list(_TRANSPORT_COMPONENTS)],
+        transport_history,
+        components=list(_TRANSPORT_COMPONENTS),
     )
-    car_obj = {"path_dates": transport_dates, "hicp_level_paths": car["level_paths"]}
-
-    six_objects = {
-        "car_fuels": car_obj,
-        "liquid_fuels": fitted["liquid_fuels"],
-        "gas": fitted["gas"],
-        "electricity": fitted["electricity"],
-        "heat_energy": fitted["heat_energy"],
-        "solid_fuels": fitted["solid_fuels"],
+    components["car_fuels"] = {
+        "dates": pd.DatetimeIndex(car_fuels["path_dates"], name="date"),
+        "paths": np.asarray(car_fuels["level_paths"], dtype=float),
     }
-    dates = _intersection_calendar(list(six_objects.values()), start=MIN_AGGREGATION_DATE)
-    unpaired = {name: _align(obj, dates) for name, obj in six_objects.items()}
-    n_effective = min(int(max_draws), *(arr.shape[0] for arr in unpaired.values()))
+
+    # --- Six model fitted HICP paths -> HICP Energy, DRAW BY DRAW --------
+    ordered_components = list(MODEL_AGGREGATE_COMPONENTS)
+    common_dates = _common_monthly_dates(
+        [components[name] for name in ordered_components], start_date
+    )
+    unpaired = {
+        name: _slice_object(components[name], common_dates)
+        for name in ordered_components
+    }
+    n_aggregate = min(int(max_draws), *(len(value) for value in unpaired.values()))
     paired, pairing_indices = independent_draw_pairing(
-        unpaired, n_draws=n_effective, seed=seed + 2001
+        unpaired,
+        n_draws=n_aggregate,
+        seed=int(pairing_seed) + 1,
     )
-
-    component_history = model_history["component_history"]
-    energy = aggregate_component_draw_paths_laspeyres(
-        component_history,
+    aggregate = aggregate_draw_paths_laspeyres(
+        model_history["component_history"],
         paired,
-        dates,
-        model_history["model_weights"],
+        common_dates,
+        weights,
         indices["hicp_energy"],
-        components=SIX_COMPONENTS,
     )
-    component_level_paths = np.stack([paired[name] for name in SIX_COMPONENTS], axis=-1)
-    component_yoy_paths = np.stack(
-        [_yoy_paths(paired[name], dates, component_history[name]) for name in SIX_COMPONENTS],
-        axis=-1,
-    )
-    energy_level_paths = np.asarray(energy["level_paths"], dtype=float)
-    energy_yoy_paths = _yoy_paths(energy_level_paths, dates, indices["hicp_energy"])
+    aggregate_levels = np.asarray(aggregate["level_paths"], dtype=float)
 
-    return {
-        "fitted_schema_version": FITTED_SCHEMA_VERSION,
-        "vintage": vintage,
-        "aggregate_run_id": str(metadata.get("aggregate_run_id", aggregate_directory.name)),
-        "forecast_name": forecast_name,
-        "dates": dates,
-        "components": list(SIX_COMPONENTS),
-        "component_level_paths": component_level_paths,
-        "component_yoy_paths": component_yoy_paths,
-        "energy_level_paths": energy_level_paths,
-        "energy_yoy_paths": energy_yoy_paths,
-        "n_draws": int(n_effective),
-        "pairing_seed": int(seed),
-        "pairing_indices": pairing_indices,
-        "fit_cache_sources": cache_sources,
-        "fitted_definition": "one_step_posterior_conditional_mean_XB_then_HICP_bridge_then_Laspeyres",
+    # Build compact long-form summaries.  The six displayed component curves
+    # use the exact paired marginal draws that feed the aggregate calculation.
+    frames: list[pd.DataFrame] = []
+    component_history_map = {
+        "car_fuels": model_history["component_history"]["car_fuels"],
+        "liquid_fuels": indices["hicp_liquid_fuels"],
+        "gas": indices["hicp_gas"],
+        "electricity": indices["hicp_electricity"],
+        "heat_energy": indices["hicp_heat_cooling_energy"],
+        "solid_fuels": indices["hicp_solid_fuels"],
     }
+    for name in ordered_components:
+        levels = paired[name]
+        yoy = _yoy_paths(levels, common_dates, component_history_map[name])
+        frames.append(
+            _summary_frame(
+                levels,
+                common_dates,
+                series=name,
+                metric="level",
+                basis="component_bvar_fitted",
+            )
+        )
+        frames.append(
+            _summary_frame(
+                yoy,
+                common_dates,
+                series=name,
+                metric="yoy",
+                basis="component_bvar_fitted",
+            )
+        )
+
+    aggregate_yoy = _yoy_paths(
+        aggregate_levels,
+        common_dates,
+        indices["hicp_energy"],
+    )
+    frames.append(
+        _summary_frame(
+            aggregate_levels,
+            common_dates,
+            series="hicp_energy",
+            metric="level",
+            basis="aggregate_bvar_fitted",
+        )
+    )
+    frames.append(
+        _summary_frame(
+            aggregate_yoy,
+            common_dates,
+            series="hicp_energy",
+            metric="yoy",
+            basis="aggregate_bvar_fitted",
+        )
+    )
+    frame = pd.concat(frames, ignore_index=True)
+    frame = frame.sort_values(["basis", "series", "metric", "date"]).reset_index(drop=True)
+    contract_audit = validate_fitted_frame(frame)
+
+    cache_path = _write_cache(frame, aggregate_directory) if persist_cache else None
+    meta = {
+        "available": True,
+        "cache_version": FITTED_CACHE_VERSION,
+        "cache_path": None if cache_path is None else str(cache_path),
+        "persisted": bool(persist_cache),
+        "canonical_discriminator": "basis",
+        "fitted_contract": contract_audit,
+        "definition": (
+            "posterior one-step conditional fitted target levels; no in-sample "
+            "innovation is added; tax/frequency/HICP adapters match aggregate forecasting"
+        ),
+        "component_overlay_definition": (
+            "six HICP component posterior fitted summaries from the exact paired draws used by the aggregate; Car fuels combines fitted Petrol/Diesel with observed Other transport fuels"
+        ),
+        "aggregate_overlay_definition": (
+            "draw-wise Laspeyres aggregation of the six fitted HICP component paths; "
+            "quantiles are computed only after aggregation"
+        ),
+        "deterministic_accounting_reconstruction": "audit_only_not_plotted_as_model_fit",
+        "cross_model_dependence": "independent posterior chains; deterministic random draw pairing",
+        "pairing_seed": int(pairing_seed),
+        "n_aggregate_fitted_draws": int(n_aggregate),
+        "fit_start": pd.Timestamp(common_dates.min()).isoformat(),
+        "fit_end": pd.Timestamp(common_dates.max()).isoformat(),
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "source_signature": signature,
+        "preparation_audit": preparation_audit,
+        "car_fuels_residual_policy": {
+            "component": "hicp_other_transport_fuels",
+            "modelled": False,
+            "historical_fitted_policy": (
+                "published observed HICP only; trim leading/trailing ragged edge; "
+                "hard-fail on any interior missing/non-positive month"
+            ),
+            "forecast_policy_is_different": (
+                "future aggregate forecasting may hold the latest published residual "
+                "level constant; that convention is not used for historical fitted diagnostics"
+            ),
+            "published_start": pd.Timestamp(other_obj["published_start"]).isoformat(),
+            "published_end": pd.Timestamp(other_obj["published_end"]).isoformat(),
+            "trimmed_leading_months": int(other_obj["trimmed_leading_months"]),
+            "trimmed_trailing_months": int(other_obj["trimmed_trailing_months"]),
+            "effective_transport_fit_start": pd.Timestamp(transport_dates.min()).isoformat(),
+            "effective_transport_fit_end": pd.Timestamp(transport_dates.max()).isoformat(),
+        },
+        "aggregate_pairing_pool_indices_recorded": {
+            name: int(len(np.asarray(index)))
+            for name, index in pairing_indices.items()
+        },
+    }
+    if persist_cache:
+        meta_path.write_text(json.dumps(meta, indent=2, default=str), encoding="utf-8")
+    return frame, meta, bool(persist_cache)
 
 
-def materialize_aggregate_bvar_fitted(
+def load_energy_aggregate_fitted(
     aggregate_directory: str | Path,
     *,
     project_root: str | Path,
-    max_draws: int = 500,
-    seed: int = 2026,
+    max_draws: int = DEFAULT_MAX_DRAWS,
+    pairing_seed: int = DEFAULT_PAIRING_SEED,
+    start_date: str | pd.Timestamp = DEFAULT_START_DATE,
     overwrite: bool = False,
-) -> dict:
-    """Materialise/reload a compact fitted aggregate cache beside the aggregate run."""
-    directory = Path(aggregate_directory)
-    arrays_path = directory / FITTED_AGGREGATE_FILENAME
-    metadata_path = directory / FITTED_AGGREGATE_METADATA
-    if arrays_path.is_file() and metadata_path.is_file() and not overwrite:
-        metadata = _json_load(metadata_path)
-        with np.load(arrays_path, allow_pickle=False) as archive:
-            arrays = {name: archive[name] for name in archive.files}
-        return {
-            **metadata,
-            "dates": pd.DatetimeIndex(pd.to_datetime(arrays["dates"]), name="date"),
-            "components": [str(x) for x in metadata["components"]],
-            "component_level_paths": arrays["component_level_paths"],
-            "component_yoy_paths": arrays["component_yoy_paths"],
-            "energy_level_paths": arrays["energy_level_paths"],
-            "energy_yoy_paths": arrays["energy_yoy_paths"],
-        }
-
-    obj = build_aggregate_bvar_fitted(
-        directory,
+    persist_cache: bool = True,
+) -> tuple[pd.DataFrame, dict, bool]:
+    """Public dashboard entry point; alias kept intentionally descriptive."""
+    return build_energy_aggregate_fitted(
+        aggregate_directory,
         project_root=project_root,
         max_draws=max_draws,
-        seed=seed,
+        pairing_seed=pairing_seed,
+        start_date=start_date,
+        overwrite=overwrite,
+        persist_cache=persist_cache,
     )
-    dates = pd.DatetimeIndex(obj["dates"], name="date")
-    np.savez_compressed(
-        arrays_path,
-        dates=dates.astype("datetime64[ns]").to_numpy(),
-        component_level_paths=np.asarray(obj["component_level_paths"], dtype=float),
-        component_yoy_paths=np.asarray(obj["component_yoy_paths"], dtype=float),
-        energy_level_paths=np.asarray(obj["energy_level_paths"], dtype=float),
-        energy_yoy_paths=np.asarray(obj["energy_yoy_paths"], dtype=float),
-    )
-    meta = {
-        "fitted_schema_version": FITTED_SCHEMA_VERSION,
-        "vintage": obj["vintage"],
-        "aggregate_run_id": obj["aggregate_run_id"],
-        "forecast_name": obj["forecast_name"],
-        "components": list(obj["components"]),
-        "n_draws": int(obj["n_draws"]),
-        "pairing_seed": int(obj["pairing_seed"]),
-        "fitted_definition": obj["fitted_definition"],
-        "fit_cache_sources": obj["fit_cache_sources"],
-        "path_start": dates[0].isoformat(),
-        "path_end": dates[-1].isoformat(),
-    }
-    metadata_path.write_text(json.dumps(meta, indent=2, default=str), encoding="utf-8")
-    return obj
 
 
 __all__ = [
-    "FITTED_SCHEMA_VERSION",
-    "FittedReconstructionError",
-    "FittedUnavailableError",
-    "build_component_fitted_hicp",
-    "materialize_component_fitted_hicp",
-    "build_aggregate_bvar_fitted",
-    "materialize_aggregate_bvar_fitted",
+    "FITTED_CACHE_VERSION",
+    "FITTED_CACHE_BASENAME",
+    "FITTED_META_FILENAME",
+    "FittedMaterialisationError",
+    "validate_fitted_frame",
+    "build_energy_aggregate_fitted",
+    "load_energy_aggregate_fitted",
 ]

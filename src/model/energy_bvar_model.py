@@ -15,12 +15,10 @@ Conventions
 -----------
 * B has shape (1 + n*p + m, n): constant first, then lag blocks, then m deterministic/exogenous regressors.
 * vec(B) is column-major (order="F"), equation by equation.
-* Interior missing levels have a selectable treatment. ``missing_data_method="dk"``
-  preserves the validated exact Gaussian data-augmentation path; missing levels
-  are drawn inside each Gibbs sweep with the augmented Durbin--Koopman smoother.
-  ``missing_data_method="linear"`` is a fast approximation that linearly fills
-  only bounded interior level gaps once before estimation. Ragged-edge nowcasts
-  and conditional forecasts remain Durbin--Koopman state-space problems.
+* Panels without interior missing values keep the original maximal-balanced-block
+  estimation path. Panels with interior gaps use exact Gaussian data augmentation:
+  missing levels are drawn inside each Gibbs sweep with the same augmented
+  Durbin--Koopman level smoother used for ragged-edge forecasts.
 * The KSC seven-component approximation is used for the log-volatility paths.
 * The continuous U(2, 20) outlier support is represented by a configurable
   finite grid. The default grid is the integer support 2, ..., 20.
@@ -167,23 +165,6 @@ _FREQUENCY_ALIASES = {
     "w": "weekly",
     "w-mon": "weekly",
 }
-
-_MISSING_DATA_METHOD_ALIASES = {
-    "dk": "dk",
-    "durbin_koopman": "dk",
-    "durbin-koopman": "dk",
-    "linear": "linear",
-    "linear_interpolation": "linear",
-    "linear-interpolation": "linear",
-}
-
-
-def _canonical_missing_data_method(method: str) -> str:
-    key = str(method).strip().lower()
-    try:
-        return _MISSING_DATA_METHOD_ALIASES[key]
-    except KeyError as exc:
-        raise ValueError("missing_data_method must be 'dk' or 'linear'.") from exc
 
 
 def _canonical_frequency(frequency: str) -> str:
@@ -364,6 +345,70 @@ def _normalise_monthly_exog(
 
 
 
+def _normalise_active_lags(
+    active_lags: Sequence[int] | None,
+    p: int,
+) -> tuple[int, ...] | None:
+    """Validate an optional common endogenous lag set.
+
+    ``None`` preserves the historical dense VAR(1,...,p) path exactly.  When a
+    sequence is supplied, omitted endogenous lag coefficients are fixed at zero
+    in every equation while the full ``p``-lag companion state is retained for
+    stability checks, DK smoothing and forecasting.
+    """
+    if active_lags is None:
+        return None
+    cleaned = tuple(sorted({int(lag) for lag in active_lags}))
+    if not cleaned:
+        raise ValueError("active_lags cannot be empty when supplied.")
+    if cleaned[0] < 1 or cleaned[-1] > int(p):
+        raise ValueError(
+            f"active_lags must lie in [1, p={int(p)}]; received {cleaned}."
+        )
+    return cleaned
+
+
+def _active_lag_free_coefficient_mask(
+    *,
+    k: int,
+    n: int,
+    p: int,
+    active_lags: Sequence[int] | None,
+) -> np.ndarray:
+    """Return the vec(B, order='F') mask for coefficients that remain free."""
+    active = _normalise_active_lags(active_lags, p)
+    mask = np.ones((int(k), int(n)), dtype=bool)
+    if active is None:
+        return mask.reshape(-1, order="F")
+    active_set = set(active)
+    for lag in range(1, int(p) + 1):
+        if lag not in active_set:
+            row0 = 1 + (lag - 1) * int(n)
+            mask[row0:row0 + int(n), :] = False
+    return mask.reshape(-1, order="F")
+
+
+def apply_active_lag_restriction(
+    B: np.ndarray,
+    n: int,
+    p: int,
+    active_lags: Sequence[int] | None,
+) -> np.ndarray:
+    """Return B with omitted endogenous lags fixed exactly at zero."""
+    active = _normalise_active_lags(active_lags, p)
+    out = np.asarray(B, dtype=float).copy()
+    if active is None:
+        return out
+    if out.ndim != 2 or out.shape[1] != int(n) or out.shape[0] < 1 + int(n) * int(p):
+        raise ValueError("B has incompatible dimensions for the requested lag restriction.")
+    active_set = set(active)
+    for lag in range(1, int(p) + 1):
+        if lag not in active_set:
+            row0 = 1 + (lag - 1) * int(n)
+            out[row0:row0 + int(n), :] = 0.0
+    return out
+
+
 def _prepare_var_regression(
     data: pd.DataFrame,
     p: int,
@@ -414,24 +459,19 @@ def prepare_bvar_panel(
     variables: Sequence[str] | None = None,
     exog: pd.DataFrame | None = None,
     frequency: str = "monthly",
-    missing_data_method: str = "dk",
 ) -> dict:
     """Prepare levels, absolute changes, regressors and missing-data metadata.
 
-    With ``missing_data_method="dk"`` the original validated path is preserved:
-    interior missing levels remain latent and are redrawn in each Gibbs sweep.
-
-    With ``missing_data_method="linear"`` only bounded interior *levels* are
-    interpolated once before differences are formed. Leading/trailing gaps are
-    never extrapolated, so the ragged edge is still handled by the state-space
-    forecast. Interpolated pseudo-observations enter the likelihood, therefore
-    this mode is explicitly marked as an approximation. Minnesota prior scales
-    continue to use the original, non-interpolated data.
+    Panels with no interior missing transformed observations follow the original
+    balanced-sample implementation exactly.  If interior gaps are present, they
+    are *not* interpolated or dropped.  Instead the preparation object records an
+    exact observed-level template for Gibbs data augmentation.  A run of ``p``
+    complete changes is used only to initialise the companion state; all later
+    missing levels up to the final fully observed level date are latent states.
 
     Deterministic regressors must be known over the complete calendar.
     """
     frequency = _canonical_frequency(frequency)
-    missing_data_method = _canonical_missing_data_method(missing_data_method)
     if p < 1:
         raise ValueError("p must be at least 1.")
     if not isinstance(levels, pd.DataFrame):
@@ -464,20 +504,6 @@ def prepare_bvar_panel(
     frame = frame.reindex(full_index)
     if np.isinf(frame.to_numpy()).any():
         raise ValueError("The level panel contains infinite values.")
-
-    # Keep the normalized source panel untouched for prior scaling, provenance,
-    # and regression tests. The linear branch modifies only the effective panel
-    # used by the likelihood.
-    original_frame = frame.copy()
-    original_differences = original_frame.diff()
-    interpolated_level_mask = pd.DataFrame(
-        False, index=frame.index, columns=frame.columns
-    )
-    if missing_data_method == "linear":
-        interpolated = frame.interpolate(method="time", limit_area="inside")
-        interpolated_level_mask = frame.isna() & interpolated.notna()
-        frame = interpolated
-
     exog_frame = _normalise_exog(exog, full_index, frequency)
 
     differences = frame.diff()
@@ -489,15 +515,9 @@ def prepare_bvar_panel(
     first = int(np.flatnonzero(complete)[0])
     last = int(np.flatnonzero(complete)[-1])
     interior_bad = np.flatnonzero(~complete[first:last + 1]) + first
-    if missing_data_method == "linear" and len(interior_bad):
-        bad_dates = frame.index[interior_bad[:10]].strftime("%Y-%m-%d").tolist()
-        raise ValueError(
-            "Linear interpolation could not resolve all interior missing changes. "
-            f"First unresolved dates: {bad_dates}. Use missing_data_method='dk'."
-        )
 
     # ------------------------------------------------------------------
-    # Original path / linear approximation: balanced regression arrays.
+    # Original path: preserve the validated balanced implementation.
     # ------------------------------------------------------------------
     if len(interior_bad) == 0:
         balanced = differences.iloc[first:last + 1].copy()
@@ -521,21 +541,11 @@ def prepare_bvar_panel(
         level_at_balanced_end = frame.loc[balanced_end].to_numpy(dtype=float)
         exog_names = [] if exog_frame is None else list(exog_frame.columns)
 
-        source_prior_scale_data = (
-            original_differences.iloc[first:last + 1].copy()
-            if missing_data_method == "linear"
-            else balanced
-        )
-        interpolated_dates = frame.index[interpolated_level_mask.any(axis=1)]
-        approximation_used = bool(interpolated_level_mask.to_numpy(dtype=bool).any())
-
         return {
             "levels": frame,
-            "levels_original": original_frame,
             "differences": differences,
-            "differences_original": original_differences,
             "balanced": balanced,
-            "prior_scale_data": source_prior_scale_data,
+            "prior_scale_data": balanced,
             "ragged": ragged,
             "exog": exog_frame,
             "exog_regression": exog_regression,
@@ -561,15 +571,6 @@ def prepare_bvar_panel(
             "n_ragged_periods": len(ragged),
             "n_ragged_months": len(ragged),
             "requires_data_augmentation": False,
-            "missing_data_method": missing_data_method,
-            "missing_treatment_exact": not approximation_used,
-            "missing_data_approximation_used": approximation_used,
-            "interpolated_level_mask": interpolated_level_mask,
-            "interpolated_dates": pd.DatetimeIndex(interpolated_dates, name="date"),
-            "n_interpolated_level_cells": int(
-                interpolated_level_mask.to_numpy(dtype=bool).sum()
-            ),
-            "n_interpolated_dates": int(len(interpolated_dates)),
             "interior_missing_dates": pd.DatetimeIndex([], name="date"),
             "n_interior_missing_dates": 0,
             "n_interior_missing_level_cells": 0,
@@ -668,9 +669,7 @@ def prepare_bvar_panel(
 
     return {
         "levels": frame,
-        "levels_original": original_frame,
         "differences": differences,
-        "differences_original": original_differences,
         "balanced": balanced_template,
         "prior_scale_data": prior_scale_data,
         "ragged": ragged,
@@ -698,13 +697,6 @@ def prepare_bvar_panel(
         "n_ragged_periods": len(ragged),
         "n_ragged_months": len(ragged),
         "requires_data_augmentation": True,
-        "missing_data_method": "dk",
-        "missing_treatment_exact": True,
-        "missing_data_approximation_used": False,
-        "interpolated_level_mask": interpolated_level_mask,
-        "interpolated_dates": pd.DatetimeIndex([], name="date"),
-        "n_interpolated_level_cells": 0,
-        "n_interpolated_dates": 0,
         "augmentation_anchor": augmentation_anchor,
         "augmentation_anchor_level": anchor_level,
         "initial_companion_state": initial_companion_state,
@@ -795,6 +787,7 @@ def make_bvar_svo_prior(
     config: BVARSVOPriorConfig | None = None,
     *,
     exog_prior_scale: float = 10.0,
+    active_lags: Sequence[int] | None = None,
 ) -> dict:
     """Build the Minnesota prior plus diffuse deterministic-coefficient priors.
 
@@ -813,6 +806,7 @@ def make_bvar_svo_prior(
         raise ValueError("exog_prior_scale must be positive.")
     n = prep["n"]
     p = prep["p"]
+    active_lags = _normalise_active_lags(active_lags, p)
     k = 1 + n * p + n_exog
     scales = ar1_residual_scales(data)
 
@@ -876,6 +870,13 @@ def make_bvar_svo_prior(
         "exog_names": exog_names,
         "exog_prior_scale": float(exog_prior_scale),
         "config": asdict(config),
+        "active_lags": None if active_lags is None else list(active_lags),
+        "free_coefficient_mask": _active_lag_free_coefficient_mask(
+            k=k,
+            n=n,
+            p=p,
+            active_lags=active_lags,
+        ),
     }
 
 # -----------------------------------------------------------------------------
@@ -960,8 +961,14 @@ def draw_bvar_coefficients_sv(
     p: int,
     rng: np.random.Generator,
     max_stability_tries: int = 1_000,
+    active_lags: Sequence[int] | None = None,
 ) -> tuple[np.ndarray, int, float]:
-    """Draw B from its heteroskedastic GLS conditional, truncated to stability."""
+    """Draw B from its heteroskedastic GLS conditional, truncated to stability.
+
+    ``active_lags=None`` executes the historical dense implementation.  With an
+    explicit lag set, coefficients on omitted endogenous lags are fixed exactly
+    at zero; the stability test still uses the full p-lag companion matrix.
+    """
     Y = np.asarray(Y, dtype=float)
     X = np.asarray(X, dtype=float)
     A = np.asarray(A, dtype=float)
@@ -973,13 +980,55 @@ def draw_bvar_coefficients_sv(
     if np.any(q <= 0) or not np.all(np.isfinite(q)):
         raise ValueError("All structural variances must be finite and positive.")
 
+    active_lags = _normalise_active_lags(active_lags, p)
     dim = n * k
-    precision = np.diag(np.asarray(prior["V0_inv_diag"], dtype=float))
-    rhs = np.asarray(prior["V0_inv_diag"], dtype=float) * np.asarray(prior["b0"], dtype=float)
     identity_n = np.eye(n)
 
+    # Historical branch kept separate so existing Energy runs retain exactly
+    # the same algebra and RNG consumption when active_lags is not supplied.
+    if active_lags is None:
+        precision = np.diag(np.asarray(prior["V0_inv_diag"], dtype=float))
+        rhs = np.asarray(prior["V0_inv_diag"], dtype=float) * np.asarray(prior["b0"], dtype=float)
+        for t in range(T):
+            H_t = np.kron(identity_n, X[t : t + 1])
+            Z_t = A @ H_t
+            inv_q = 1.0 / q[t]
+            precision += Z_t.T @ (inv_q[:, None] * Z_t)
+            rhs += Z_t.T @ (inv_q * (A @ Y[t]))
+
+        precision = 0.5 * (precision + precision.T)
+        mean = np.linalg.solve(precision, rhs)
+        L = _safe_cholesky(precision)
+
+        last_radius = np.nan
+        for attempt in range(1, max_stability_tries + 1):
+            draw = mean + np.linalg.solve(L.T, rng.standard_normal(dim))
+            B = draw.reshape(k, n, order="F")
+            last_radius = spectral_radius(B, n, p)
+            if np.isfinite(last_radius) and last_radius < 1.0:
+                return B, attempt, float(last_radius)
+        raise RuntimeError(
+            f"No stable B draw after {max_stability_tries} attempts; "
+            f"last radius={last_radius:.6f}."
+        )
+
+    free = _active_lag_free_coefficient_mask(
+        k=k,
+        n=n,
+        p=p,
+        active_lags=active_lags,
+    )
+    free_index = np.flatnonzero(free)
+    if len(free_index) == 0:
+        raise ValueError("The sparse coefficient restriction leaves no free coefficients.")
+
+    prior_precision_full = np.asarray(prior["V0_inv_diag"], dtype=float)
+    prior_mean_full = np.asarray(prior["b0"], dtype=float)
+    precision = np.diag(prior_precision_full[free_index])
+    rhs = prior_precision_full[free_index] * prior_mean_full[free_index]
+
     for t in range(T):
-        H_t = np.kron(identity_n, X[t : t + 1])
+        H_t = np.kron(identity_n, X[t : t + 1])[:, free_index]
         Z_t = A @ H_t
         inv_q = 1.0 / q[t]
         precision += Z_t.T @ (inv_q[:, None] * Z_t)
@@ -991,14 +1040,17 @@ def draw_bvar_coefficients_sv(
 
     last_radius = np.nan
     for attempt in range(1, max_stability_tries + 1):
-        draw = mean + np.linalg.solve(L.T, rng.standard_normal(dim))
-        B = draw.reshape(k, n, order="F")
+        draw_free = mean + np.linalg.solve(L.T, rng.standard_normal(len(free_index)))
+        draw_full = np.zeros(dim, dtype=float)
+        draw_full[free_index] = draw_free
+        B = draw_full.reshape(k, n, order="F")
         last_radius = spectral_radius(B, n, p)
         if np.isfinite(last_radius) and last_radius < 1.0:
             return B, attempt, float(last_radius)
 
     raise RuntimeError(
-        f"No stable B draw after {max_stability_tries} attempts; last radius={last_radius:.6f}."
+        f"No stable sparse-lag B draw after {max_stability_tries} attempts; "
+        f"active_lags={active_lags}, last radius={last_radius:.6f}."
     )
 
 
@@ -1623,6 +1675,7 @@ def _gibbs_bvar_sv_outlier_with_missing(
     prior_config: BVARSVOPriorConfig,
     sampler_config: SamplerConfig,
     exog_prior_scale: float,
+    active_lags: Sequence[int] | None = None,
 ) -> dict:
     """Exact Gibbs sampler with DK data augmentation for interior level gaps."""
     T = int(prep["n_regression_observations"])
@@ -1670,6 +1723,7 @@ def _gibbs_bvar_sv_outlier_with_missing(
         return_diagnostics=True,
     )
     ols = _fit_var_ols_arrays(Y, X, n, p)
+    ols["B"] = apply_active_lag_restriction(ols["B"], n, p, active_lags)
     if var_is_stable(ols["B"], n, p):
         B = ols["B"].copy()
     _, u = structural_residuals(Y, X, B, A)
@@ -1762,6 +1816,7 @@ def _gibbs_bvar_sv_outlier_with_missing(
             p,
             rng,
             max_stability_tries=sampler_config.max_stability_tries,
+            active_lags=active_lags,
         )
         total_B_proposals += attempts
         unstable_B_proposals += attempts - 1
@@ -1871,12 +1926,10 @@ def _gibbs_bvar_sv_outlier_with_missing(
         "exog_names": list(prep["exog_names"]),
         "exog_prior_scale": float(exog_prior_scale),
         "p": p,
+        "active_lags": None if active_lags is None else list(active_lags),
         "frequency": prep["frequency"],
         "sv_sampler": sampler_config.sv_sampler,
         "outlier_support": prior["outlier_grid"].copy(),
-        "missing_data_method": "dk",
-        "missing_treatment_exact": True,
-        "ksc_offset_calibration": "initial_structural_residual_median_squared",
         "data_augmentation": "durbin_koopman_interior_levels",
         "dk_projection_initialization": initial_dk_diagnostics,
         "dk_projection_records": (
@@ -1991,26 +2044,22 @@ def gibbs_bvar_sv_outlier(
     exog_prior_scale: float = 10.0,
     prior_config: BVARSVOPriorConfig | None = None,
     sampler_config: SamplerConfig | None = None,
-    missing_data_method: str = "dk",
+    active_lags: Sequence[int] | None = None,
 ) -> dict:
     """Estimate the constant-coefficient BVAR-SV-outlier model."""
     prior_config = BVARSVOPriorConfig() if prior_config is None else prior_config
     sampler_config = SamplerConfig() if sampler_config is None else sampler_config
     prior_config.validate()
     sampler_config.validate()
-    missing_data_method = _canonical_missing_data_method(missing_data_method)
+    active_lags = _normalise_active_lags(active_lags, p)
     prep = prepare_bvar_panel(
-        levels,
-        p=p,
-        variables=variables,
-        exog=exog,
-        frequency=frequency,
-        missing_data_method=missing_data_method,
+        levels, p=p, variables=variables, exog=exog, frequency=frequency
     )
     prior = make_bvar_svo_prior(
         prep,
         prior_config,
         exog_prior_scale=exog_prior_scale,
+        active_lags=active_lags,
     )
     if prep.get("requires_data_augmentation", False):
         return _gibbs_bvar_sv_outlier_with_missing(
@@ -2019,6 +2068,7 @@ def gibbs_bvar_sv_outlier(
             prior_config=prior_config,
             sampler_config=sampler_config,
             exog_prior_scale=exog_prior_scale,
+            active_lags=active_lags,
         )
     Y = prep["Y"]
     X = prep["X"]
@@ -2026,6 +2076,7 @@ def gibbs_bvar_sv_outlier(
     rng = np.random.default_rng(sampler_config.seed)
 
     ols = fit_var_ols_from_prepared(prep)
+    ols["B"] = apply_active_lag_restriction(ols["B"], n, p, active_lags)
     B = ols["B"].copy()
     if not var_is_stable(B, n, p):
         B = prior["B0"].copy()
@@ -2074,6 +2125,7 @@ def gibbs_bvar_sv_outlier(
             p,
             rng,
             max_stability_tries=sampler_config.max_stability_tries,
+            active_lags=active_lags,
         )
         total_B_proposals += attempts
         unstable_B_proposals += attempts - 1
@@ -2169,17 +2221,10 @@ def gibbs_bvar_sv_outlier(
         "exog_names": list(prep["exog_names"]),
         "exog_prior_scale": float(exog_prior_scale),
         "p": p,
+        "active_lags": None if active_lags is None else list(active_lags),
         "frequency": prep["frequency"],
         "sv_sampler": sampler_config.sv_sampler,
         "outlier_support": prior["outlier_grid"].copy(),
-        "missing_data_method": missing_data_method,
-        "missing_treatment_exact": bool(prep.get("missing_treatment_exact", True)),
-        "ksc_offset_calibration": "initial_structural_residual_median_squared",
-        "data_augmentation": (
-            "linear_interpolation"
-            if prep.get("missing_data_approximation_used", False)
-            else "none"
-        ),
     }
     return result
 
@@ -2248,11 +2293,18 @@ def coefficient_posterior_table(result: Mapping) -> pd.DataFrame:
     B = np.asarray(result["B"], dtype=float)
     flat = B.reshape(len(B), -1, order="F")
     prior = result["prior"]
+    prior_sd = np.sqrt(np.asarray(prior["V0_diag"], dtype=float))
+    free = prior.get("free_coefficient_mask")
+    if free is not None:
+        free = np.asarray(free, dtype=bool)
+        if free.shape == prior_sd.shape:
+            prior_sd = prior_sd.copy()
+            prior_sd[~free] = 0.0
     return posterior_summary(
         flat,
         prior["coefficient_labels"],
         prior_mean=prior["b0"],
-        prior_sd=np.sqrt(prior["V0_diag"]),
+        prior_sd=prior_sd,
     )
 
 
@@ -2905,18 +2957,6 @@ def forecast_bvar_sv_outlier(
         "calendar_rule": _calendar_rule(frequency),
         "period_name": _period_name(frequency),
         "H": H,
-        "missing_data_method": result.get(
-            "missing_data_method", prep.get("missing_data_method", "dk")
-        ),
-        "missing_treatment_exact": bool(
-            result.get(
-                "missing_treatment_exact",
-                prep.get("missing_treatment_exact", True),
-            )
-        ),
-        "missing_data_approximation_used": bool(
-            prep.get("missing_data_approximation_used", False)
-        ),
     }
 
 
@@ -3132,19 +3172,12 @@ def forecast_horizon_table(
     if variable not in variables:
         raise ValueError(f"Unknown variable {variable!r}.")
     j = variables.index(variable)
-    table = path_horizon_table(
+    return path_horizon_table(
         np.asarray(forecast["future_level_paths"], dtype=float)[:, :, j],
         forecast["future_dates"],
         forecast["last_calendar_date"],
         quantiles=quantiles,
     )
-    table["missing_data_method"] = str(
-        forecast.get("missing_data_method", "dk")
-    )
-    table["missing_treatment_exact"] = bool(
-        forecast.get("missing_treatment_exact", True)
-    )
-    return table
 
 # -----------------------------------------------------------------------------
 # Structural analysis: recursive and sign-restricted IRF, FEVD and HD
@@ -3694,16 +3727,18 @@ def hash_run_config(
     frequency: str = "monthly",
     exog_names: Sequence[str] | None = None,
     exog_prior_scale: float = 10.0,
-    missing_data_method: str = "dk",
+    active_lags: Sequence[int] | None = None,
 ) -> str:
     payload = {
         "frequency": _canonical_frequency(frequency),
-        "missing_data_method": _canonical_missing_data_method(missing_data_method),
         "p": int(p),
         "variables": list(variables),
         "prior": asdict(prior_config),
         "sampler": asdict(sampler_config),
     }
+    active_lags = _normalise_active_lags(active_lags, p)
+    if active_lags is not None:
+        payload["active_lags"] = list(active_lags)
     names = [] if exog_names is None else list(exog_names)
     if names:
         payload["deterministic"] = {
@@ -3726,19 +3761,13 @@ def build_run_metadata(
     frequency: str = "monthly",
     exog: pd.DataFrame | None = None,
     exog_prior_scale: float = 10.0,
-    missing_data_method: str = "dk",
-    missing_treatment_exact: bool = True,
-    effective_levels: pd.DataFrame | None = None,
+    active_lags: Sequence[int] | None = None,
     code_version: str = "unversioned",
-    result_schema_version: str = "1.4",
+    result_schema_version: str = "1.2",
 ) -> dict:
     frequency = _canonical_frequency(frequency)
     exog_names = [] if exog is None else list(exog.columns)
     data_hash = hash_model_data(levels, exog)
-    effective_data_hash = hash_model_data(
-        levels if effective_levels is None else effective_levels,
-        exog,
-    )
     config_hash = hash_run_config(
         prior_config,
         sampler_config,
@@ -3747,7 +3776,7 @@ def build_run_metadata(
         frequency=frequency,
         exog_names=exog_names,
         exog_prior_scale=exog_prior_scale,
-        missing_data_method=missing_data_method,
+        active_lags=active_lags,
     )
     identity = {
         "model_id": str(model_id),
@@ -3764,14 +3793,15 @@ def build_run_metadata(
         "result_schema_version": result_schema_version,
         "frequency": frequency,
         "calendar_rule": _calendar_rule(frequency),
-        "missing_data_method": _canonical_missing_data_method(missing_data_method),
-        "missing_treatment_exact": bool(missing_treatment_exact),
-        "source_data_hash": data_hash,
-        "effective_estimation_data_hash": effective_data_hash,
         "variables": list(variables),
         "exog_names": exog_names,
         "exog_prior_scale": float(exog_prior_scale) if exog_names else None,
         "p": int(p),
+        "active_lags": (
+            None
+            if _normalise_active_lags(active_lags, p) is None
+            else list(_normalise_active_lags(active_lags, p))
+        ),
         "n_observations": int(len(levels)),
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
     }
@@ -3790,12 +3820,11 @@ def run_energy_bvar(
     exog_prior_scale: float = 10.0,
     prior_config: BVARSVOPriorConfig | None = None,
     sampler_config: SamplerConfig | None = None,
-    missing_data_method: str = "dk",
+    active_lags: Sequence[int] | None = None,
     code_version: str = "unversioned",
 ) -> dict:
     """Run the generic monthly/weekly engine and attach a cache-safe identity."""
     frequency = _canonical_frequency(frequency)
-    missing_data_method = _canonical_missing_data_method(missing_data_method)
     prior_config = BVARSVOPriorConfig() if prior_config is None else prior_config
     sampler_config = SamplerConfig() if sampler_config is None else sampler_config
     variables = list(levels.columns) if variables is None else list(variables)
@@ -3808,14 +3837,13 @@ def run_energy_bvar(
         exog_prior_scale=exog_prior_scale,
         prior_config=prior_config,
         sampler_config=sampler_config,
-        missing_data_method=missing_data_method,
+        active_lags=active_lags,
     )
     normalised_exog = result["prep"].get("exog")
     result["metadata"] = build_run_metadata(
         model_id=model_id,
         vintage=vintage,
-        levels=result["prep"].get("levels_original", result["prep"]["levels"])[variables],
-        effective_levels=result["prep"]["levels"][variables],
+        levels=result["prep"]["levels"][variables],
         p=p,
         variables=variables,
         frequency=frequency,
@@ -3823,28 +3851,11 @@ def run_energy_bvar(
         exog_prior_scale=exog_prior_scale,
         prior_config=prior_config,
         sampler_config=sampler_config,
-        missing_data_method=missing_data_method,
-        missing_treatment_exact=bool(result.get("missing_treatment_exact", True)),
+        active_lags=active_lags,
         code_version=code_version,
     )
     result["metadata"].update({
         "data_augmentation": result.get("data_augmentation", "none"),
-        "missing_data_method": missing_data_method,
-        "missing_treatment_exact": bool(result.get("missing_treatment_exact", True)),
-        "missing_data_approximation_used": bool(
-            result["prep"].get("missing_data_approximation_used", False)
-        ),
-        "interpolated_level_cells": int(
-            result["prep"].get("n_interpolated_level_cells", 0)
-        ),
-        "interpolated_dates": int(
-            result["prep"].get("n_interpolated_dates", 0)
-        ),
-        "ksc_offset_calibration": result.get(
-            "ksc_offset_calibration",
-            "initial_structural_residual_median_squared",
-        ),
-        "ksc_offsets": np.asarray(result.get("ksc_offsets", []), dtype=float).tolist(),
         "requires_data_augmentation": bool(
             result["prep"].get("requires_data_augmentation", False)
         ),
@@ -3856,6 +3867,11 @@ def run_energy_bvar(
         ),
         "dk_projection_mode": sampler_config.dk_projection_mode,
         "dk_projection_diagnostics": result.get("dk_projection_diagnostics"),
+        "active_lags": (
+            None
+            if _normalise_active_lags(active_lags, p) is None
+            else list(_normalise_active_lags(active_lags, p))
+        ),
     })
     return result
 
@@ -3874,6 +3890,7 @@ __all__ = [
     "load_energy_panel",
     "monthly_seasonal_dummies",
     "prepare_bvar_panel",
+    "apply_active_lag_restriction",
     "fit_var_ols_from_prepared",
     "make_bvar_svo_prior",
     "draw_sv_block",
