@@ -204,6 +204,14 @@ def _fan_rows(
         raise DisplayError(f"{metric}/{basis}: no posterior draws are available.")
 
     quantiles = np.nanquantile(values, DISPLAY_QUANTILES, axis=0)
+    finite_count = np.sum(np.isfinite(values), axis=0)
+    finite_sum = np.nansum(values, axis=0)
+    posterior_mean = np.divide(
+        finite_sum,
+        finite_count,
+        out=np.full(finite_sum.shape, np.nan, dtype=float),
+        where=finite_count > 0,
+    )
     future_index = pd.DatetimeIndex([] if future_dates is None else future_dates)
     future_set = set(future_index)
     rows = []
@@ -226,6 +234,7 @@ def _fan_rows(
                     "date": date,
                     "segment": "forecast" if is_future else segment_for_nonfuture,
                     "is_future": bool(is_future),
+                    "value": posterior_mean[t, j],
                     "q05": quantiles[0, t, j],
                     "q16": quantiles[1, t, j],
                     "q50": quantiles[2, t, j],

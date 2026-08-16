@@ -8,7 +8,8 @@ This module is deliberately separate from the Dash callbacks:
 - never writes below ``results/``.
 
 The econometric/data transformations remain owned by the canonical
-``build_dataset_paper_six_models_v*.py`` script.
+``build_dataset_headline_joint_v*_FINAL.py`` script. Legacy six-model builder
+names remain discoverable only as a backward-compatible fallback.
 """
 
 from __future__ import annotations
@@ -40,6 +41,18 @@ EXPECTED_ENERGY_OUTPUTS = (
 EXPECTED_HICP_OUTPUTS = (
     "hicp_indices_monthly.csv",
     "hicp_weights_annual.csv",
+    "hicp_series_metadata.csv",
+    "hicp_flags.csv",
+    "hicp_weight_identity_diagnostics.csv",
+)
+
+EXPECTED_HEADLINE_OUTPUTS = (
+    "headline_joint_monthly.csv",
+    "headline_joint_weights_annual.csv",
+    "headline_joint_weight_identity_diagnostics.csv",
+    "headline_hicp_indices_monthly.csv",
+    "headline_hicp_weights_annual.csv",
+    "headline_hicp_weight_identity_diagnostics.csv",
 )
 
 EXPECTED_AUDIT_OUTPUTS = (
@@ -47,6 +60,21 @@ EXPECTED_AUDIT_OUTPUTS = (
     "model_datasets_diagnostics.csv",
     "source_vintages.csv",
     "aggregation_coverage.csv",
+    "partial_period_inputs.csv",
+)
+
+RAW_WORKBOOK_PATTERNS = (
+    "bvar_energy_raw_data*.xlsm",
+    "bvar_energy_raw_data*.xlsx",
+    "raw_energy_bvar*.xlsm",
+    "raw_energy_bvar*.xlsx",
+)
+
+PREFERRED_RAW_WORKBOOK_NAMES = (
+    "bvar_energy_raw_data.xlsm",
+    "raw_energy_bvar.xlsm",
+    "bvar_energy_raw_data.xlsx",
+    "raw_energy_bvar.xlsx",
 )
 
 DATASET_LOCK_NAME = ".dataset_build.lock"
@@ -103,22 +131,33 @@ def discover_dataset_builder(
             f"Dataset pipeline folder does not exist: {pipeline_dir}"
         )
 
-    # Prefer the newest numbered canonical builder, while ignoring obvious
-    # temporary/backup files. The exact chosen path is shown in the UI.
-    candidates = [
-        p
-        for p in pipeline_dir.glob("build_dataset_paper_six_models_v*.py")
-        if p.is_file()
-        and not p.name.startswith("~")
-        and "backup" not in p.name.casefold()
-        and "old" not in p.name.casefold()
-    ]
-    if not candidates:
+    # Prefer the final joint-Headline builder family. Legacy six-model names
+    # remain a fallback so old checkouts are still diagnosable.
+    families = (
+        (2, "build_dataset_headline_joint_v*.py"),
+        (1, "build_dataset_paper_six_models_v*.py"),
+    )
+    ranked: list[tuple[int, Path]] = []
+    for family_rank, pattern in families:
+        for p in pipeline_dir.glob(pattern):
+            if (
+                p.is_file()
+                and not p.name.startswith("~")
+                and "backup" not in p.name.casefold()
+                and "old" not in p.name.casefold()
+            ):
+                ranked.append((family_rank, p))
+    if not ranked:
         raise DatasetBuildError(
-            "No build_dataset_paper_six_models_v*.py found in "
-            f"{pipeline_dir}. Set ENERGY_BVAR_DATASET_BUILDER to override."
+            "No canonical dataset builder found in "
+            f"{pipeline_dir}. Expected build_dataset_headline_joint_v*.py "
+            "or the legacy build_dataset_paper_six_models_v*.py family. "
+            "Set ENERGY_BVAR_DATASET_BUILDER to override."
         )
-    return max(candidates, key=_version_key).resolve()
+    return max(
+        ranked,
+        key=lambda item: (item[0], *_version_key(item[1])),
+    )[1].resolve()
 
 
 def discover_raw_workbook(
@@ -140,35 +179,65 @@ def discover_raw_workbook(
     if not raw_root.is_dir():
         raise DatasetBuildError(f"Raw-data folder does not exist: {raw_root}")
 
-    preferred = [
-        p for p in raw_root.rglob("raw_energy_bvar*.xlsx")
-        if p.is_file() and not p.name.startswith("~$")
-    ]
-    if preferred:
-        def rank(path: Path) -> tuple[int, int, int]:
-            vintage = _parse_vintage_name(path.parent.name)
-            vintage_ord = vintage.toordinal() if vintage else -1
-            exact = int(path.name.casefold() == "raw_energy_bvar.xlsx")
-            return vintage_ord, exact, int(path.stat().st_mtime_ns)
-        return max(preferred, key=rank).resolve()
+    # The production contract is one living top-level workbook.  Prefer it
+    # deterministically over any archived/datestamped copies below data/raw.
+    for name in PREFERRED_RAW_WORKBOOK_NAMES:
+        canonical = raw_root / name
+        if canonical.is_file() and not canonical.name.startswith("~$"):
+            return canonical.resolve()
 
-    top_level = [
-        p for p in raw_root.glob("*.xlsx")
-        if p.is_file() and not p.name.startswith("~$")
-    ]
-    if len(top_level) == 1:
-        return top_level[0].resolve()
-    if len(top_level) > 1:
-        listing = "\n  ".join(str(p.relative_to(root)) for p in top_level)
+    candidates: list[Path] = []
+    seen: set[Path] = set()
+    for pattern in RAW_WORKBOOK_PATTERNS:
+        for path in raw_root.rglob(pattern):
+            if not path.is_file() or path.name.startswith("~$"):
+                continue
+            resolved = path.resolve()
+            if resolved not in seen:
+                seen.add(resolved)
+                candidates.append(path)
+
+    if not candidates:
+        top_level = [
+            p
+            for suffix in (".xlsm", ".xlsx")
+            for p in raw_root.glob(f"*{suffix}")
+            if p.is_file() and not p.name.startswith("~$")
+        ]
+        if len(top_level) == 1:
+            candidates = top_level
+        elif len(top_level) > 1:
+            listing = "\n  ".join(str(p.relative_to(root)) for p in top_level)
+            raise DatasetBuildError(
+                "Could not auto-select the production workbook because several "
+                f"top-level Excel files exist:\n  {listing}\n"
+                "Enter the workbook path explicitly in the Data page."
+            )
+
+    if not candidates:
         raise DatasetBuildError(
-            "Could not auto-select the workbook because several top-level XLSX "
-            f"files exist:\n  {listing}\n"
-            "Enter the workbook path explicitly in the Estimation page."
+            f"No production .xlsm/.xlsx workbook found below {raw_root}. "
+            "Expected bvar_energy_raw_data* or raw_energy_bvar*."
         )
 
-    raise DatasetBuildError(
-        f"No raw_energy_bvar*.xlsx workbook found below {raw_root}."
-    )
+    preference = {
+        name.casefold(): len(PREFERRED_RAW_WORKBOOK_NAMES) - i
+        for i, name in enumerate(PREFERRED_RAW_WORKBOOK_NAMES)
+    }
+
+    def rank(path: Path) -> tuple[int, int, int, int]:
+        vintage = _parse_vintage_name(path.parent.name)
+        vintage_ord = vintage.toordinal() if vintage else -1
+        exact_preference = preference.get(path.name.casefold(), 0)
+        macro_enabled = int(path.suffix.casefold() == ".xlsm")
+        return (
+            vintage_ord,
+            exact_preference,
+            macro_enabled,
+            int(path.stat().st_mtime_ns),
+        )
+
+    return max(candidates, key=rank).resolve()
 
 
 def default_build_vintage(raw_path: str | Path) -> str:
@@ -336,10 +405,17 @@ def inspect_dataset_build_environment(
     }
 
 
-def _validate_outputs(output_dir: Path, *, require_hicp: bool) -> list[str]:
+def _validate_outputs(
+    output_dir: Path,
+    *,
+    require_hicp: bool,
+    require_headline: bool,
+) -> list[str]:
     required = list(EXPECTED_ENERGY_OUTPUTS) + list(EXPECTED_AUDIT_OUTPUTS)
     if require_hicp:
         required.extend(EXPECTED_HICP_OUTPUTS)
+    if require_headline:
+        required.extend(EXPECTED_HEADLINE_OUTPUTS)
     return [name for name in required if not (output_dir / name).is_file()]
 
 
@@ -349,8 +425,9 @@ def run_dataset_build(
     raw_path: str | Path | None = None,
     builder_path: str | Path | None = None,
     build_vintage: str | None = None,
-    overwrite: bool = True,
+    overwrite: bool = False,
     require_hicp: bool = True,
+    require_headline: bool = True,
     hicp_discovery: bool = False,
     progress_callback: Callable[[int, str, str], None] | None = None,
 ) -> dict[str, Any]:
@@ -390,7 +467,9 @@ def run_dataset_build(
             progress_callback(
                 15,
                 "Building datasets",
-                f"Running {builder.name} · HICP inputs {'required' if require_hicp else 'optional'}.",
+                f"Running {builder.name} · HICP "
+                f"{'required' if require_hicp else 'optional'} · Headline "
+                f"{'required' if require_headline else 'optional'}.",
             )
         try:
             with redirect_stdout(stdout), redirect_stderr(stderr):
@@ -404,6 +483,7 @@ def run_dataset_build(
                     max_tax_carry_months=12,
                     hicp_discovery=bool(hicp_discovery),
                     require_hicp=bool(require_hicp),
+                    require_headline=bool(require_headline),
                 )
         except Exception as exc:
             log = (stdout.getvalue() + "\n" + stderr.getvalue()).strip()
@@ -419,7 +499,11 @@ def run_dataset_build(
         effective_vintage = str(manifest["build_vintage"])
         output_dir = output_root / effective_vintage
 
-    missing = _validate_outputs(output_dir, require_hicp=require_hicp)
+    missing = _validate_outputs(
+        output_dir,
+        require_hicp=require_hicp,
+        require_headline=require_headline,
+    )
     if missing:
         raise DatasetBuildError(
             "Builder returned without the complete production output contract. "
@@ -430,7 +514,8 @@ def run_dataset_build(
         progress_callback(
             90,
             "Validating outputs",
-            "Processed Energy datasets, HICP sidecars and audit manifest found.",
+            "Processed Energy datasets, complete HICP aggregation lineage, "
+            "joint Headline inputs and audit manifest found.",
         )
 
     raw_hash = _sha256(raw)
@@ -442,6 +527,11 @@ def run_dataset_build(
     hicp_files = {
         name: str((output_dir / name).resolve())
         for name in EXPECTED_HICP_OUTPUTS
+        if (output_dir / name).is_file()
+    }
+    headline_files = {
+        name: str((output_dir / name).resolve())
+        for name in EXPECTED_HEADLINE_OUTPUTS
         if (output_dir / name).is_file()
     }
 
@@ -459,8 +549,10 @@ def run_dataset_build(
         ).astimezone().isoformat(timespec="seconds"),
         "overwrite": bool(overwrite),
         "require_hicp": bool(require_hicp),
+        "require_headline": bool(require_headline),
         "model_files": model_files,
         "hicp_files": hicp_files,
+        "headline_files": headline_files,
         "manifest_path": str(manifest_path.resolve()),
         "manifest": manifest,
         "log": log,
@@ -472,7 +564,8 @@ def run_dataset_build(
         progress_callback(
             100,
             "Processed vintage ready",
-            f"Vintage {effective_vintage} is ready for the seven-model Energy suite.",
+            f"Vintage {effective_vintage} is ready for the seven-model Energy suite "
+            "and the joint Headline BVAR.",
         )
     return payload
 
@@ -481,6 +574,7 @@ __all__ = [
     "DatasetBuildError",
     "EXPECTED_ENERGY_OUTPUTS",
     "EXPECTED_HICP_OUTPUTS",
+    "EXPECTED_HEADLINE_OUTPUTS",
     "dataset_build_lock_state",
     "default_build_vintage",
     "discover_dataset_builder",

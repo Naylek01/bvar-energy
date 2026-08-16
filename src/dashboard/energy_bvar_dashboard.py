@@ -4,8 +4,9 @@ Dashboard foundation
 ---------------------
 * persistent URL routing;
 * central context store: vintage / model_id / run_id / forecast_name / draw_mode;
-* SQLite-backed selectors with promoted-run awareness;
-* exactly one ``display_v1.parquet`` read when the selected run changes;
+* one immutable registry/result snapshot, refreshed only by explicit user action;
+* SQLite-backed selectors resolved from the frozen snapshot;
+* display artefacts loaded once per snapshot/run and reused from server memory;
 * Forecast page driven exclusively by the in-memory display store;
 * 68%, 90%, or combined posterior fans with ``uirevision``;
 * observed / nowcast / forecast segmentation and a compact values table;
@@ -24,13 +25,12 @@ import os
 import re
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from io import StringIO
 import socket
 import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import diskcache
 import numpy as np
@@ -51,6 +51,30 @@ from dash import (
     no_update,
 )
 from dash.exceptions import PreventUpdate
+
+from dashboard_snapshot_cache import (
+    clear_all as snapshot_clear_all,
+    frame_from_store as snapshot_frame_from_store,
+    get as snapshot_get,
+    get_or_build as snapshot_get_or_build,
+    put as snapshot_put,
+    put_frame as snapshot_put_frame,
+)
+
+from inflation_table_contract import (  # noqa: E402
+    DUAL_IMPACT_COLUMNS,
+    FORECAST_COLUMNS,
+    HD_COLUMNS,
+    IRF_COLUMNS,
+    PAIRED_EFFECT_COLUMNS,
+    dual_impact_records,
+    forecast_summary_records,
+    paired_effect_records,
+    readable_table,
+    structural_fevd_table,
+    structural_hd_records,
+    structural_irf_records,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -81,9 +105,38 @@ if not MODEL_DIR.is_dir():
 if str(MODEL_DIR) not in sys.path:
     sys.path.insert(0, str(MODEL_DIR))
 
+# ---------------------------------------------------------------------------
+# Optional Economic Data feature boundary
+# ---------------------------------------------------------------------------
+#
+# The feature is deliberately isolated from Energy / Headline / Core.  Setting
+# DASH_ENABLE_ECONOMIC_DATA=0 disables it without importing its package.  If the
+# package directory has been physically removed, the dashboard also degrades
+# cleanly to the core application.
+_ECONOMIC_DATA_REQUESTED = os.getenv(
+    "DASH_ENABLE_ECONOMIC_DATA", "1"
+).strip().lower() not in {"0", "false", "no", "off"}
+
+ECONOMIC_DATA_ENABLED = False
+_economic_data_page = None
+_register_economic_data_callbacks = None
+
+if _ECONOMIC_DATA_REQUESTED:
+    try:
+        from economic_data import (  # noqa: E402
+            economic_data_page as _economic_data_page,
+            register_callbacks as _register_economic_data_callbacks,
+        )
+        ECONOMIC_DATA_ENABLED = True
+    except ModuleNotFoundError as exc:
+        if not str(exc.name or "").startswith("economic_data"):
+            raise
+        print(
+            "Economic Data feature package not found; "
+            "continuing without /economic-data."
+        )
+
 from energy_bvar_dashboard_aggregate import (  # noqa: E402
-    aggregate_contribution_figure,
-    aggregate_diagnostics_table,
     aggregate_fan_figure,
     aggregate_kpis,
     aggregate_metric_options,
@@ -95,11 +148,19 @@ from energy_bvar_dashboard_aggregate import (  # noqa: E402
     empty_aggregate_figure,
 )
 from energy_bvar_dashboard_aggregate_ext import (  # noqa: E402
-    adapt_yaxis_to_visible_window,
     aggregate_contribution_timeline_figure,
     aggregate_provenance_table_v2,
     build_historical_contribution_frame,
     tidy_aggregate_figure,
+)
+from energy_bvar_tax_decomposition import (  # noqa: E402
+    COMPONENTS as TAX_COMPONENTS,
+    COMPONENT_LABELS as TAX_COMPONENT_LABELS,
+    build_tax_contribution_decomposition,
+    horizon_options as tax_horizon_options,
+    tax_contribution_figure,
+    tax_matrix_period_title,
+    tax_matrix_records,
 )
 from energy_bvar_dashboard_diagnostics import (  # noqa: E402
     component_diagnostic_summary,
@@ -111,7 +172,6 @@ from energy_bvar_dashboard_diagnostics import (  # noqa: E402
     stability_table,
 )
 from energy_bvar_dashboard_dataset import (  # noqa: E402
-    DatasetBuildError,
     dataset_build_lock_state,
     inspect_dataset_build_environment,
     run_dataset_build,
@@ -124,17 +184,21 @@ from energy_bvar_dashboard_structural import (  # noqa: E402
     MAX_HORIZON as STRUCTURAL_MAX_HORIZON,
     MAX_STRUCTURAL_DRAWS,
     StructuralDashboardError,
-    compute_structural_v1,
+    compute_structural_volatility_v1,
+    compute_structural_irf_fevd_v1,
+    compute_structural_hd_v1,
     fevd_figure,
     historical_decomposition_figure,
     irf_figure,
     resolve_run_directory as resolve_structural_run_directory,
     structural_run_contract,
-    volatility_history_figure,
+    reference_regime_date,
+    reference_volatility_snapshot,
+    volatility_sparkline_figure,
+    relative_volatility_state_figure,
 )
 from energy_bvar_dashboard_conditional import (  # noqa: E402
     CONDITIONAL_CONTRACT_VERSION,
-    ConditionalScenarioError,
     clear_conditional_set,
     compute_conditional_scenario,
     conditional_aggregate_contract,
@@ -146,11 +210,9 @@ from energy_bvar_dashboard_conditional import (  # noqa: E402
     conditional_path_figure,
     conditional_set_components,
     conditional_set_payload,
-    conditional_set_signature,
     conditional_set_summary,
     conditional_target_figure,
     empty_conditional_figure,
-    empty_conditional_set,
     remove_conditional_component,
     scenario_marginal_impact_figure,
     upsert_conditional_component,
@@ -163,6 +225,7 @@ from energy_bvar_dashboard_scenarios import (  # noqa: E402
     scenario_kpis,
     scenario_main_figure,
     scenario_payload,
+    scenario_frames,
     scenario_set_components,
     scenario_set_payload,
     scenario_set_signature,
@@ -177,10 +240,14 @@ from energy_bvar_component_hicp import (  # noqa: E402
     component_tax_scenario_contract,
 )
 from energy_bvar_aggregate_pipeline import run_aggregate  # noqa: E402
+from headline_bvar_conditional import (  # noqa: E402
+    ENERGY_BRIDGE_CONTRACT_VERSION,
+    energy_outcome_headline_bridge,
+)
 from energy_bvar_fitted import (  # noqa: E402
     load_energy_aggregate_fitted,
 )
-from energy_bvar_display import (  # noqa: E402
+from inflation_bvar_display import (  # noqa: E402
     DISPLAY_FILENAME,
     build_aggregate_display,
     build_component_display,
@@ -189,7 +256,6 @@ from energy_bvar_display import (  # noqa: E402
 )
 from energy_bvar_pipeline import (  # noqa: E402
     CANONICAL_MODEL_IDS,
-    available_vintages,
     build_panel,
     model_spec,
     planned_run_metadata,
@@ -198,7 +264,11 @@ from energy_bvar_pipeline import (  # noqa: E402
     vintage_coverage,
 )
 from energy_bvar_model import BVARSVOPriorConfig, SamplerConfig  # noqa: E402
-from energy_bvar_registry import (  # noqa: E402
+from headline_bvar_pipeline import (  # noqa: E402
+    available_vintages as headline_available_vintages,
+    build_inputs as build_headline_inputs,
+)
+from inflation_bvar_registry import (  # noqa: E402
     default_registry_path,
     init_registry,
     list_aggregates,
@@ -211,6 +281,49 @@ from energy_bvar_registry import (  # noqa: E402
     set_run_status,
 )
 
+from inflation_dashboard_shell import (  # noqa: E402
+    HEADLINE_MODEL_ID,
+    domain_from_path,
+    model_label,
+    models_for_domain,
+)
+
+# HEADLINE DASHBOARD SLICE 2
+from headline_bvar_dashboard import (  # noqa: E402
+    root_diagnostic_records,
+    mcmc_diagnostic_records,
+    validation_diagnostic_records,
+    stability_diagnostic_kpis,
+)
+from headline_bvar_dashboard_structural import (  # noqa: E402
+    headline_structural_page,
+    register_headline_structural_callbacks,
+)
+
+# HEADLINE DASHBOARD SLICE 3
+# HEADLINE DASHBOARD SLICE 4
+# HEADLINE DASHBOARD SLICE 6
+from headline_dashboard_slice6 import (  # noqa: E402
+    headline_scenarios_page,
+    register_headline_slice6_callbacks,
+)
+
+from headline_dashboard_slice5 import (  # noqa: E402
+    headline_estimation_v2_page,
+    headline_forecast_v2_page,
+    register_headline_slice5_callbacks,
+)
+from headline_core_dashboard import (  # noqa: E402
+    core_forecast_page,
+    core_scenarios_page,
+    register_core_dashboard_callbacks,
+)
+from inflation_overview_dashboard import (  # noqa: E402
+    overview_page,
+    register_overview_callbacks,
+)
+
+# HEADLINE DASHBOARD SLICE 5
 RESULTS_ROOT = Path(
     os.getenv("ENERGY_BVAR_RESULTS_ROOT", str(PROJECT_ROOT / "results"))
 ).expanduser().resolve()
@@ -707,6 +820,21 @@ def _planned_run_state(
     }
 
 
+def _component_run_reusable(state: Mapping[str, Any]) -> bool:
+    """True only when the exact planned run has every production artefact.
+
+    A saved posterior + raw forecast is not sufficient for Energy production:
+    the component HICP bridge must also be present because the aggregate and
+    scenarios consume that store. Display parquet is deliberately excluded
+    because it is cheap and can be rematerialised without Gibbs.
+    """
+    return bool(
+        state.get("has_draws")
+        and state.get("has_forecast")
+        and state.get("has_hicp")
+    )
+
+
 def _config_differs_from_baseline(
     model_id: str,
     selected_model_id: str,
@@ -731,23 +859,88 @@ def _config_differs_from_baseline(
 # ---------------------------------------------------------------------------
 
 
+_ACTIVE_REGISTRY_SNAPSHOT: dict[str, Any] = {
+    "snapshot_id": None,
+    "forecasts": pd.DataFrame(),
+    "runs": pd.DataFrame(),
+    "aggregates": pd.DataFrame(),
+    "production_inventory": [],
+}
+
+
+def _registry_table(name: str) -> pd.DataFrame:
+    frame = _ACTIVE_REGISTRY_SNAPSHOT.get(str(name))
+    return frame if isinstance(frame, pd.DataFrame) else pd.DataFrame()
+
+
+def _registry_snapshot_id() -> str:
+    return str(_ACTIVE_REGISTRY_SNAPSHOT.get("snapshot_id") or "bootstrap")
+
+
+def _frozen_production_inventory() -> list[dict]:
+    return [
+        dict(item)
+        for item in (_ACTIVE_REGISTRY_SNAPSHOT.get("production_inventory") or [])
+    ]
+
+
 def _scan_registry() -> dict[str, Any]:
+    """Build the immutable base snapshot at startup or explicit refresh."""
+    global _ACTIVE_REGISTRY_SNAPSHOT
     try:
-        report = scan_results(results_root=RESULTS_ROOT, registry_path=REGISTRY_PATH)
+        report = scan_results(
+            results_root=RESULTS_ROOT,
+            registry_path=REGISTRY_PATH,
+        )
+        forecasts = list_forecasts(
+            REGISTRY_PATH,
+            valid_only=True,
+            present_only=True,
+        ).copy()
+        runs = list_runs(
+            REGISTRY_PATH,
+            present_only=True,
+        ).copy()
+        aggregates = list_aggregates(
+            REGISTRY_PATH,
+            present_only=True,
+        ).copy()
+        production_inventory = _production_vintage_inventory()
+        snapshot_id = pd.Timestamp.utcnow().isoformat()
+
+        snapshot_clear_all()
+        snapshot_put("registry_table", "forecasts", forecasts)
+        snapshot_put("registry_table", "runs", runs)
+        snapshot_put("registry_table", "aggregates", aggregates)
+        snapshot_put(
+            "production_inventory",
+            "active",
+            [dict(item) for item in production_inventory],
+        )
+        _ACTIVE_REGISTRY_SNAPSHOT = {
+            "snapshot_id": snapshot_id,
+            "forecasts": forecasts,
+            "runs": runs,
+            "aggregates": aggregates,
+            "production_inventory": production_inventory,
+        }
         return {
             "ok": True,
-            "revision": pd.Timestamp.utcnow().isoformat(),
+            "snapshot_id": snapshot_id,
+            "revision": snapshot_id,
             "message": (
                 f"{report.component_runs_seen} runs · {report.forecasts_seen} forecasts · "
-                f"{report.aggregates_seen} aggregates"
+                f"{report.aggregates_seen} aggregates · snapshot frozen"
             ),
             "unexpected": list(report.unexpected_directories),
         }
-    except Exception as exc:  # surfaced in the UI, not swallowed
+    except Exception as exc:
+        previous = _registry_snapshot_id()
         return {
             "ok": False,
-            "revision": pd.Timestamp.utcnow().isoformat(),
-            "message": f"Registry scan failed: {exc}",
+            "snapshot_id": previous,
+            "revision": previous,
+            "message": f"Registry refresh failed; previous snapshot kept: {exc}",
             "unexpected": [],
         }
 
@@ -757,12 +950,7 @@ def _json_frame(frame: pd.DataFrame) -> str:
 
 
 def _frame_from_store(store: dict | None) -> pd.DataFrame:
-    if not store or not store.get("frame_json"):
-        return pd.DataFrame()
-    frame = pd.read_json(StringIO(store["frame_json"]), orient="split")
-    if "date" in frame:
-        frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
-    return frame
+    return snapshot_frame_from_store(store)
 
 
 def _short_run(run_id: str) -> str:
@@ -844,7 +1032,7 @@ def _anchor_fan_line(block: pd.DataFrame, date, value) -> pd.DataFrame:
         return block
     anchor = {column: np.nan for column in block.columns}
     anchor["date"] = pd.Timestamp(date)
-    for column in ("q05", "q16", "q50", "q84", "q95"):
+    for column in ("value", "q05", "q16", "q50", "q84", "q95"):
         if column in block.columns:
             anchor[column] = float(value)
     return pd.concat([pd.DataFrame([anchor]), block], ignore_index=True).sort_values("date")
@@ -892,19 +1080,19 @@ def forecast_figure(
     if not now_line.empty:
         fig.add_trace(
             go.Scatter(
-                x=now_line["date"], y=now_line["q50"], mode="lines", name="Nowcast median",
+                x=now_line["date"], y=now_line["value"], mode="lines", name="Nowcast posterior mean",
                 line={"width": 2.4, "color": now_color},
                 hovertemplate="%{x|%Y-%m-%d}<br>Nowcast: %{y:.3f}<extra></extra>",
             )
         )
         anchor_date = pd.Timestamp(now_line["date"].iloc[-1])
-        anchor_value = float(now_line["q50"].iloc[-1])
+        anchor_value = float(now_line["value"].iloc[-1])
 
     fc_line = _anchor_fan_line(forecast, anchor_date, anchor_value)
     if not fc_line.empty:
         fig.add_trace(
             go.Scatter(
-                x=fc_line["date"], y=fc_line["q50"], mode="lines", name="Forecast median",
+                x=fc_line["date"], y=fc_line["value"], mode="lines", name="Forecast posterior mean",
                 line={"width": 2.4, "dash": "dash", "color": fc_color},
                 hovertemplate="%{x|%Y-%m-%d}<br>Forecast: %{y:.3f}<extra></extra>",
             )
@@ -934,13 +1122,13 @@ def forecast_figure(
 
     fig.update_layout(
         template="plotly_white",
-        margin={"l": 54, "r": 24, "t": 54, "b": 42},
+        margin={"l": 54, "r": 24, "t": 82, "b": 42},
         height=520,
         title={"text": label, "x": 0.01, "xanchor": "left", "font": {"size": 18, "color": "#111827"}},
         font={"family": "Inter, Segoe UI, sans-serif", "color": "#374151", "size": 12},
         xaxis_title=None, yaxis_title=unit, hovermode="x unified", dragmode="pan",
         hoverlabel={"bgcolor": "white", "bordercolor": "#e5e7eb", "font": {"color": "#111827"}},
-        legend={"orientation": "h", "y": 1.08, "x": 1, "xanchor": "right", "font": {"size": 11}},
+        legend={"orientation": "h", "y": 1.13, "x": 1, "xanchor": "right", "font": {"size": 11}},
         uirevision=f"{context.get('model_id')}::{series}::{metric}",
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
     )
@@ -1092,11 +1280,18 @@ def forecast_page() -> html.Div:
             html.Div(
                 [
                     _stat_card("Latest observed", "stat-observed", "stat-observed-date"),
-                    _stat_card("First future median", "stat-first", "stat-first-date"),
-                    _stat_card("Terminal median", "stat-terminal", "stat-terminal-date"),
+                    _stat_card("First future mean", "stat-first", "stat-first-date"),
+                    _stat_card("Terminal mean", "stat-terminal", "stat-terminal-date"),
                     _stat_card("Forecast horizon", "stat-horizon", "stat-horizon-unit"),
                 ],
                 className="stats-grid",
+            ),
+            html.Div(
+                [
+                    html.Div([html.Div("Key results", className="eyebrow"), html.H3("Readable outlook", className="panel-title"), html.P("M+1 / M+2 / M+3 are prioritised; M+6 / M+12 appear only when the saved path reaches them. Central forecasts are posterior means.", className="panel-subtitle")], className="panel-heading"),
+                    readable_table("forecast-summary-table", FORECAST_COLUMNS, page_size=7),
+                ],
+                className="panel table-panel",
             ),
             html.Div(
                 [
@@ -1134,6 +1329,7 @@ def forecast_page() -> html.Div:
                             {"name": "Segment", "id": "segment"},
                             {"name": "q05", "id": "q05", "type": "numeric"},
                             {"name": "q16", "id": "q16", "type": "numeric"},
+                            {"name": "Mean", "id": "value", "type": "numeric"},
                             {"name": "Median", "id": "q50", "type": "numeric"},
                             {"name": "q84", "id": "q84", "type": "numeric"},
                             {"name": "q95", "id": "q95", "type": "numeric"},
@@ -1219,11 +1415,18 @@ def aggregate_page() -> html.Div:
             html.Div(
                 [
                     _stat_card("Latest observed", "agg-observed", "agg-observed-date"),
-                    _stat_card("First future median", "agg-first", "agg-first-date"),
-                    _stat_card("Terminal median", "agg-terminal", "agg-terminal-date"),
+                    _stat_card("First future mean", "agg-first", "agg-first-date"),
+                    _stat_card("Terminal mean", "agg-terminal", "agg-terminal-date"),
                     _stat_card("Posterior draws", "agg-draws", "agg-draws-unit"),
                 ],
                 className="stats-grid",
+            ),
+            html.Div(
+                [
+                    html.Div([html.Div("Key results", className="eyebrow"), html.H3("HICP Energy outlook", className="panel-title"), html.P("Posterior mean and uncertainty at the priority month-ahead horizons.", className="panel-subtitle")], className="panel-heading"),
+                    readable_table("agg-summary-table", FORECAST_COLUMNS, page_size=7),
+                ],
+                className="panel table-panel",
             ),
             html.Div(
                 [dcc.Loading(dcc.Graph(id="agg-graph", config=_AGG_GRAPH_CONFIG, style={"height": "680px"}), type="circle")],
@@ -1313,7 +1516,7 @@ def aggregate_page() -> html.Div:
                                     html.H3("HICP Energy contribution decomposition", className="panel-title"),
                                     html.P(
                                         "Observed historical contributions use the exact Laspeyres-term identity; "
-                                        "the model path uses saved draw-wise posterior contribution medians.",
+                                        "the model path uses saved draw-wise posterior contribution means.",
                                         className="panel-subtitle",
                                     ),
                                 ],
@@ -1363,6 +1566,141 @@ def aggregate_page() -> html.Div:
                         },
                     ),
                     dcc.Loading(dcc.Graph(id="agg-contrib", config=_AGG_GRAPH_CONFIG), type="circle"),
+                ],
+                className="panel chart-panel",
+            ),
+            html.Div(
+                [
+                    html.Div(
+                        [
+                            html.Div(
+                                [
+                                    html.H3("Tax-layer contribution decomposition", className="panel-title"),
+                                    html.P(
+                                        "Contributions in percentage points to year-on-year HICP Energy inflation. "
+                                        "VAT is the final legal layer, so VAT-on-excise is included in VAT. "
+                                        "A tax layer is split only when the bridge is identified in both the selected "
+                                        "month and the same month one year earlier; otherwise the exact contribution "
+                                        "remains Unsplit.",
+                                        className="panel-subtitle",
+                                    ),
+                                ],
+                                className="panel-heading",
+                            ),
+                            html.Div(
+                                [
+                                    html.Div(
+                                        [
+                                            html.Span("Component", className="control-label"),
+                                            dcc.Dropdown(
+                                                id="agg-tax-component",
+                                                options=[
+                                                    {"label": "All HICP Energy", "value": "all"},
+                                                    *[
+                                                        {
+                                                            "label": TAX_COMPONENT_LABELS.get(name, name),
+                                                            "value": name,
+                                                        }
+                                                        for name in TAX_COMPONENTS
+                                                    ],
+                                                ],
+                                                value="all",
+                                                clearable=False,
+                                                searchable=False,
+                                                style={"minWidth": "190px"},
+                                            ),
+                                        ],
+                                        className="control-block",
+                                    ),
+                                    html.Div(
+                                        [
+                                            html.Span("Display", className="control-label"),
+                                            dcc.RadioItems(
+                                                id="agg-tax-mode",
+                                                options=[
+                                                    {"label": "Stacked bars", "value": "bars"},
+                                                    {"label": "Lines", "value": "lines"},
+                                                ],
+                                                value="bars",
+                                                inline=True,
+                                                className="fan-radio",
+                                            ),
+                                        ],
+                                        className="control-block",
+                                    ),
+                                    html.Div(
+                                        [
+                                            html.Span("Table period", className="control-label"),
+                                            dcc.RadioItems(
+                                                id="agg-tax-horizon",
+                                                options=[],
+                                                value=None,
+                                                inline=True,
+                                                className="fan-radio",
+                                            ),
+                                        ],
+                                        className="control-block",
+                                    ),
+                                ],
+                                className="chart-controls",
+                            ),
+                        ],
+                        style={
+                            "display": "flex",
+                            "justifyContent": "space-between",
+                            "gap": "20px",
+                            "flexWrap": "wrap",
+                            "alignItems": "flex-start",
+                        },
+                    ),
+                    html.Div(id="agg-tax-note", className="selection-banner"),
+                    dcc.Loading(
+                        dcc.Graph(id="agg-tax-contrib", config=_AGG_GRAPH_CONFIG),
+                        type="circle",
+                    ),
+                    html.H4(
+                        id="agg-tax-table-title",
+                        children="Tax-layer contribution — select a table period",
+                        style={
+                            "margin": "12px 0 6px",
+                            "fontSize": "14px",
+                            "fontWeight": "700",
+                            "color": "#111827",
+                        },
+                    ),
+                    dash_table.DataTable(
+                        id="agg-tax-table",
+                        columns=[
+                            {"name": "Component", "id": "Component"},
+                            {"name": "Pre-tax / market", "id": "Pre-tax / market"},
+                            {"name": "Excise", "id": "Excise"},
+                            {"name": "VAT", "id": "VAT"},
+                            {"name": "Unsplit", "id": "Unsplit"},
+                            {"name": "Tax total", "id": "Tax total"},
+                            {"name": "Total contribution", "id": "Total contribution"},
+                        ],
+                        data=[],
+                        page_size=8,
+                        style_as_list_view=True,
+                        style_cell={
+                            "fontFamily": "Inter, Segoe UI, sans-serif",
+                            "textAlign": "right",
+                            "padding": "8px 10px",
+                            "whiteSpace": "nowrap",
+                        },
+                        style_cell_conditional=[
+                            {
+                                "if": {"column_id": "Component"},
+                                "textAlign": "left",
+                                "fontWeight": "600",
+                            }
+                        ],
+                        style_header={
+                            "fontWeight": "650",
+                            "backgroundColor": "#F8FAFC",
+                            "borderBottom": "1px solid #CBD5E1",
+                        },
+                    ),
                 ],
                 className="panel chart-panel",
             ),
@@ -1744,6 +2082,13 @@ def scenario_page() -> html.Div:
             ),
             html.Div(
                 [
+                    html.Div([html.Div("Key scenario results", className="eyebrow"), html.H3("Conditional effect by horizon", className="panel-title"), html.P("Component and HICP Energy effects from the same paired conditional draws used by the charts.", className="panel-subtitle")], className="panel-heading"),
+                    readable_table("conditional-effect-table", DUAL_IMPACT_COLUMNS, page_size=7),
+                ],
+                className="panel table-panel",
+            ),
+            html.Div(
+                [
                     dcc.Loading(
                         dcc.Graph(
                             id="conditional-path-graph",
@@ -1843,6 +2188,7 @@ def scenario_page() -> html.Div:
                 className="panel",
             ),
             html.Div(id="scenario-support-note", className="selection-banner"),
+            html.Div(id="scenario-tax-preview", className="selection-banner"),
             html.Div(id="scenario-banner"),
             html.Div(
                 [
@@ -1880,6 +2226,13 @@ def scenario_page() -> html.Div:
                     ),
                 ],
                 className="stats-grid",
+            ),
+            html.Div(
+                [
+                    html.Div([html.Div("Key scenario results", className="eyebrow"), html.H3("Tax scenario effect by horizon", className="panel-title"), html.P("Legacy tax artefacts persist quantiles rather than a posterior mean; central values here are therefore the saved posterior medians.", className="panel-subtitle")], className="panel-heading"),
+                    readable_table("scenario-effect-table", PAIRED_EFFECT_COLUMNS, page_size=7),
+                ],
+                className="panel table-panel",
             ),
             html.Div(
                 [
@@ -1976,7 +2329,18 @@ def scenario_page() -> html.Div:
 
 
 def structural_page() -> html.Div:
-    """Recursive / Cholesky structural analysis from persisted Gibbs draws."""
+    """Recursive structural analysis with an explicit joint-SV reference state."""
+    badge_style = {
+        "display": "inline-flex", "alignItems": "center", "gap": "6px",
+        "padding": "6px 10px", "borderRadius": "999px",
+        "border": "1px solid #DCE3EC", "background": "#F8FAFC",
+        "fontSize": "12px", "fontWeight": 600, "color": "#334155",
+    }
+    effect_chip_style = {
+        "display": "inline-flex", "alignItems": "center", "padding": "7px 10px",
+        "borderRadius": "10px", "border": "1px solid #E2E8F0",
+        "background": "#FFFFFF", "fontSize": "12px", "fontWeight": 600,
+    }
     return html.Div(
         [
             html.Div(
@@ -1985,251 +2349,262 @@ def structural_page() -> html.Div:
                         [
                             html.H2("Structural analysis", className="page-title"),
                             html.P(
-                                "Impulse responses, forecast-error variance decomposition and exact "
-                                "historical decomposition from the selected saved posterior run. "
-                                "V1 uses recursive (Cholesky) identification only.",
+                                "Recursive structural analysis from the selected saved posterior. "
+                                "The reference date selects the full vector of structural stochastic "
+                                "variances Λₜ used by 1σ IRFs and FEVD; recursive historical decomposition "
+                                "uses the realised volatility path and is reference-date invariant.",
                                 className="page-subtitle",
                             ),
                         ]
                     ),
+                    html.Div(
+                        [
+                            html.Span("Recursive / Cholesky", style=badge_style),
+                            html.Span("Regular SV state", style=badge_style),
+                            html.Span("Outlier scale excluded from IRF / FEVD", style=badge_style),
+                        ],
+                        style={"display": "flex", "gap": "8px", "flexWrap": "wrap", "justifyContent": "flex-end"},
+                    ),
                 ],
                 className="page-heading-row",
             ),
-            html.Div(
-                id="structural-run-banner",
-                className="selection-banner",
-            ),
+            html.Div(id="structural-run-banner", className="selection-banner"),
+
+            # Compact computation controls.  The reference date itself lives in
+            # the dedicated joint-SV state panel below.
             html.Div(
                 [
                     html.Div(
                         [
                             html.Div(
                                 [
-                                    html.Label("Identification", className="control-label"),
-                                    dcc.Dropdown(
-                                        id="structural-identification",
-                                        options=[
-                                            {
-                                                "label": "Recursive / Cholesky",
-                                                "value": "recursive",
-                                            }
-                                        ],
-                                        value="recursive",
-                                        clearable=False,
-                                        disabled=True,
-                                        className="compact-dropdown",
-                                    ),
-                                ],
-                                className="control-block",
-                            ),
-                            html.Div(
-                                [
-                                    html.Label("Reference volatility date", className="control-label"),
-                                    dcc.Dropdown(
-                                        id="structural-reference-date",
-                                        options=[],
-                                        value=None,
-                                        clearable=False,
-                                        className="compact-dropdown wide-control",
-                                    ),
-                                ],
-                                className="control-block wide-control",
-                            ),
-                            html.Div(
-                                [
                                     html.Label("Horizon", className="control-label"),
                                     dcc.Input(
-                                        id="structural-horizon",
-                                        type="number",
-                                        min=1,
-                                        max=STRUCTURAL_MAX_HORIZON,
-                                        step=1,
+                                        id="structural-horizon", type="number", min=1,
+                                        max=STRUCTURAL_MAX_HORIZON, step=1,
                                         value=STRUCTURAL_DEFAULT_HORIZON,
                                         className="est-profile-name-input",
                                     ),
-                                ],
-                                className="control-block",
+                                ], className="control-block",
                             ),
                             html.Div(
                                 [
                                     html.Label("Posterior draws", className="control-label"),
                                     dcc.Input(
-                                        id="structural-draws",
-                                        type="number",
-                                        min=1,
-                                        max=MAX_STRUCTURAL_DRAWS,
-                                        step=1,
+                                        id="structural-draws", type="number", min=1,
+                                        max=MAX_STRUCTURAL_DRAWS, step=1,
                                         value=DEFAULT_STRUCTURAL_DRAWS,
                                         className="est-profile-name-input",
                                     ),
-                                ],
-                                className="control-block",
+                                ], className="control-block",
                             ),
                             html.Div(
                                 [
-                                    html.Label("Shock scaling", className="control-label"),
-                                    dcc.Dropdown(
+                                    html.Label("IRF shock definition", className="control-label"),
+                                    dcc.RadioItems(
                                         id="structural-shock-unit",
                                         options=[
-                                            {
-                                                "label": "Structural standard deviations",
-                                                "value": "structural_std",
-                                            },
-                                            {
-                                                "label": "Unit-level impact",
-                                                "value": "level",
-                                            },
+                                            {"label": "Standard deviation", "value": "structural_std"},
+                                            {"label": "Level impact", "value": "level"},
                                         ],
                                         value=DEFAULT_SHOCK_UNIT,
-                                        clearable=False,
-                                        className="compact-dropdown",
-                                    ),
-                                ],
-                                className="control-block",
-                            ),
-                            html.Div(
-                                [
-                                    html.Label("Shock intensity", className="control-label"),
-                                    dcc.RadioItems(
-                                        id="structural-shock-size",
-                                        options=[
-                                            {"label": "1", "value": 1},
-                                            {"label": "2", "value": 2},
-                                            {"label": "3", "value": 3},
-                                            {"label": "4", "value": 4},
-                                        ],
-                                        value=int(DEFAULT_SHOCK_SIZE),
                                         inline=True,
                                         className="fan-radio",
                                     ),
-                                ],
-                                className="control-block",
+                                ], className="control-block wide-control",
+                            ),
+                            html.Div(
+                                [
+                                    html.Label(
+                                        "Magnitude",
+                                        id="structural-shock-size-label",
+                                        className="control-label",
+                                    ),
+                                    html.Div(
+                                        [
+                                            dcc.Input(
+                                                id="structural-shock-size",
+                                                type="number",
+                                                min=1e-6,
+                                                step=0.1,
+                                                value=float(DEFAULT_SHOCK_SIZE),
+                                                className="est-profile-name-input",
+                                                style={"minWidth": "110px", "width": "100%"},
+                                            ),
+                                            html.Span(
+                                                "σ",
+                                                id="structural-shock-size-unit",
+                                                style={
+                                                    "fontSize": "12px",
+                                                    "fontWeight": 600,
+                                                    "whiteSpace": "nowrap",
+                                                    "color": "#6B6E72",
+                                                },
+                                            ),
+                                        ],
+                                        style={
+                                            "display": "flex",
+                                            "alignItems": "center",
+                                            "gap": "8px",
+                                        },
+                                    ),
+                                ], className="control-block",
                             ),
                         ],
                         style={
                             "display": "grid",
-                            "gridTemplateColumns": "minmax(180px,0.8fr) minmax(240px,1.2fr) minmax(110px,0.45fr) minmax(130px,0.5fr) minmax(220px,0.9fr) minmax(180px,0.75fr)",
-                            "gap": "14px",
-                            "alignItems": "end",
+                            "gridTemplateColumns": "minmax(110px,.45fr) minmax(130px,.5fr) minmax(250px,1fr) minmax(180px,.75fr)",
+                            "gap": "14px", "alignItems": "end",
                         },
+                    ),
+                    html.Div(
+                        id="structural-shock-interpretation",
+                        className="selection-banner",
+                        style={"marginTop": "12px", "marginBottom": "2px"},
                     ),
                     html.Div(
                         [
                             dcc.Checklist(
                                 id="structural-hd-options",
-                                options=[
-                                    {
-                                        "label": "Split realised outlier amplification in historical decomposition",
-                                        "value": "split_outliers",
-                                    }
-                                ],
-                                value=["split_outliers"],
-                                className="estimation-checklist",
+                                options=[{
+                                    "label": "Split realised outlier amplification in historical decomposition",
+                                    "value": "split_outliers",
+                                }],
+                                value=["split_outliers"], className="estimation-checklist",
                             ),
                             html.Div(
                                 [
                                     html.Button(
-                                        "Recompute structural analysis",
-                                        id="structural-run",
-                                        n_clicks=0,
-                                        className="refresh-button estimation-run-all-button",
+                                        "Refresh structural analysis", id="structural-run",
+                                        n_clicks=0, className="refresh-button estimation-run-all-button",
                                     ),
                                     html.Button(
-                                        "Cancel",
-                                        id="structural-cancel",
-                                        n_clicks=0,
-                                        disabled=True,
-                                        className="estimation-cancel-button",
+                                        "Cancel", id="structural-cancel", n_clicks=0,
+                                        disabled=True, className="estimation-cancel-button",
                                     ),
-                                ],
-                                className="estimation-actions",
+                                ], className="estimation-actions",
                             ),
-                        ],
-                        className="estimation-run-row",
+                        ], className="estimation-run-row",
                     ),
                     html.Div(
                         [
-                            html.Progress(
-                                id="structural-progress",
-                                value=0,
-                                max=100,
-                                className="estimation-progress",
-                            ),
+                            html.Progress(id="structural-progress", value=0, max=100, className="estimation-progress"),
                             html.Div(
                                 [
+                                    html.Div("Idle", id="structural-phase", className="estimation-phase"),
                                     html.Div(
-                                        "Idle",
-                                        id="structural-phase",
-                                        className="estimation-phase",
+                                        "Opening Structural automatically loads the default volatility, IRF, FEVD and HD once. Results remain frozen until a structural parameter changes or Refresh structural analysis is pressed.",
+                                        id="structural-progress-detail", className="estimation-progress-detail",
                                     ),
-                                    html.Div(
-                                        "The default analysis is computed automatically from the selected saved run.",
-                                        id="structural-progress-detail",
-                                        className="estimation-progress-detail",
-                                    ),
-                                ],
-                                className="estimation-progress-text",
+                                ], className="estimation-progress-text",
                             ),
-                        ],
-                        className="estimation-progress-wrap",
+                        ], className="estimation-progress-wrap",
                     ),
                 ],
                 className="panel",
             ),
+
+            # Joint structural-volatility state selector.
             html.Div(
                 [
                     html.Div(
                         [
                             html.Div(
                                 [
-                                    html.H3("Reference volatility history", className="panel-title"),
+                                    html.H3("Reference structural-volatility state", className="panel-title"),
                                     html.P(
-                                        "Use this history to choose the volatility state used to normalise IRFs and FEVD. "
-                                        "Persistent SV is √λ; total scale is o√λ and therefore includes transient outlier "
-                                        "amplification. Hover for exact values, zoom/pan horizontally, then choose the "
-                                        "reference date above and recompute.",
+                                        "There is no single BVAR volatility parameter. Each structural shock has its own "
+                                        "λⱼ,ₜ. A reference date selects all of them simultaneously. The cards show √λ in "
+                                        "native units and a scale-free ratio to each series' own sample median.",
                                         className="panel-subtitle",
                                     ),
                                 ]
                             ),
                             html.Div(
                                 [
-                                    html.Label("Volatility series", className="control-label"),
+                                    html.Label("Exact reference date", className="control-label"),
                                     dcc.Dropdown(
-                                        id="structural-volatility-variable",
-                                        options=[],
-                                        value=None,
-                                        clearable=False,
-                                        className="compact-dropdown wide-control",
+                                        id="structural-reference-date", options=[], value=None,
+                                        clearable=False, className="compact-dropdown wide-control",
                                     ),
+                                ], className="control-block wide-control",
+                            ),
+                        ], className="panel-heading",
+                    ),
+                    html.Div(
+                        [
+                            html.Div("Regime", className="control-label"),
+                            dcc.RadioItems(
+                                id="structural-reference-regime",
+                                options=[
+                                    {"label": "Latest", "value": "latest"},
+                                    {"label": "Calm · P10", "value": "p10"},
+                                    {"label": "Median · P50", "value": "p50"},
+                                    {"label": "Stressed · P90", "value": "p90"},
+                                    {"label": "Peak 2022", "value": "peak_2022"},
                                 ],
-                                className="control-block",
+                                value="latest", inline=True, className="fan-radio",
                             ),
                         ],
-                        className="panel-heading",
+                        style={"padding": "0 2px 12px 2px"},
                     ),
-                    dcc.Loading(
-                        dcc.Graph(
-                            id="structural-volatility-graph",
-                            config=_AGG_GRAPH_CONFIG if "_AGG_GRAPH_CONFIG" in globals() else _GRAPH_CONFIG,
-                            style={"height": "520px"},
-                        ),
-                        type="circle",
+                    html.Div(
+                        id="structural-reference-status",
+                        style={"marginBottom": "12px"},
+                    ),
+                    html.Div(
+                        id="structural-volatility-cards",
+                        style={
+                            "display": "grid",
+                            "gridTemplateColumns": "repeat(auto-fit, minmax(260px, 1fr))",
+                            "gap": "12px",
+                        },
+                    ),
+                    html.Div(
+                        [
+                            html.Div(
+                                [
+                                    html.Div("Relative structural-variance state", style={"fontWeight": 700, "fontSize": "13px"}),
+                                    html.Div(
+                                        "λⱼ,ₜ divided by that shock's own sample-median λⱼ. This is a dimensionless "
+                                        "state diagnostic, not a FEVD share.",
+                                        style={"fontSize": "11px", "color": "#64748B", "marginTop": "2px"},
+                                    ),
+                                ],
+                                style={"padding": "14px 14px 0 14px"},
+                            ),
+                            dcc.Graph(
+                                id="structural-volatility-relative-graph",
+                                config={"displayModeBar": False, "responsive": True},
+                            ),
+                        ],
+                        style={
+                            "marginTop": "14px", "border": "1px solid #E2E8F0",
+                            "borderRadius": "12px", "background": "#FBFCFE",
+                        },
+                    ),
+                    html.Div(
+                        [
+                            html.Div("What the selected date changes", style={"fontWeight": 700, "fontSize": "13px", "marginBottom": "8px"}),
+                            html.Div(id="structural-reference-effects", style={"display": "flex", "gap": "8px", "flexWrap": "wrap"}),
+                        ],
+                        style={"marginTop": "14px"},
                     ),
                 ],
                 className="panel chart-panel",
             ),
+
             html.Div(
                 [
                     _stat_card("Identification", "structural-stat-identification", "structural-stat-ordering"),
-                    _stat_card("Reference date", "structural-stat-reference", "structural-stat-frequency"),
+                    _stat_card("Computed reference", "structural-stat-reference", "structural-stat-frequency"),
                     _stat_card("Posterior draws", "structural-stat-draws", "structural-stat-draws-total"),
                     _stat_card("HD reconstruction", "structural-stat-hd-error", "structural-stat-hd-error-note"),
                     _stat_card("FEVD sum error", "structural-stat-fevd-error", "structural-stat-fevd-error-note"),
                     _stat_card("IRF shock scale", "structural-stat-shock-scale", "structural-stat-shock-scale-note"),
-                ],
-                className="stats-grid",
+                ], className="stats-grid",
             ),
+
             html.Div(
                 [
                     html.Div(
@@ -2238,88 +2613,26 @@ def structural_page() -> html.Div:
                                 [
                                     html.H3("Impulse responses", className="panel-title"),
                                     html.P(
-                                        "Regular structural shocks at the selected stochastic-volatility state. "
-                                        "Structural-SD mode applies 1–4 standard deviations. Unit-level mode rescales "
-                                        "each shock so the shocked variable moves by +1 to +4 units on impact. "
-                                        "The transient outlier multiplier is excluded from IRFs.",
+                                        "A 1σ IRF uses the selected shock's √λ at the computed reference date. "
+                                        "Unit-level IRFs are exactly invariant to that date because the impact normalisation "
+                                        "cancels the shock scale.",
                                         className="panel-subtitle",
                                     ),
                                 ]
                             ),
                             html.Div(
                                 [
-                                    html.Div(
-                                        [
-                                            html.Label("Shock", className="control-label"),
-                                            dcc.Dropdown(
-                                                id="structural-shock",
-                                                options=[],
-                                                clearable=False,
-                                                className="compact-dropdown wide-control",
-                                            ),
-                                        ],
-                                        className="control-block wide-control",
-                                    ),
-                                    html.Div(
-                                        [
-                                            html.Label("Response", className="control-label"),
-                                            dcc.Dropdown(
-                                                id="structural-response",
-                                                options=[],
-                                                clearable=False,
-                                                className="compact-dropdown wide-control",
-                                            ),
-                                        ],
-                                        className="control-block wide-control",
-                                    ),
-                                    html.Div(
-                                        [
-                                            html.Label("IRF object", className="control-label"),
-                                            dcc.RadioItems(
-                                                id="structural-irf-metric",
-                                                options=[
-                                                    {"label": "Cumulative level", "value": "cumulative"},
-                                                    {"label": "Period change", "value": "change"},
-                                                ],
-                                                value="cumulative",
-                                                inline=True,
-                                                className="fan-radio",
-                                            ),
-                                        ],
-                                        className="control-block",
-                                    ),
-                                    html.Div(
-                                        [
-                                            html.Label("Fan", className="control-label"),
-                                            dcc.RadioItems(
-                                                id="structural-irf-fan",
-                                                options=[
-                                                    {"label": "68%", "value": "68"},
-                                                    {"label": "90%", "value": "90"},
-                                                    {"label": "Both", "value": "both"},
-                                                ],
-                                                value="68",
-                                                inline=True,
-                                                className="fan-radio",
-                                            ),
-                                        ],
-                                        className="control-block",
-                                    ),
-                                ],
-                                className="chart-controls",
+                                    html.Div([html.Label("Shock", className="control-label"), dcc.Dropdown(id="structural-shock", options=[], clearable=False, className="compact-dropdown wide-control")], className="control-block wide-control"),
+                                    html.Div([html.Label("Response", className="control-label"), dcc.Dropdown(id="structural-response", options=[], clearable=False, className="compact-dropdown wide-control")], className="control-block wide-control"),
+                                    html.Div([html.Label("IRF object", className="control-label"), dcc.RadioItems(id="structural-irf-metric", options=[{"label": "Cumulative level", "value": "cumulative"}, {"label": "Period change", "value": "change"}], value="cumulative", inline=True, className="fan-radio")], className="control-block"),
+                                    html.Div([html.Label("Fan", className="control-label"), dcc.RadioItems(id="structural-irf-fan", options=[{"label": "68%", "value": "68"}, {"label": "90%", "value": "90"}, {"label": "Both", "value": "both"}], value="68", inline=True, className="fan-radio")], className="control-block"),
+                                ], className="chart-controls",
                             ),
-                        ],
-                        className="panel-heading",
+                        ], className="panel-heading",
                     ),
-                    dcc.Loading(
-                        dcc.Graph(
-                            id="structural-irf-graph",
-                            config=_AGG_GRAPH_CONFIG if "_AGG_GRAPH_CONFIG" in globals() else _GRAPH_CONFIG,
-                        ),
-                        type="circle",
-                    ),
-                ],
-                className="panel chart-panel",
+                    readable_table("structural-irf-table", IRF_COLUMNS, page_size=7),
+                    dcc.Loading(dcc.Graph(id="structural-irf-graph", config=_AGG_GRAPH_CONFIG if "_AGG_GRAPH_CONFIG" in globals() else _GRAPH_CONFIG), type="circle"),
+                ], className="panel chart-panel",
             ),
             html.Div(
                 [
@@ -2327,22 +2640,16 @@ def structural_page() -> html.Div:
                         [
                             html.H3("Forecast error variance decomposition", className="panel-title"),
                             html.P(
-                                "Posterior median share of the selected response's forecast-error variance "
-                                "at each horizon. Shares sum to 100% draw by draw.",
+                                "Posterior-median shares, shown as 100% stacked bars. The selected reference date changes "
+                                "FEVD through the joint relative structural-variance state; shares still depend on the full "
+                                "VAR dynamics and contemporaneous impact matrix.",
                                 className="panel-subtitle",
                             ),
-                        ],
-                        className="panel-heading",
+                        ], className="panel-heading",
                     ),
-                    dcc.Loading(
-                        dcc.Graph(
-                            id="structural-fevd-graph",
-                            config=_AGG_GRAPH_CONFIG if "_AGG_GRAPH_CONFIG" in globals() else _GRAPH_CONFIG,
-                        ),
-                        type="circle",
-                    ),
-                ],
-                className="panel chart-panel",
+                    readable_table("structural-fevd-table", [{"name":"Shock","id":"shock"}], page_size=12),
+                    dcc.Loading(dcc.Graph(id="structural-fevd-graph", config=_AGG_GRAPH_CONFIG if "_AGG_GRAPH_CONFIG" in globals() else _GRAPH_CONFIG), type="circle"),
+                ], className="panel chart-panel",
             ),
             html.Div(
                 [
@@ -2352,9 +2659,9 @@ def structural_page() -> html.Div:
                                 [
                                     html.H3("Historical decomposition", className="panel-title"),
                                     html.P(
-                                        "Posterior-mean structural contributions. The posterior mean is used "
-                                        "because it preserves the exact additive reconstruction identity; "
-                                        "component-wise posterior medians generally do not.",
+                                        "Posterior-mean structural contributions preserve the exact additive reconstruction. "
+                                        "Under recursive identification the selected reference date does not change the HD: "
+                                        "each historical observation uses its realised λₜ and outlier scale.",
                                         className="panel-subtitle",
                                     ),
                                 ]
@@ -2369,31 +2676,42 @@ def structural_page() -> html.Div:
                                             {"label": "Last 10 years", "value": 120},
                                             {"label": "Last 13 years", "value": 156},
                                             {"label": "Full sample", "value": -1},
-                                        ],
-                                        value=156,
-                                        clearable=False,
-                                        className="compact-dropdown",
+                                        ], value=156, clearable=False, className="compact-dropdown",
                                     ),
-                                ],
-                                className="control-block",
+                                    html.Div(
+                                        [
+                                            html.Button(
+                                                "Compute historical decomposition",
+                                                id="structural-hd-run",
+                                                n_clicks=0,
+                                                className="refresh-button",
+                                            ),
+                                            html.Button(
+                                                "Cancel",
+                                                id="structural-hd-cancel",
+                                                n_clicks=0,
+                                                disabled=True,
+                                                className="estimation-cancel-button",
+                                            ),
+                                        ],
+                                        style={"display": "flex", "gap": "8px", "marginTop": "8px"},
+                                    ),
+                                ], className="control-block",
                             ),
-                        ],
-                        className="panel-heading",
-                    ),
-                    dcc.Loading(
-                        dcc.Graph(
-                            id="structural-hd-graph",
-                            config=_AGG_GRAPH_CONFIG if "_AGG_GRAPH_CONFIG" in globals() else _GRAPH_CONFIG,
-                        ),
-                        type="circle",
+                        ], className="panel-heading",
                     ),
                     html.Div(
-                        "Structural ≠ scenario. This page asks what an identified innovation does. "
-                        "Observable commodity-path assumptions belong in Scenarios and will be extended separately.",
+                        "Checking HD cache…",
+                        id="structural-hd-status",
+                        className="selection-banner",
+                    ),
+                    readable_table("structural-hd-table", HD_COLUMNS, page_size=20),
+                    dcc.Loading(dcc.Graph(id="structural-hd-graph", config=_AGG_GRAPH_CONFIG if "_AGG_GRAPH_CONFIG" in globals() else _GRAPH_CONFIG), type="circle"),
+                    html.Div(
+                        "Structural ≠ scenario. This page asks what an identified innovation does. Observable commodity-path assumptions belong in Scenarios.",
                         className="estimation-required-note",
                     ),
-                ],
-                className="panel chart-panel",
+                ], className="panel chart-panel",
             ),
         ],
         className="page-body",
@@ -2401,72 +2719,710 @@ def structural_page() -> html.Div:
 
 
 
-def estimation_page() -> html.Div:
-    model_options = [
-        {"label": model_spec(model_id).label, "value": model_id}
-        for model_id in ENERGY_SUITE_MODEL_IDS
+# ---------------------------------------------------------------------------
+# Shared Data preparation / production-vintage page
+# ---------------------------------------------------------------------------
+
+
+def _interior_missing_cells(frame: pd.DataFrame) -> int:
+    """Count NaNs strictly between each series' first and last observation."""
+    if frame is None or frame.empty:
+        return 0
+    total = 0
+    for column in frame.columns:
+        series = frame[column]
+        valid = series.notna()
+        if not valid.any():
+            total += int(len(series))
+            continue
+        first = int(np.flatnonzero(valid.to_numpy())[0])
+        last = int(np.flatnonzero(valid.to_numpy())[-1])
+        total += int(series.iloc[first : last + 1].isna().sum())
+    return int(total)
+
+
+def _last_complete_date(frame: pd.DataFrame) -> pd.Timestamp | None:
+    if frame is None or frame.empty:
+        return None
+    complete = frame.notna().all(axis=1)
+    if not complete.any():
+        return None
+    return pd.Timestamp(frame.index[np.flatnonzero(complete.to_numpy())[-1]])
+
+
+def _calendar_ok(frame: pd.DataFrame, frequency: str) -> bool:
+    if frame is None or frame.empty or len(frame.index) < 2:
+        return bool(frame is not None and not frame.empty)
+    index = pd.DatetimeIndex(frame.index)
+    rule = "MS" if str(frequency).lower() == "monthly" else "W-MON"
+    expected = pd.date_range(index.min(), index.max(), freq=rule)
+    return bool(index.equals(expected))
+
+
+def _production_vintage_inventory() -> list[dict]:
+    """All processed vintages, annotated by Energy/Headline readiness."""
+    processed = PROJECT_ROOT / "data" / "processed"
+    if not processed.is_dir():
+        return []
+    directories = sorted(
+        (path for path in processed.iterdir() if path.is_dir()),
+        key=lambda path: path.name,
+        reverse=True,
+    )
+    try:
+        energy_coverage = vintage_coverage(
+            models=ENERGY_SUITE_MODEL_IDS,
+            project_root=PROJECT_ROOT,
+        )
+    except Exception:
+        energy_coverage = pd.DataFrame()
+    try:
+        headline_ready = set(
+            map(str, headline_available_vintages(project_root=PROJECT_ROOT))
+        )
+    except Exception:
+        headline_ready = set()
+
+    rows = []
+    for directory in directories:
+        vintage = str(directory.name)
+        energy_ready = bool(
+            not energy_coverage.empty
+            and vintage in energy_coverage.index
+            and bool(energy_coverage.loc[vintage].all())
+        )
+        headline_ok = vintage in headline_ready
+        linked = energy_ready and headline_ok
+        rows.append(
+            {
+                "vintage": vintage,
+                "energy_ready": energy_ready,
+                "headline_ready": headline_ok,
+                "linked_ready": linked,
+            }
+        )
+    return rows
+
+
+def _production_vintage_label(item: Mapping[str, Any]) -> str:
+    if item.get("linked_ready"):
+        suffix = "linked ready"
+    elif item.get("energy_ready"):
+        suffix = "Energy ready"
+    elif item.get("headline_ready"):
+        suffix = "Headline ready"
+    else:
+        suffix = "incomplete"
+    return f"{item['vintage']} · {suffix}"
+
+
+def _data_diagnostic_row(
+    *,
+    domain: str,
+    dataset: str,
+    frequency: str,
+    frame: pd.DataFrame | None,
+    source: str,
+    status: str,
+    note: str = "",
+) -> dict:
+    if frame is None or frame.empty:
+        return {
+            "domain": domain,
+            "dataset": dataset,
+            "frequency": frequency,
+            "series": 0,
+            "start": "—",
+            "end": "—",
+            "last_complete": "—",
+            "rows": 0,
+            "missing_cells": "—",
+            "interior_missing": "—",
+            "edge_missing": "—",
+            "calendar": "—",
+            "status": status,
+            "source": source,
+            "note": note,
+        }
+    start = pd.Timestamp(frame.index.min()).strftime("%Y-%m-%d")
+    end = pd.Timestamp(frame.index.max()).strftime("%Y-%m-%d")
+    last = _last_complete_date(frame)
+    missing = int(frame.isna().sum().sum())
+    interior = _interior_missing_cells(frame)
+    edge_missing = max(int(missing - interior), 0)
+    return {
+        "domain": domain,
+        "dataset": dataset,
+        "frequency": frequency,
+        "series": int(frame.shape[1]),
+        "start": start,
+        "end": end,
+        "last_complete": "—" if last is None else last.strftime("%Y-%m-%d"),
+        "rows": int(len(frame)),
+        "missing_cells": missing,
+        "interior_missing": interior,
+        "edge_missing": edge_missing,
+        "calendar": "OK" if _calendar_ok(frame, frequency) else "GAP",
+        "status": status,
+        "source": source,
+        "note": note,
+    }
+
+
+def _validation_artifact_rows(vintage: str) -> tuple[list[dict], list[str]]:
+    """Summarise persisted processed-vintage audit artefacts without model work."""
+    directory = PROJECT_ROOT / "data" / "processed" / str(vintage)
+    specs = (
+        ("manifest.json", "Build manifest"),
+        ("source_vintages.csv", "Source vintages"),
+        ("model_datasets_diagnostics.csv", "Model dataset diagnostics"),
+        ("aggregation_coverage.csv", "Energy aggregation coverage"),
+        ("hicp_validation_failures.csv", "HICP validation failures"),
+        ("hicp_weight_identity_diagnostics.csv", "HICP weight identity"),
+        ("headline_hicp_weight_identity_diagnostics.csv", "Headline HICP weight identity"),
+        ("headline_joint_weight_identity_diagnostics.csv", "Headline joint weight identity"),
+    )
+    rows: list[dict] = []
+    warnings: list[str] = []
+
+    for filename, label in specs:
+        path = directory / filename
+        if not path.is_file():
+            rows.append(
+                {
+                    "artefact": label,
+                    "file": filename,
+                    "rows": "—",
+                    "columns": "—",
+                    "status": "MISSING",
+                    "note": "Not present in this processed vintage.",
+                }
+            )
+            continue
+
+        if path.suffix.lower() == ".json":
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                rows.append(
+                    {
+                        "artefact": label,
+                        "file": filename,
+                        "rows": 1,
+                        "columns": len(payload) if isinstance(payload, dict) else "—",
+                        "status": "PRESENT",
+                        "note": "Processed-vintage provenance manifest.",
+                    }
+                )
+            except Exception as exc:
+                warnings.append(f"{filename}: unreadable JSON ({exc})")
+                rows.append(
+                    {
+                        "artefact": label,
+                        "file": filename,
+                        "rows": "—",
+                        "columns": "—",
+                        "status": "ERROR",
+                        "note": str(exc),
+                    }
+                )
+            continue
+
+        try:
+            try:
+                frame = pd.read_csv(path)
+            except pd.errors.EmptyDataError:
+                frame = pd.DataFrame()
+            n_rows = int(len(frame))
+            n_cols = int(frame.shape[1])
+            if filename == "hicp_validation_failures.csv":
+                status = "PASS" if n_rows == 0 else "WARN"
+                note = (
+                    "No recorded HICP validation failures."
+                    if n_rows == 0
+                    else f"{n_rows} recorded validation failure row(s); inspect before estimation."
+                )
+                if n_rows:
+                    warnings.append(f"{filename}: {n_rows} validation failure row(s)")
+            else:
+                status = "PRESENT"
+                note = f"{n_rows} row(s), {n_cols} column(s)."
+            rows.append(
+                {
+                    "artefact": label,
+                    "file": filename,
+                    "rows": n_rows,
+                    "columns": n_cols,
+                    "status": status,
+                    "note": note,
+                }
+            )
+        except Exception as exc:
+            warnings.append(f"{filename}: unreadable CSV ({exc})")
+            rows.append(
+                {
+                    "artefact": label,
+                    "file": filename,
+                    "rows": "—",
+                    "columns": "—",
+                    "status": "ERROR",
+                    "note": str(exc),
+                }
+            )
+
+    return rows, warnings
+
+
+def _production_vintage_diagnostics(vintage: str) -> dict:
+    """Filesystem/data-contract diagnostics only. Never estimates a model."""
+    vintage = str(vintage)
+    processed_dir = PROJECT_ROOT / "data" / "processed" / vintage
+    rows: list[dict] = []
+    energy_ready_count = 0
+
+    for model_id in ENERGY_SUITE_MODEL_IDS:
+        spec = model_spec(model_id)
+        try:
+            panel = build_panel(model_id, vintage, project_root=PROJECT_ROOT)
+            energy_ready_count += 1
+            missing = int(panel.levels.isna().sum().sum())
+            interior = _interior_missing_cells(panel.levels)
+            note = (
+                f"{missing} total missing level cells / {interior} interior. "
+                "Treatment is chosen separately in Estimation."
+            )
+            rows.append(
+                _data_diagnostic_row(
+                    domain="Energy",
+                    dataset=spec.label,
+                    frequency=panel.frequency,
+                    frame=panel.levels,
+                    source=panel.dataset_path.name,
+                    status="READY",
+                    note=note,
+                )
+            )
+        except Exception as exc:
+            rows.append(
+                _data_diagnostic_row(
+                    domain="Energy",
+                    dataset=spec.label,
+                    frequency=spec.frequency,
+                    frame=None,
+                    source=spec.dataset_file,
+                    status="ERROR",
+                    note=str(exc),
+                )
+            )
+
+    headline_ready = False
+    try:
+        inputs = build_headline_inputs(vintage, project_root=PROJECT_ROOT)
+        headline_ready = True
+        rows.append(
+            _data_diagnostic_row(
+                domain="Headline",
+                dataset="Joint HICP components",
+                frequency="monthly",
+                frame=inputs.native_levels,
+                source=inputs.dataset_path.name,
+                status="READY",
+                note=(
+                    f"weights {inputs.weights_path.name}; official Headline "
+                    f"{inputs.official_indices_path.name}"
+                ),
+            )
+        )
+    except Exception as exc:
+        rows.append(
+            _data_diagnostic_row(
+                domain="Headline",
+                dataset="Joint HICP components",
+                frequency="monthly",
+                frame=None,
+                source="headline_joint_monthly.csv",
+                status="ERROR",
+                note=str(exc),
+            )
+        )
+
+    aggregate_required = (
+        "aggregation_coverage.csv",
+        "hicp_indices_monthly.csv",
+        "hicp_weights_annual.csv",
+        "hicp_series_metadata.csv",
+        "hicp_flags.csv",
+        "hicp_weight_identity_diagnostics.csv",
+        "manifest.json",
+    )
+    aggregate_missing = [
+        name for name in aggregate_required if not (processed_dir / name).is_file()
     ]
+    aggregate_ready = not aggregate_missing
+    rows.append(
+        {
+            "domain": "Energy",
+            "dataset": "HICP Energy aggregation inputs",
+            "frequency": "mixed",
+            "series": "—",
+            "start": "—",
+            "end": "—",
+            "last_complete": "—",
+            "rows": "—",
+            "missing_cells": "—",
+            "interior_missing": "—",
+            "edge_missing": "—",
+            "calendar": "—",
+            "status": "READY" if aggregate_ready else "ERROR",
+            "source": ", ".join(aggregate_required),
+            "note": (
+                "All aggregation sidecars present"
+                if aggregate_ready
+                else "Missing: " + ", ".join(aggregate_missing)
+            ),
+        }
+    )
+
+    artifact_rows, artifact_warnings = _validation_artifact_rows(vintage)
+    energy_ready = energy_ready_count == len(ENERGY_SUITE_MODEL_IDS)
+    linked_ready = energy_ready and headline_ready and aggregate_ready
+    return {
+        "vintage": vintage,
+        "processed_ready": processed_dir.is_dir(),
+        "energy_ready": energy_ready,
+        "energy_ready_count": int(energy_ready_count),
+        "headline_ready": headline_ready,
+        "aggregate_ready": aggregate_ready,
+        "linked_ready": linked_ready,
+        "rows": rows,
+        "artifact_rows": artifact_rows,
+        "artifact_warnings": artifact_warnings,
+    }
+
+
+
+def _headline_run_artifact_state(vintage: str) -> dict:
+    """Inspect saved locked-Headline artefacts without estimating anything."""
+    vintage = str(vintage)
+    base = RESULTS_ROOT / str(HEADLINE_MODEL_ID) / vintage
+    rows = []
+    if base.is_dir():
+        for directory in sorted(p for p in base.iterdir() if p.is_dir()):
+            metadata_path = directory / "metadata.json"
+            if not metadata_path.is_file():
+                continue
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except Exception:
+                metadata = {}
+            if str(metadata.get("model_id", HEADLINE_MODEL_ID)) != str(HEADLINE_MODEL_ID):
+                continue
+            forecast_dir = directory / "forecasts" / "unconditional"
+            checks = {
+                "draws": (directory / "draws.npz").is_file(),
+                "forecast": (
+                    (forecast_dir / "forecast_metadata.json").is_file()
+                    and (forecast_dir / "forecast_draws.npz").is_file()
+                ),
+                "headline": (
+                    (forecast_dir / "headline_metadata.json").is_file()
+                    and (forecast_dir / "headline_draws.npz").is_file()
+                ),
+            }
+            rows.append(
+                {
+                    "run_id": directory.name,
+                    "directory": directory,
+                    "checks": checks,
+                    "complete": all(checks.values()),
+                }
+            )
+
+    promoted_ids: set[str] = set()
+    try:
+        registry_rows = _registry_table("runs")
+        if not registry_rows.empty:
+            registry_rows = registry_rows.loc[
+                registry_rows["model_id"].astype(str).eq(str(HEADLINE_MODEL_ID))
+                & registry_rows["vintage"].astype(str).eq(str(vintage))
+                & registry_rows["status"].astype(str).eq("complete")
+            ].copy()
+        if not registry_rows.empty and "promoted" in registry_rows:
+            promoted_ids = set(
+                registry_rows.loc[
+                    registry_rows["promoted"].fillna(0).astype(int).eq(1),
+                    "run_id",
+                ].astype(str)
+            )
+    except Exception:
+        promoted_ids = set()
+
+    complete = [row for row in rows if row["complete"]]
+    promoted_complete = [
+        row for row in complete if str(row["run_id"]) in promoted_ids
+    ]
+    if len(promoted_complete) == 1:
+        chosen = promoted_complete[0]
+        status = "COMPLETE"
+        note = "promoted locked Headline run"
+    elif len(complete) == 1:
+        chosen = complete[0]
+        status = "COMPLETE"
+        note = "unique complete locked Headline run"
+    elif len(complete) > 1:
+        chosen = None
+        status = "AMBIGUOUS"
+        note = f"{len(complete)} complete runs; promote/select one before linked production"
+    elif rows:
+        chosen = None
+        status = "PARTIAL"
+        note = f"{len(rows)} saved run director{'y' if len(rows) == 1 else 'ies'}, none production-complete"
+    else:
+        chosen = None
+        status = "MISSING"
+        note = "no saved Headline run for this vintage"
+
+    return {
+        "status": status,
+        "note": note,
+        "run_id": "" if chosen is None else str(chosen["run_id"]),
+        "directory": None if chosen is None else chosen["directory"],
+        "n_complete": len(complete),
+        "n_saved": len(rows),
+    }
+
+
+def _production_model_readiness(
+    vintage: str,
+    *,
+    selected_model_id: str | None,
+    config_store: dict | None,
+) -> dict:
+    """Exact saved-model readiness for the current production vintage.
+
+    Energy is compared against the deterministic run IDs implied by the current
+    Estimation configuration. This is exactly the identity used by the suite
+    callback, so the table is also the next-run resume plan.
+    """
+    vintage = str(vintage)
+    selected_model_id = selected_model_id or ENERGY_SUITE_MODEL_IDS[0]
+    if not config_store or not config_store.get("valid"):
+        config_store = {**_baseline_config_payload(), "valid": True}
+
+    rows: list[dict] = []
+    energy_states: dict[str, dict] = {}
+    energy_run_ids: dict[str, str] = {}
+
+    for model_id in ENERGY_SUITE_MODEL_IDS:
+        spec = model_spec(model_id)
+        try:
+            state = _planned_run_state(
+                model_id,
+                vintage,
+                selected_model_id=selected_model_id,
+                config_store=config_store,
+            )
+            energy_states[model_id] = state
+            energy_run_ids[str(spec.model_id)] = str(state["run_id"])
+
+            reusable = _component_run_reusable(state)
+            any_saved = bool(
+                Path(state["directory"]).is_dir()
+                or state.get("has_draws")
+                or state.get("has_forecast")
+                or state.get("has_hicp")
+            )
+            status = "COMPLETE" if reusable else ("PARTIAL" if any_saved else "MISSING")
+            missing_parts = [
+                label
+                for label, ok in (
+                    ("draws", bool(state.get("has_draws"))),
+                    ("forecast", bool(state.get("has_forecast"))),
+                    ("HICP", bool(state.get("has_hicp"))),
+                )
+                if not ok
+            ]
+            artifacts = " · ".join(
+                [
+                    f"draws {'✓' if state.get('has_draws') else '—'}",
+                    f"forecast {'✓' if state.get('has_forecast') else '—'}",
+                    f"HICP {'✓' if state.get('has_hicp') else '—'}",
+                    f"display {'✓' if state.get('has_display') else '—'}",
+                ]
+            )
+            note = (
+                "Exact planned run will be reused; Gibbs skipped."
+                if reusable
+                else (
+                    "Exact planned run is partial; missing " + ", ".join(missing_parts) + "."
+                    if any_saved
+                    else "Exact planned run has not been estimated."
+                )
+            )
+            rows.append(
+                {
+                    "domain": "Energy",
+                    "model": spec.label,
+                    "run_id": _short_run(state["run_id"]),
+                    "artifacts": artifacts,
+                    "status": status,
+                    "next_run": "REUSE" if reusable else "ESTIMATE",
+                    "note": note,
+                }
+            )
+        except Exception as exc:
+            rows.append(
+                {
+                    "domain": "Energy",
+                    "model": spec.label,
+                    "run_id": "—",
+                    "artifacts": "—",
+                    "status": "ERROR",
+                    "next_run": "BLOCKED",
+                    "note": str(exc),
+                }
+            )
+
+    energy_complete = sum(
+        _component_run_reusable(state) for state in energy_states.values()
+    )
+    all_energy_complete = (
+        len(energy_states) == len(ENERGY_SUITE_MODEL_IDS)
+        and energy_complete == len(ENERGY_SUITE_MODEL_IDS)
+    )
+
+    aggregate_status = "BLOCKED"
+    aggregate_run_id = ""
+    aggregate_note = "Complete the exact seven Energy component runs first."
+    aggregate_reused = False
+    if all_energy_complete:
+        try:
+            existing = _matching_saved_energy_aggregate(vintage, energy_run_ids)
+            if existing is None:
+                aggregate_status = "BUILD PENDING"
+                aggregate_note = (
+                    "All exact component runs are complete; the next suite run "
+                    "can build the HICP Energy aggregate without rerunning Gibbs."
+                )
+            else:
+                aggregate_run_id, _aggregate_dir = existing
+                aggregate_status = "COMPLETE"
+                aggregate_reused = True
+                aggregate_note = (
+                    "Exact aggregate already matches the seven planned component run IDs."
+                )
+        except Exception as exc:
+            aggregate_status = "ERROR"
+            aggregate_note = str(exc)
+
+    rows.append(
+        {
+            "domain": "Energy",
+            "model": "HICP Energy aggregate",
+            "run_id": _short_run(aggregate_run_id) if aggregate_run_id else "—",
+            "artifacts": "aggregate_draws + metadata" if aggregate_reused else "—",
+            "status": aggregate_status,
+            "next_run": (
+                "REUSE"
+                if aggregate_status == "COMPLETE"
+                else "BUILD"
+                if aggregate_status == "BUILD PENDING"
+                else "BLOCKED"
+            ),
+            "note": aggregate_note,
+        }
+    )
+
+    headline = _headline_run_artifact_state(vintage)
+    rows.append(
+        {
+            "domain": "Headline",
+            "model": "Headline joint BVAR",
+            "run_id": _short_run(headline["run_id"]) if headline["run_id"] else "—",
+            "artifacts": (
+                "draws ✓ · forecast ✓ · Headline paths ✓"
+                if headline["status"] == "COMPLETE"
+                else "inspect saved run artefacts"
+            ),
+            "status": headline["status"],
+            "next_run": "REUSE" if headline["status"] == "COMPLETE" else "ESTIMATE",
+            "note": headline["note"],
+        }
+    )
+
+    linked_ready = bool(
+        all_energy_complete
+        and aggregate_status == "COMPLETE"
+        and headline["status"] == "COMPLETE"
+    )
+
+    return {
+        "rows": rows,
+        "energy_complete": int(energy_complete),
+        "energy_total": len(ENERGY_SUITE_MODEL_IDS),
+        "energy_ready": bool(all_energy_complete),
+        "aggregate_status": aggregate_status,
+        "aggregate_run_id": aggregate_run_id,
+        "headline_status": headline["status"],
+        "headline_run_id": headline["run_id"],
+        "linked_ready": linked_ready,
+    }
+
+
+def data_page() -> html.Div:
     return html.Div(
         [
             html.Div(
                 [
                     html.Div(
                         [
-                            html.H2("Estimation", className="page-title"),
+                            html.H2("Data preparation & validation", className="page-title"),
                             html.P(
-                                "Production Energy-suite estimation from processed vintages. "
-                                "A successful seven-model run automatically builds the HICP "
-                                "Energy aggregate; full posterior draws remain persisted for "
-                                "Structural analysis.",
+                                "One production information set shared by Energy and Headline. "
+                                "Build or select a processed vintage here, inspect data diagnostics, "
+                                "then estimate either model family without choosing a second vintage.",
                                 className="page-subtitle",
                             ),
                         ]
                     ),
                     html.Div(
                         [
-                            html.Div(
-                                [
-                                    html.Label("Model", className="control-label"),
-                                    dcc.Dropdown(
-                                        id="est-model-select",
-                                        options=model_options,
-                                        value="gas",
-                                        clearable=False,
-                                        className="compact-dropdown wide-control",
-                                    ),
-                                ],
-                                className="control-block wide-control",
-                            ),
-                            html.Div(
-                                [
-                                    html.Label("Data vintage", className="control-label"),
-                                    dcc.Dropdown(
-                                        id="est-vintage-select",
-                                        options=[],
-                                        value=None,
-                                        clearable=False,
-                                        className="compact-dropdown",
-                                    ),
-                                ],
-                                className="control-block",
+                            html.Label("Production vintage", className="control-label"),
+                            dcc.Dropdown(
+                                id="production-vintage-select",
+                                options=[],
+                                value=None,
+                                clearable=False,
+                                persistence=True,
+                                persistence_type="session",
+                                className="compact-dropdown",
                             ),
                         ],
-                        className="chart-controls",
+                        className="control-block",
                     ),
                 ],
                 className="page-heading-row",
             ),
             html.Div(
                 [
+                    _stat_card("Processed vintage", "data-processed-status", "data-processed-note"),
+                    _stat_card("Energy inputs", "data-energy-status", "data-energy-note"),
+                    _stat_card("Headline inputs", "data-headline-status", "data-headline-note"),
+                    _stat_card("Linked suite", "data-linked-status", "data-linked-note"),
+                ],
+                className="stats-grid",
+            ),
+            html.Div(id="data-readiness-banner", className="selection-banner"),
+            html.Div(
+                [
                     html.Div(
                         [
                             html.Div(
                                 [
-                                    html.H3("Data preparation", className="panel-title"),
+                                    html.H3("Build / refresh processed vintage", className="panel-title"),
                                     html.P(
-                                        "After refreshing and saving the single Excel workbook, build the canonical "
-                                        "processed Energy datasets here before running the BVARs. The builder writes "
-                                        "only to data/processed/<vintage>; it never modifies saved results.",
+                                        "Refresh and save the canonical Excel workbook, then materialise the "
+                                        "shared processed vintage. This writes only below data/processed/<vintage> "
+                                        "and never modifies saved BVAR results.",
                                         className="panel-subtitle",
                                     ),
                                 ]
@@ -2513,10 +3469,7 @@ def estimation_page() -> html.Div:
                         ],
                         className="panel-heading",
                     ),
-                    html.Div(
-                        id="dataset-build-environment",
-                        className="selection-banner",
-                    ),
+                    html.Div(id="dataset-build-environment", className="selection-banner"),
                     html.Div(
                         [
                             dcc.Checklist(
@@ -2527,13 +3480,13 @@ def estimation_page() -> html.Div:
                                         "value": "overwrite",
                                     }
                                 ],
-                                value=["overwrite"],
+                                value=[],
                                 className="estimation-checklist",
                             ),
                             html.Div(
                                 [
                                     html.Button(
-                                        "Build / refresh VAR datasets",
+                                        "Build / refresh processed vintage",
                                         id="dataset-build-run",
                                         n_clicks=0,
                                         className="refresh-button estimation-run-all-button",
@@ -2561,11 +3514,7 @@ def estimation_page() -> html.Div:
                             ),
                             html.Div(
                                 [
-                                    html.Div(
-                                        "Idle",
-                                        id="dataset-build-phase",
-                                        className="estimation-phase",
-                                    ),
+                                    html.Div("Idle", id="dataset-build-phase", className="estimation-phase"),
                                     html.Div(
                                         "Save the refreshed workbook, then build the processed vintage.",
                                         id="dataset-build-progress-detail",
@@ -2595,13 +3544,233 @@ def estimation_page() -> html.Div:
                         ],
                         style={"marginTop": "10px"},
                     ),
+                ],
+                className="panel",
+            ),
+            html.Div(
+                [
                     html.Div(
-                        "Production build uses the canonical workbook builder with HICP aggregation inputs required. "
-                        "The newly built vintage is automatically selected below when the build succeeds.",
-                        className="estimation-required-note",
+                        [
+                            html.Div("Data diagnostics", className="eyebrow"),
+                            html.H3("Coverage, calendar and missing observations", className="panel-title"),
+                            html.P(
+                                "These are data diagnostics only. The model's treatment of missing data "
+                                "(linear or Durbin–Koopman) remains an Estimation setting.",
+                                className="panel-subtitle",
+                            ),
+                        ],
+                        className="panel-heading",
+                    ),
+                    dash_table.DataTable(
+                        id="data-diagnostics-table",
+                        columns=[
+                            {"name": "Domain", "id": "domain"},
+                            {"name": "Dataset / model", "id": "dataset"},
+                            {"name": "Frequency", "id": "frequency"},
+                            {"name": "Series", "id": "series"},
+                            {"name": "Start", "id": "start"},
+                            {"name": "End", "id": "end"},
+                            {"name": "Last complete", "id": "last_complete"},
+                            {"name": "Rows", "id": "rows"},
+                            {"name": "Missing cells", "id": "missing_cells"},
+                            {"name": "Interior missing", "id": "interior_missing"},
+                            {"name": "Edge missing", "id": "edge_missing"},
+                            {"name": "Calendar", "id": "calendar"},
+                            {"name": "Status", "id": "status"},
+                            {"name": "Source", "id": "source"},
+                            {"name": "Note", "id": "note"},
+                        ],
+                        data=[],
+                        sort_action="native",
+                        filter_action="native",
+                        page_action="none",
+                        style_table={"overflowX": "auto"},
+                        style_cell={
+                            "fontSize": "11px",
+                            "padding": "7px 8px",
+                            "textAlign": "left",
+                            "whiteSpace": "normal",
+                            "height": "auto",
+                            "minWidth": "80px",
+                            "maxWidth": "260px",
+                        },
+                        style_header={"fontWeight": "600"},
                     ),
                 ],
                 className="panel",
+            ),
+            html.Div(
+                [
+                    html.Div(
+                        [
+                            html.Div("Production model readiness", className="eyebrow"),
+                            html.H3("Saved runs & smart-resume plan", className="panel-title"),
+                            html.P(
+                                "Read-only status for the selected production vintage. "
+                                "Energy rows use the exact deterministic run IDs implied by the current "
+                                "Estimation configuration. COMPLETE rows are reused on the next suite run; "
+                                "Gibbs is skipped. A component is production-complete only when posterior "
+                                "draws, raw forecast and component HICP bridge all exist.",
+                                className="panel-subtitle",
+                            ),
+                        ],
+                        className="panel-heading",
+                    ),
+                    html.Div(
+                        [
+                            _stat_card("Energy models", "data-model-energy-status", "data-model-energy-note"),
+                            _stat_card("Energy aggregate", "data-model-aggregate-status", "data-model-aggregate-note"),
+                            _stat_card("Headline BVAR", "data-model-headline-status", "data-model-headline-note"),
+                            _stat_card("Linked production", "data-model-linked-status", "data-model-linked-note"),
+                        ],
+                        className="stats-grid",
+                    ),
+                    html.Div(id="data-model-readiness-banner", className="selection-banner"),
+                    dash_table.DataTable(
+                        id="data-model-readiness-table",
+                        columns=[
+                            {"name": "Domain", "id": "domain"},
+                            {"name": "Model", "id": "model"},
+                            {"name": "Planned / saved run", "id": "run_id"},
+                            {"name": "Artefacts", "id": "artifacts"},
+                            {"name": "Status", "id": "status"},
+                            {"name": "Next suite action", "id": "next_run"},
+                            {"name": "Note", "id": "note"},
+                        ],
+                        data=[],
+                        sort_action="native",
+                        page_action="none",
+                        style_table={"overflowX": "auto"},
+                        style_cell={
+                            "fontSize": "11px",
+                            "padding": "7px 8px",
+                            "textAlign": "left",
+                            "whiteSpace": "normal",
+                            "height": "auto",
+                            "minWidth": "90px",
+                            "maxWidth": "360px",
+                        },
+                        style_header={"fontWeight": "600"},
+                    ),
+                ],
+                className="panel",
+            ),
+            html.Div(
+                [
+                    html.Div(
+                        [
+                            html.Div("Persisted validation artefacts", className="eyebrow"),
+                            html.H3("Builder diagnostics & lineage", className="panel-title"),
+                            html.P(
+                                "Read-only summary of the audit files already written under "
+                                "data/processed/<vintage>. These checks do not estimate any model.",
+                                className="panel-subtitle",
+                            ),
+                        ],
+                        className="panel-heading",
+                    ),
+                    html.Div(id="data-validation-banner", className="selection-banner"),
+                    dash_table.DataTable(
+                        id="data-validation-artifacts-table",
+                        columns=[
+                            {"name": "Artefact", "id": "artefact"},
+                            {"name": "File", "id": "file"},
+                            {"name": "Rows", "id": "rows"},
+                            {"name": "Columns", "id": "columns"},
+                            {"name": "Status", "id": "status"},
+                            {"name": "Note", "id": "note"},
+                        ],
+                        data=[],
+                        sort_action="native",
+                        page_action="none",
+                        style_table={"overflowX": "auto"},
+                        style_cell={
+                            "fontSize": "11px",
+                            "padding": "7px 8px",
+                            "textAlign": "left",
+                            "whiteSpace": "normal",
+                            "height": "auto",
+                            "minWidth": "90px",
+                            "maxWidth": "320px",
+                        },
+                        style_header={"fontWeight": "600"},
+                    ),
+                ],
+                className="panel",
+            ),
+        ],
+        className="page-body",
+    )
+
+
+def estimation_page() -> html.Div:
+    model_options = [
+        {"label": model_spec(model_id).label, "value": model_id}
+        for model_id in ENERGY_SUITE_MODEL_IDS
+    ]
+    return html.Div(
+        [
+            html.Div(
+                [
+                    html.Div(
+                        [
+                            html.H2("Estimation", className="page-title"),
+                            html.P(
+                                "Production Energy-suite estimation from processed vintages. "
+                                "A successful seven-model run automatically builds the HICP "
+                                "Energy aggregate; full posterior draws remain persisted for "
+                                "Structural analysis.",
+                                className="page-subtitle",
+                            ),
+                        ]
+                    ),
+                    html.Div(
+                        [
+                            html.Div(
+                                [
+                                    html.Label("Model", className="control-label"),
+                                    dcc.Dropdown(
+                                        id="est-model-select",
+                                        options=model_options,
+                                        value="gas",
+                                        clearable=False,
+                                        className="compact-dropdown wide-control",
+                                    ),
+                                ],
+                                className="control-block wide-control",
+                            ),
+                            html.Div(
+                                [
+                                    html.Label("Production vintage", className="control-label"),
+                                    html.Div(
+                                        id="est-production-vintage-value",
+                                        children="Select it in Data",
+                                        className="stat-value",
+                                    ),
+                                    dcc.Link(
+                                        "Open Data →",
+                                        href="/data",
+                                        className="stat-subtitle",
+                                    ),
+                                ],
+                                className="control-block",
+                            ),
+                        ],
+                        className="chart-controls",
+                    ),
+                ],
+                className="page-heading-row",
+            ),
+            html.Div(
+                [
+                    html.Strong("Production data is managed centrally in Data."),
+                    html.Span(
+                        " Energy estimation reads the shared production vintage; "
+                        "dataset building and coverage diagnostics no longer live on this page."
+                    ),
+                    dcc.Link(" Open Data →", href="/data", className="refresh-button"),
+                ],
+                className="selection-banner",
             ),
             html.Div(id="estimation-preview-banner", className="selection-banner"),
             html.Div(
@@ -2998,7 +4167,7 @@ def estimation_page() -> html.Div:
                             html.Div(
                                 [
                                     html.Div("Idle", id="estimation-phase", className="estimation-phase"),
-                                    html.Div("Select a model and vintage.", id="estimation-progress-detail", className="estimation-progress-detail"),
+                                    html.Div("Select a model and production vintage.", id="estimation-progress-detail", className="estimation-progress-detail"),
                                 ],
                                 className="estimation-progress-text",
                             ),
@@ -3177,19 +4346,69 @@ def sidebar() -> html.Aside:
             html.Div(
                 [
                     html.Div(className="brand-mark", title="BVAR"),
-                    html.Div("Energy Inflation", className="brand-title"),
+                    html.Div("Inflation Dashboard", className="brand-title"),
                 ],
                 className="brand-row",
             ),
             html.Nav(
                 [
+                    _nav_link("Overview", "/overview", "◎"),
+                    _nav_link("Data", "/data", "▦"),
+                    *(
+                        [_nav_link("Economic Data", "/economic-data", "▤")]
+                        if ECONOMIC_DATA_ENABLED
+                        else []
+                    ),
+                ],
+                id="global-nav",
+                className="nav-stack",
+            ),
+            html.Div(
+                [
+                    dcc.Link("Energy", href="/forecast", className="domain-pill"),
+                    dcc.Link(
+                        "Headline HICP",
+                        href="/headline/forecast",
+                        className="domain-pill",
+                    ),
+                    dcc.Link(
+                        "Core",
+                        href="/core/forecast",
+                        className="domain-pill",
+                    ),
+                ],
+                className="domain-switch",
+            ),
+            html.Nav(
+                [
                     _nav_link("Forecast", "/forecast", "↗"),
-                    _nav_link("Energy aggregate", "/aggregate", "Σ"),
+                    _nav_link("Aggregate", "/aggregate", "Σ"),
                     _nav_link("Scenarios", "/scenarios", "△"),
                     _nav_link("Structural", "/structural", "ψ"),
                     _nav_link("Estimation", "/estimation", "⚙"),
                 ],
-                className="nav-stack",
+                id="energy-nav",
+                className="nav-stack nav-stack-energy",
+            ),
+            html.Nav(
+                [
+                    _nav_link("Forecast & Contributions", "/headline/forecast", "↗"),
+                    _nav_link("Scenarios", "/headline/scenarios", "△"),
+                    _nav_link("Structural", "/headline/structural", "ψ"),
+                    _nav_link("Estimation", "/headline/estimation", "⚙"),
+                ],
+                id="headline-nav",
+                className="nav-stack nav-stack-headline",
+                style={"display": "none"},
+            ),
+            html.Nav(
+                [
+                    _nav_link("Forecast & Contributions", "/core/forecast", "↗"),
+                    _nav_link("Scenarios", "/core/scenarios", "△"),
+                ],
+                id="core-nav",
+                className="nav-stack nav-stack-core",
+                style={"display": "none"},
             ),
             html.Div(
                 [
@@ -3217,12 +4436,13 @@ def topbar() -> html.Div:
             ),
             html.Div(
                 [
-                    html.Button("Refresh", id="refresh-registry", n_clicks=0, className="refresh-button"),
+                    html.Button("Refresh snapshot", id="refresh-registry", n_clicks=0, className="refresh-button"),
                     html.Div(id="registry-status", className="registry-status"),
                 ],
                 className="refresh-area",
             ),
         ],
+        id="global-topbar",
         className="topbar",
     )
 
@@ -3236,7 +4456,7 @@ app = Dash(
     assets_folder=str(Path(__file__).parent / "assets"),
     suppress_callback_exceptions=True,
     background_callback_manager=background_callback_manager,
-    title="Energy BVAR Dashboard",
+    title="Inflation Dashboard",
     update_title="Updating…",
 )
 server = app.server
@@ -3246,6 +4466,7 @@ app.layout = html.Div(
         dcc.Location(id="url", refresh=False),
         dcc.Store(id="registry-store", data=_scan_registry()),
         dcc.Store(id="ctx-store", storage_type="session"),
+        dcc.Store(id="production-vintage-store", storage_type="session"),
         dcc.Store(id="data-store", storage_type="memory"),
         dcc.Store(id="agg-store", storage_type="memory"),
         dcc.Store(id="scenario-store", storage_type="memory"),
@@ -3254,7 +4475,9 @@ app.layout = html.Div(
         dcc.Store(id="agg-scenario-store", storage_type="memory"),
         dcc.Store(id="estimation-result-store", storage_type="memory"),
         dcc.Store(id="dataset-build-result-store", storage_type="memory"),
+        dcc.Store(id="structural-volatility-store", storage_type="memory"),
         dcc.Store(id="structural-store", storage_type="memory"),
+        dcc.Store(id="structural-hd-key-store", storage_type="memory"),
         dcc.Store(
             id="estimation-config-store",
             data={**_baseline_config_payload(), "valid": True, "errors": []},
@@ -3269,6 +4492,18 @@ app.layout = html.Div(
                 html.Div(id="selection-banner", className="selection-banner"),
                 html.Div(
                     [
+                        html.Div(overview_page(), id="page-overview", style={"display": "none"}),
+                        html.Div(data_page(), id="page-data", style={"display": "none"}),
+                        html.Div(
+                            (
+                                _economic_data_page()
+                                if ECONOMIC_DATA_ENABLED
+                                and _economic_data_page is not None
+                                else None
+                            ),
+                            id="page-economic-data",
+                            style={"display": "none"},
+                        ),
                         html.Div(forecast_page(), id="page-forecast"),
                         html.Div(
                             aggregate_page(),
@@ -3290,6 +4525,46 @@ app.layout = html.Div(
                             id="page-estimation",
                             style={"display": "none"},
                         ),
+                    html.Div(
+                        headline_forecast_v2_page(),
+                        id="page-headline-forecast",
+                        style={"display": "none"},
+                    ),
+                    html.Div(
+                        headline_scenarios_page(),
+                        id="page-headline-scenarios",
+                        style={"display": "none"},
+                    ),
+                    html.Div(
+                        core_forecast_page(),
+                        id="page-core-forecast",
+                        style={"display": "none"},
+                    ),
+                    html.Div(
+                        core_scenarios_page(),
+                        id="page-core-scenarios",
+                        style={"display": "none"},
+                    ),
+                        html.Div(
+                            headline_structural_page(),
+                            id="page-headline-structural",
+                            style={"display": "none"},
+                        ),
+                        html.Div(
+                        [
+                            html.Div(
+                                [
+                                    html.Strong("Production vintage: "),
+                                    html.Span(id="headline-production-vintage-value", children="Select it in Data"),
+                                    dcc.Link(" · Open Data →", href="/data", className="refresh-button"),
+                                ],
+                                className="selection-banner",
+                            ),
+                            headline_estimation_v2_page(),
+                        ],
+                        id="page-headline-diagnostics",
+                        style={"display": "none"},
+                    )
                     ],
                     className="page-container",
                 ),
@@ -3309,10 +4584,28 @@ app.layout = html.Div(
 @callback(
     Output("registry-store", "data"),
     Input("refresh-registry", "n_clicks"),
+    Input("dataset-build-result-store", "data"),
     Input("estimation-result-store", "data"),
     prevent_initial_call=True,
 )
-def refresh_registry(_: int, __: dict | None) -> dict:
+def refresh_registry(
+    _manual_clicks: int | None,
+    dataset_result: dict | None,
+    estimation_result: dict | None,
+) -> dict:
+    """Refresh the frozen registry after explicit refreshes or successful writes.
+
+    Background callbacks run in worker processes, so calling ``scan_results``
+    inside them cannot refresh this server process' in-memory snapshot.  The
+    result-store transition is the safe foreground hand-off point.
+    """
+    trigger = ctx.triggered_id
+    if trigger == "dataset-build-result-store":
+        if not (dataset_result or {}).get("ok"):
+            raise PreventUpdate
+    elif trigger == "estimation-result-store":
+        if not (estimation_result or {}).get("ok"):
+            raise PreventUpdate
     return _scan_registry()
 
 
@@ -3337,13 +4630,35 @@ def registry_status(store: dict | None):
     Output("vintage-select", "options"),
     Output("vintage-select", "value"),
     Input("registry-store", "data"),
+    Input("url", "pathname"),
     State("vintage-select", "value"),
 )
-def vintage_options(_: dict | None, current: str | None):
-    forecasts = list_forecasts(REGISTRY_PATH, valid_only=True, present_only=True)
+def vintage_options(
+    _: dict | None,
+    pathname: str | None,
+    current: str | None,
+):
+    forecasts = _registry_table("forecasts")
     if forecasts.empty:
         return [], None
-    vintages = sorted(forecasts["vintage"].astype(str).unique(), reverse=True)
+
+    domain = "headline" if (pathname or "").startswith("/core") else domain_from_path(pathname)
+    allowed_models = set(
+        models_for_domain(
+            forecasts["model_id"].astype(str).unique(),
+            domain,
+        )
+    )
+    forecasts = forecasts.loc[
+        forecasts["model_id"].astype(str).isin(allowed_models)
+    ]
+    if forecasts.empty:
+        return [], None
+
+    vintages = sorted(
+        forecasts["vintage"].astype(str).unique(),
+        reverse=True,
+    )
     options = [{"label": value, "value": value} for value in vintages]
     return options, current if current in vintages else vintages[0]
 
@@ -3353,26 +4668,39 @@ def vintage_options(_: dict | None, current: str | None):
     Output("model-select", "value"),
     Input("vintage-select", "value"),
     Input("registry-store", "data"),
+    Input("url", "pathname"),
     State("model-select", "value"),
 )
-def model_options(vintage: str | None, _: dict | None, current: str | None):
+def model_options(
+    vintage: str | None,
+    _: dict | None,
+    pathname: str | None,
+    current: str | None,
+):
     if not vintage:
         return [], None
-    forecasts = list_forecasts(
-        REGISTRY_PATH, vintage=vintage, valid_only=True, present_only=True
-    )
+    forecasts = _registry_table("forecasts")
+    if not forecasts.empty:
+        forecasts = forecasts.loc[
+            forecasts["vintage"].astype(str).eq(str(vintage))
+        ].copy()
     if forecasts.empty:
         return [], None
-    models = sorted(forecasts["model_id"].astype(str).unique())
-    options = []
-    for model_id in models:
-        try:
-            label = model_spec(model_id).label
-        except Exception:
-            label = model_id.replace("_", " ").title()
-        options.append({"label": label, "value": model_id})
+
+    domain = "headline" if (pathname or "").startswith("/core") else domain_from_path(pathname)
+    models = models_for_domain(
+        forecasts["model_id"].astype(str).unique(),
+        domain,
+    )
+    options = [
+        {"label": model_label(model_id), "value": model_id}
+        for model_id in models
+    ]
     values = [item["value"] for item in options]
-    return options, current if current in values else values[0]
+    return (
+        options,
+        current if current in values else (values[0] if values else None),
+    )
 
 
 @callback(
@@ -3391,13 +4719,12 @@ def forecast_options(
 ):
     if not vintage or not model_id:
         return [], None
-    frame = list_forecasts(
-        REGISTRY_PATH,
-        model_id=model_id,
-        vintage=vintage,
-        valid_only=True,
-        present_only=True,
-    )
+    frame = _registry_table("forecasts")
+    if not frame.empty:
+        frame = frame.loc[
+            frame["model_id"].astype(str).eq(str(model_id))
+            & frame["vintage"].astype(str).eq(str(vintage))
+        ].copy()
     names = sorted(frame["forecast_name"].astype(str).unique()) if not frame.empty else []
     options = [{"label": name.replace("_", " ").title(), "value": name} for name in names]
     preferred = "unconditional" if "unconditional" in names else (names[0] if names else None)
@@ -3422,21 +4749,20 @@ def run_options(
 ):
     if not all([vintage, model_id, forecast_name]):
         return [], None
-    forecasts = list_forecasts(
-        REGISTRY_PATH,
-        model_id=model_id,
-        vintage=vintage,
-        forecast_name=forecast_name,
-        valid_only=True,
-        present_only=True,
-    )
-    runs = list_runs(
-        REGISTRY_PATH,
-        model_id=model_id,
-        vintage=vintage,
-        status="complete",
-        present_only=True,
-    )
+    forecasts = _registry_table("forecasts")
+    if not forecasts.empty:
+        forecasts = forecasts.loc[
+            forecasts["model_id"].astype(str).eq(str(model_id))
+            & forecasts["vintage"].astype(str).eq(str(vintage))
+            & forecasts["forecast_name"].astype(str).eq(str(forecast_name))
+        ].copy()
+    runs = _registry_table("runs")
+    if not runs.empty:
+        runs = runs.loc[
+            runs["model_id"].astype(str).eq(str(model_id))
+            & runs["vintage"].astype(str).eq(str(vintage))
+            & runs["status"].astype(str).eq("complete")
+        ].copy()
     if forecasts.empty or runs.empty:
         return [], None
     merged = forecasts.merge(
@@ -3469,6 +4795,7 @@ def run_options(
     Input("model-select", "value"),
     Input("run-select", "value"),
     Input("forecast-select", "value"),
+    Input("url", "pathname"),
     State("ctx-store", "data"),
 )
 def update_context(
@@ -3476,11 +4803,18 @@ def update_context(
     model_id: str | None,
     run_id: str | None,
     forecast_name: str | None,
+    pathname: str | None,
     previous: dict | None,
 ):
     previous = dict(previous or {})
-    previous.update(
+    proposed = dict(previous)
+    proposed.update(
         {
+            "domain": (
+                "core"
+                if (pathname or "").startswith("/core")
+                else domain_from_path(pathname)
+            ),
             "vintage": vintage,
             "model_id": model_id,
             "run_id": run_id,
@@ -3488,7 +4822,12 @@ def update_context(
             "draw_mode": previous.get("draw_mode", "posterior"),
         }
     )
-    return previous
+    # Navigation inside the same domain must not rewrite the economic context.
+    # This keeps already-loaded page stores frozen when a user leaves a page and
+    # later returns without changing vintage/model/run/forecast.
+    if proposed == previous:
+        raise PreventUpdate
+    return proposed
 
 
 @callback(
@@ -3503,14 +4842,13 @@ def load_selected_display(context: dict | None, _: dict | None):
     ):
         return None, html.Div("Select a saved run to load its display artefact.")
 
-    forecasts = list_forecasts(
-        REGISTRY_PATH,
-        model_id=context["model_id"],
-        vintage=context["vintage"],
-        forecast_name=context["forecast_name"],
-        valid_only=True,
-        present_only=True,
-    )
+    forecasts = _registry_table("forecasts")
+    if not forecasts.empty:
+        forecasts = forecasts.loc[
+            forecasts["model_id"].astype(str).eq(str(context["model_id"]))
+            & forecasts["vintage"].astype(str).eq(str(context["vintage"]))
+            & forecasts["forecast_name"].astype(str).eq(str(context["forecast_name"]))
+        ].copy()
     selected = forecasts.loc[forecasts["run_id"].astype(str) == str(context["run_id"])]
     if selected.empty:
         return None, html.Div("Selected forecast store is no longer present in the registry.")
@@ -3518,58 +4856,106 @@ def load_selected_display(context: dict | None, _: dict | None):
     row = selected.iloc[0]
     forecast_dir = Path(str(row["directory"]))
     display_path = forecast_dir / DISPLAY_FILENAME
-    materialised = False
-    try:
-        if not display_path.is_file():
-            if not AUTO_BUILD_DISPLAY:
-                raise FileNotFoundError(
-                    f"{display_path} is missing and ENERGY_BVAR_AUTO_BUILD_DISPLAY=0."
-                )
-            run_dir = forecast_dir.parent.parent
-            build_component_display(
-                run_dir,
-                project_root=PROJECT_ROOT,
-                forecast_name=context["forecast_name"],
-            )
-            materialised = True
-        frame = load_display_artifact(display_path)
-        # display_v1 files created before the component-HICP contract can be
-        # perfectly valid for the raw BVAR forecast while still lacking HICP
-        # Level / YoY.  Rebuild them once from the saved forecast; the builder
-        # materialises hicp_draws.npz without re-estimating the BVAR.
-        fan_mask = frame["record_type"].astype(str) == "fan"
-        metrics_present = set(frame.loc[fan_mask, "metric"].dropna().astype(str))
-        if AUTO_BUILD_DISPLAY and not {"hicp_level", "yoy"}.issubset(metrics_present):
-            run_dir = forecast_dir.parent.parent
-            build_component_display(
-                run_dir,
-                project_root=PROJECT_ROOT,
-                forecast_name=context["forecast_name"],
-                overwrite=True,
-            )
-            materialised = True
-            frame = load_display_artifact(display_path)
+    snapshot_ref = (
+        f"{_registry_snapshot_id()}::component-display::"
+        f"{context['model_id']}::{context['vintage']}::{context['run_id']}::"
+        f"{context['forecast_name']}"
+    )
+    cached_result = snapshot_get(
+        "component_display_result",
+        snapshot_ref,
+    )
+    if (
+        isinstance(cached_result, tuple)
+        and len(cached_result) == 2
+    ):
+        return cached_result
 
-        meta = display_metadata(frame)
-        fan_rows = int((frame["record_type"].astype(str) == "fan").sum())
-        if fan_rows == 0:
-            raise ValueError(
-                f"{DISPLAY_FILENAME} loaded successfully but contains no forecast fan rows."
+    cached_display = snapshot_get("component_display", snapshot_ref)
+    materialised = False
+
+    if isinstance(cached_display, dict):
+        frame = cached_display["frame"]
+        meta = dict(cached_display["meta"])
+        snapshot_put_frame(snapshot_ref, frame)
+    else:
+        try:
+            if not display_path.is_file():
+                if not AUTO_BUILD_DISPLAY:
+                    raise FileNotFoundError(
+                        f"{display_path} is missing and ENERGY_BVAR_AUTO_BUILD_DISPLAY=0."
+                    )
+                run_dir = forecast_dir.parent.parent
+                build_component_display(
+                    run_dir,
+                    project_root=PROJECT_ROOT,
+                    forecast_name=context["forecast_name"],
+                )
+                materialised = True
+            frame = load_display_artifact(display_path)
+            # display_v1 files created before the component-HICP contract can be
+            # valid for the raw BVAR while still lacking component HICP output.
+            fan_mask = frame["record_type"].astype(str) == "fan"
+            metrics_present = set(
+                frame.loc[fan_mask, "metric"].dropna().astype(str)
             )
-        final_metrics = set(
-            frame.loc[frame["record_type"].astype(str) == "fan", "metric"]
-            .dropna().astype(str)
-        )
-        if not {"hicp_level", "yoy"}.issubset(final_metrics):
-            raise ValueError(
-                "Component HICP post-processing is incomplete: expected both "
-                "'hicp_level' and 'yoy' in display_v1."
+
+            is_headline = context.get("model_id") == HEADLINE_MODEL_ID
+            required_metrics = (
+                {"level", "yoy"}
+                if is_headline
+                else {"hicp_level", "yoy"}
             )
-    except Exception as exc:
-        return None, html.Div(
-            [html.Strong("Display load failed: "), html.Span(str(exc))],
-            className="banner-error",
-        )
+            if (
+                not is_headline
+                and AUTO_BUILD_DISPLAY
+                and not required_metrics.issubset(metrics_present)
+            ):
+                run_dir = forecast_dir.parent.parent
+                build_component_display(
+                    run_dir,
+                    project_root=PROJECT_ROOT,
+                    forecast_name=context["forecast_name"],
+                    overwrite=True,
+                )
+                materialised = True
+                frame = load_display_artifact(display_path)
+
+            meta = display_metadata(frame)
+            fan_rows = int(
+                (frame["record_type"].astype(str) == "fan").sum()
+            )
+            if fan_rows == 0:
+                raise ValueError(
+                    f"{DISPLAY_FILENAME} loaded successfully but contains no forecast fan rows."
+                )
+            final_metrics = set(
+                frame.loc[
+                    frame["record_type"].astype(str) == "fan",
+                    "metric",
+                ].dropna().astype(str)
+            )
+            if not required_metrics.issubset(final_metrics):
+                if is_headline:
+                    raise ValueError(
+                        "Headline display is incomplete: expected both "
+                        "'level' and 'yoy' fan metrics in display_v1."
+                    )
+                raise ValueError(
+                    "Component HICP post-processing is incomplete: expected both "
+                    "'hicp_level' and 'yoy' in display_v1."
+                )
+            snapshot_put(
+                "component_display",
+                snapshot_ref,
+                {"frame": frame, "meta": dict(meta)},
+            )
+            snapshot_put_frame(snapshot_ref, frame)
+        except Exception as exc:
+            return None, html.Div(
+                [html.Strong("Display load failed: "), html.Span(str(exc))],
+                className="banner-error",
+            )
 
     label = meta.get("model_label") or context["model_id"]
     method = meta.get("missing_data_method") or "—"
@@ -3592,16 +4978,28 @@ def load_selected_display(context: dict | None, _: dict | None):
             html.Span(f" · vintage {context['vintage']}"),
             html.Span(f" · run {_short_run(context['run_id'])}"),
             html.Span(f" · missing data: {method}{' (' + missing_note + ')' if missing_note else ''}"),
-            html.Span(" · component HICP: ready"),
+            html.Span(
+                " · Headline aggregate: ready"
+                if context.get("model_id") == HEADLINE_MODEL_ID
+                else " · component HICP: ready"
+            ),
             html.Span(built_note),
         ]
     )
-    return {
+    component_store = {
+        "snapshot_ref": snapshot_ref,
         "frame_json": _json_frame(frame),
         "meta": meta,
         "context": context,
         "display_path": str(display_path),
-    }, banner
+    }
+    result = (component_store, banner)
+    snapshot_put(
+        "component_display_result",
+        snapshot_ref,
+        result,
+    )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -3624,37 +5022,280 @@ def sync_estimation_model(pathname, global_model, current):
 
 
 @callback(
-    Output("est-vintage-select", "options"),
-    Output("est-vintage-select", "value"),
-    Input("est-model-select", "value"),
-    Input("dataset-build-result-store", "data"),
-    State("vintage-select", "value"),
-    State("est-vintage-select", "value"),
+    Output("production-vintage-select", "options"),
+    Output("production-vintage-select", "value"),
+    Input("registry-store", "data"),
+    State("production-vintage-select", "value"),
 )
-def estimation_vintage_options(model_id, build_result, global_vintage, current):
-    if not model_id:
-        return [], None
-    try:
-        vintages = available_vintages(model_id, project_root=PROJECT_ROOT)
-    except Exception:
-        return [], None
-    vintages = sorted(map(str, vintages), reverse=True)
-    options = [{"label": value, "value": value} for value in vintages]
+def production_vintage_options(_registry, current):
+    inventory = _frozen_production_inventory()
+    options = [
+        {"label": _production_vintage_label(item), "value": item["vintage"]}
+        for item in inventory
+    ]
+    values = [item["vintage"] for item in inventory]
 
-    built_vintage = (
-        str((build_result or {}).get("build_vintage"))
-        if (build_result or {}).get("ok")
-        else None
-    )
-    if built_vintage in vintages:
-        value = built_vintage
-    elif global_vintage in vintages:
-        value = global_vintage
-    elif current in vintages:
+    if current in values:
         value = current
     else:
-        value = vintages[0] if vintages else None
+        linked = [item["vintage"] for item in inventory if item.get("linked_ready")]
+        value = linked[0] if linked else (values[0] if values else None)
     return options, value
+
+
+@callback(
+    Output("production-vintage-store", "data"),
+    Output("data-processed-status", "children"),
+    Output("data-processed-note", "children"),
+    Output("data-energy-status", "children"),
+    Output("data-energy-note", "children"),
+    Output("data-headline-status", "children"),
+    Output("data-headline-note", "children"),
+    Output("data-linked-status", "children"),
+    Output("data-linked-note", "children"),
+    Output("data-readiness-banner", "children"),
+    Output("data-diagnostics-table", "data"),
+    Output("data-validation-banner", "children"),
+    Output("data-validation-artifacts-table", "data"),
+    Input("production-vintage-select", "value"),
+    Input("dataset-build-result-store", "data"),
+)
+def render_production_vintage_diagnostics(vintage, _build_result):
+    if not vintage:
+        empty_store = {"vintage": None, "linked_ready": False}
+        return (
+            empty_store,
+            "—", "Select a production vintage",
+            "—", "0/7",
+            "—", "not checked",
+            "—", "not checked",
+            html.Div("Select a production vintage."),
+            [],
+            html.Div("Select a production vintage."),
+            [],
+        )
+
+    diagnostics = snapshot_get_or_build(
+        "production_vintage_diagnostics",
+        (_registry_snapshot_id(), str(vintage)),
+        lambda: _production_vintage_diagnostics(str(vintage)),
+    )
+    energy_count = int(diagnostics["energy_ready_count"])
+    processed = bool(diagnostics["processed_ready"])
+    energy_ready = bool(diagnostics["energy_ready"])
+    headline_ready = bool(diagnostics["headline_ready"])
+    aggregate_ready = bool(diagnostics["aggregate_ready"])
+    linked_ready = bool(diagnostics["linked_ready"])
+
+    store = {
+        "vintage": str(vintage),
+        "processed_ready": processed,
+        "energy_ready": energy_ready,
+        "energy_ready_count": energy_count,
+        "headline_ready": headline_ready,
+        "aggregate_ready": aggregate_ready,
+        "linked_ready": linked_ready,
+    }
+
+    if linked_ready:
+        banner = html.Div(
+            [
+                html.Strong("Production vintage ready"),
+                html.Span(f" · {vintage}"),
+                html.Span(" · Energy 7/7"),
+                html.Span(" · Headline ready"),
+                html.Span(" · HICP Energy aggregation inputs ready"),
+            ]
+        )
+    else:
+        issues = []
+        if not energy_ready:
+            issues.append(f"Energy {energy_count}/7")
+        if not headline_ready:
+            issues.append("Headline incomplete")
+        if not aggregate_ready:
+            issues.append("Energy aggregation inputs incomplete")
+        banner = html.Div(
+            [
+                html.Strong("Production vintage incomplete"),
+                html.Span(f" · {vintage}"),
+                html.Span(" · " + "; ".join(issues)),
+            ],
+            className="estimation-error-text",
+        )
+
+    artifact_warnings = list(diagnostics.get("artifact_warnings", []) or [])
+    if artifact_warnings:
+        validation_banner = html.Div(
+            [
+                html.Strong("Validation artefacts need attention"),
+                html.Span(" · " + "; ".join(artifact_warnings[:4])),
+            ],
+            className="estimation-error-text",
+        )
+    else:
+        validation_banner = html.Div(
+            [
+                html.Strong("Persisted validation artefacts"),
+                html.Span(" · no recorded HICP validation failures"),
+            ]
+        )
+
+    return (
+        store,
+        "READY" if processed else "MISSING",
+        f"data/processed/{vintage}",
+        "READY" if energy_ready else f"{energy_count}/7",
+        "7 canonical component datasets" if energy_ready else "See diagnostics below",
+        "READY" if headline_ready else "INCOMPLETE",
+        "joint components + weights + official Headline",
+        "READY" if linked_ready else "INCOMPLETE",
+        "same production information set for Energy + Headline",
+        banner,
+        diagnostics["rows"],
+        validation_banner,
+        diagnostics.get("artifact_rows", []),
+    )
+
+
+@callback(
+    Output("data-model-energy-status", "children"),
+    Output("data-model-energy-note", "children"),
+    Output("data-model-aggregate-status", "children"),
+    Output("data-model-aggregate-note", "children"),
+    Output("data-model-headline-status", "children"),
+    Output("data-model-headline-note", "children"),
+    Output("data-model-linked-status", "children"),
+    Output("data-model-linked-note", "children"),
+    Output("data-model-readiness-banner", "children"),
+    Output("data-model-readiness-table", "data"),
+    Input("production-vintage-select", "value"),
+    Input("estimation-config-store", "data"),
+    Input("est-model-select", "value"),
+    Input("registry-store", "data"),
+    Input("estimation-result-store", "data"),
+)
+def render_production_model_readiness(
+    vintage,
+    config_store,
+    selected_model_id,
+    _registry,
+    _estimation_result,
+):
+    if not vintage:
+        return (
+            "—", "Select a production vintage",
+            "—", "not checked",
+            "—", "not checked",
+            "—", "not checked",
+            html.Div("Select a production vintage."),
+            [],
+        )
+
+    try:
+        readiness_key = (
+            _registry_snapshot_id(),
+            str(vintage),
+            str(selected_model_id or ""),
+            json.dumps(config_store or {}, sort_keys=True, default=str),
+        )
+        snapshot = snapshot_get_or_build(
+            "production_model_readiness",
+            readiness_key,
+            lambda: _production_model_readiness(
+                str(vintage),
+                selected_model_id=selected_model_id,
+                config_store=config_store,
+            ),
+        )
+    except Exception as exc:
+        return (
+            "ERROR", str(exc),
+            "ERROR", "readiness unavailable",
+            "ERROR", "readiness unavailable",
+            "ERROR", "readiness unavailable",
+            html.Div(
+                [html.Strong("Model readiness failed: "), html.Span(str(exc))],
+                className="estimation-error-text",
+            ),
+            [],
+        )
+
+    energy_complete = int(snapshot["energy_complete"])
+    energy_total = int(snapshot["energy_total"])
+    aggregate_status = str(snapshot["aggregate_status"])
+    headline_status = str(snapshot["headline_status"])
+    linked_ready = bool(snapshot["linked_ready"])
+
+    if linked_ready:
+        banner = html.Div(
+            [
+                html.Strong("Production model suite ready"),
+                html.Span(f" · {vintage}"),
+                html.Span(" · Energy 7/7"),
+                html.Span(" · aggregate complete"),
+                html.Span(" · Headline complete"),
+            ]
+        )
+    else:
+        actions = []
+        if energy_complete < energy_total:
+            actions.append(
+                f"Energy next run will reuse {energy_complete}/{energy_total} and estimate "
+                f"{energy_total - energy_complete}"
+            )
+        elif aggregate_status == "BUILD PENDING":
+            actions.append("Energy aggregate can be built without Gibbs")
+        elif aggregate_status != "COMPLETE":
+            actions.append(f"Energy aggregate {aggregate_status.lower()}")
+        if headline_status != "COMPLETE":
+            actions.append(f"Headline {headline_status.lower()}")
+        banner = html.Div(
+            [
+                html.Strong("Production model suite incomplete"),
+                html.Span(f" · {vintage}"),
+                html.Span(" · " + "; ".join(actions)),
+            ]
+        )
+
+    return (
+        f"{energy_complete}/{energy_total}",
+        (
+            "all exact runs reusable"
+            if energy_complete == energy_total
+            else f"{energy_total - energy_complete} exact run(s) still require estimation"
+        ),
+        aggregate_status,
+        (
+            "exact seven-run aggregate reusable"
+            if aggregate_status == "COMPLETE"
+            else "built only after the exact 7/7 component set is complete"
+        ),
+        headline_status,
+        (
+            _short_run(snapshot["headline_run_id"])
+            if snapshot.get("headline_run_id")
+            else "locked Headline production run"
+        ),
+        "READY" if linked_ready else "INCOMPLETE",
+        "same vintage + complete Energy aggregate + complete Headline",
+        banner,
+        snapshot["rows"],
+    )
+
+
+@callback(
+    Output("est-production-vintage-value", "children"),
+    Output("headline-production-vintage-value", "children"),
+    Input("production-vintage-store", "data"),
+)
+def render_production_vintage_badges(store):
+    vintage = str((store or {}).get("vintage") or "")
+    if not vintage:
+        return "Select it in Data", "Select it in Data"
+    suffix = " ✓ validated" if (store or {}).get("linked_ready") else " · incomplete"
+    label = vintage + suffix
+    return label, label
 
 
 
@@ -3666,7 +5307,7 @@ def estimation_vintage_options(model_id, build_result, global_vintage, current):
     Input("dataset-build-result-store", "data"),
 )
 def dataset_build_environment(pathname, raw_path, build_result):
-    if (pathname or "") != "/estimation":
+    if (pathname or "") != "/data":
         raise PreventUpdate
     try:
         info = inspect_dataset_build_environment(
@@ -3773,6 +5414,7 @@ def build_processed_datasets(
             build_vintage=(build_vintage or "").strip() or None,
             overwrite="overwrite" in set(overwrite_values or []),
             require_hicp=True,
+            require_headline=True,
             hicp_discovery=False,
             progress_callback=push,
         )
@@ -3804,13 +5446,15 @@ def render_dataset_build_result(store):
         elapsed = float(store.get("elapsed_seconds", 0.0) or 0.0)
         model_count = len(dict(store.get("model_files", {}) or {}))
         hicp_count = len(dict(store.get("hicp_files", {}) or {}))
+        headline_count = len(dict(store.get("headline_files", {}) or {}))
         banner = html.Div(
             [
                 html.Strong("Processed vintage ready: "),
                 html.Span(vintage),
                 html.Span(
-                    f" · {model_count} canonical dataset files"
+                    f" · {model_count} canonical Energy dataset files"
                     f" · {hicp_count} HICP aggregation sidecars"
+                    f" · {headline_count} joint Headline files"
                     f" · {elapsed:.1f}s"
                 ),
                 html.Span(
@@ -4217,14 +5861,14 @@ def save_estimation_profile(n_clicks, name, config_store, revision):
     Output("est-config-hash", "children"),
     Output("est-config-run", "children"),
     Input("est-model-select", "value"),
-    Input("est-vintage-select", "value"),
+    Input("production-vintage-select", "value"),
     Input("estimation-config-store", "data"),
 )
 def estimation_preview(model_id, vintage, config_store):
     if not model_id or not vintage:
         return (
             "—", "", "—", "", "—", "", "—", "",
-            "Select a processed data vintage.",
+            "Select a production vintage in Data.",
             "Seven-model suite readiness will appear here.",
             "Waiting for a valid selection.",
             "—",
@@ -4262,7 +5906,7 @@ def estimation_preview(model_id, vintage, config_store):
         target = str(panel.target).replace("_", " ").title()
         run_id = state["run_id"]
         metadata = state["metadata"]
-        if state["has_draws"] and state["has_forecast"]:
+        if _component_run_reusable(state):
             existing = "complete · Gibbs will not rerun"
         elif state["directory"].exists():
             missing = []
@@ -4687,7 +6331,7 @@ def _initial_suite_statuses(
             selected_model_id=selected_model_id,
             config_store=config_store,
         )
-        complete = bool(state["has_draws"] and state["has_forecast"])
+        complete = _component_run_reusable(state)
         statuses[model_id] = {
             "model_id": model_id,
             "label": model_spec(model_id).label,
@@ -4708,7 +6352,7 @@ def _initial_suite_statuses(
     ],
     state=[
         State("est-model-select", "value"),
-        State("est-vintage-select", "value"),
+        State("production-vintage-select", "value"),
         State("estimation-promote", "value"),
         State("estimation-config-store", "data"),
     ],
@@ -4719,7 +6363,7 @@ def _initial_suite_statuses(
         (Output("estimation-run-aggregate", "disabled"), True, False),
         (Output("estimation-cancel", "disabled"), False, True),
         (Output("est-model-select", "disabled"), True, False),
-        (Output("est-vintage-select", "disabled"), True, False),
+        (Output("production-vintage-select", "disabled"), True, False),
     ],
     cancel=[Input("estimation-cancel", "n_clicks")],
     progress=[
@@ -4728,7 +6372,7 @@ def _initial_suite_statuses(
         Output("estimation-progress-detail", "children"),
         Output("estimation-suite-progress-store", "data"),
     ],
-    progress_default=(0, "Idle", "Select a model and vintage.", {}),
+    progress_default=(0, "Idle", "Select a model and production vintage.", {}),
     prevent_initial_call=True,
 )
 def estimate_models(
@@ -4861,13 +6505,13 @@ def estimate_models(
         run_id = state["run_id"]
         directory = Path(state["directory"])
 
-        if state["has_draws"] and state["has_forecast"]:
+        if _component_run_reusable(state):
             try:
                 _push_estimation_progress(
                     set_progress,
                     92,
                     "Existing run",
-                    "Full posterior and forecast already exist; rebuilding display if needed.",
+                    "Full posterior, forecast and HICP bridge already exist; rebuilding display if needed.",
                 )
                 build_component_display(
                     directory,
@@ -5130,13 +6774,13 @@ def estimate_models(
                     set_progress,
                     int(round(base)),
                     f"{model_index + 1}/7 · {spec.label}",
-                    "Checking existing full posterior and forecast contract.",
+                    "Checking existing posterior, forecast and HICP production contract.",
                     suite_payload,
                 )
 
                 # Reuse deterministic complete run. We still rematerialise its
                 # display so the dashboard contract is current.
-                if state["has_draws"] and state["has_forecast"]:
+                if _component_run_reusable(state):
                     build_component_display(
                         directory,
                         project_root=PROJECT_ROOT,
@@ -5703,13 +7347,13 @@ def render_estimation_result(store):
 def _diagnostic_run_row(model_id: str | None, vintage: str | None, run_id: str | None):
     if not model_id or not vintage or not run_id:
         return None
-    runs = list_runs(
-        REGISTRY_PATH,
-        model_id=str(model_id),
-        vintage=str(vintage),
-        status="complete",
-        present_only=True,
-    )
+    runs = _registry_table("runs")
+    if not runs.empty:
+        runs = runs.loc[
+            runs["model_id"].astype(str).eq(str(model_id))
+            & runs["vintage"].astype(str).eq(str(vintage))
+            & runs["status"].astype(str).eq("complete")
+        ].copy()
     if runs.empty:
         return None
     block = runs.loc[runs["run_id"].astype(str).eq(str(run_id))]
@@ -5720,7 +7364,7 @@ def _diagnostic_run_row(model_id: str | None, vintage: str | None, run_id: str |
     Output("est-diag-run-select", "options"),
     Output("est-diag-run-select", "value"),
     Input("est-model-select", "value"),
-    Input("est-vintage-select", "value"),
+    Input("production-vintage-select", "value"),
     Input("registry-store", "data"),
     Input("estimation-result-store", "data"),
     State("est-diag-run-select", "value"),
@@ -5728,13 +7372,13 @@ def _diagnostic_run_row(model_id: str | None, vintage: str | None, run_id: str |
 def estimation_diagnostic_run_options(model_id, vintage, _registry, result_store, current):
     if not model_id or not vintage:
         return [], None
-    runs = list_runs(
-        REGISTRY_PATH,
-        model_id=str(model_id),
-        vintage=str(vintage),
-        status="complete",
-        present_only=True,
-    )
+    runs = _registry_table("runs")
+    if not runs.empty:
+        runs = runs.loc[
+            runs["model_id"].astype(str).eq(str(model_id))
+            & runs["vintage"].astype(str).eq(str(vintage))
+            & runs["status"].astype(str).eq("complete")
+        ].copy()
     if runs.empty:
         return [], None
     runs = runs.sort_values(
@@ -5792,7 +7436,7 @@ def estimation_diagnostic_run_options(model_id, vintage, _registry, result_store
     Output("est-diag-mcmc-table", "data"),
     Output("est-diag-stability-table", "data"),
     Input("est-model-select", "value"),
-    Input("est-vintage-select", "value"),
+    Input("production-vintage-select", "value"),
     Input("est-diag-run-select", "value"),
 )
 def render_estimation_diagnostics(model_id, vintage, run_id):
@@ -5811,7 +7455,11 @@ def render_estimation_diagnostics(model_id, vintage, run_id):
     else:
         directory = Path(str(directory_value))
     try:
-        metadata, diagnostics = load_component_diagnostics(directory)
+        metadata, diagnostics = snapshot_get_or_build(
+            "component_diagnostics",
+            (_registry_snapshot_id(), str(directory.resolve())),
+            lambda: load_component_diagnostics(directory),
+        )
         summary = component_diagnostic_summary(metadata, diagnostics)
         mcmc = key_mcmc_table(diagnostics)
         stability = stability_table(diagnostics)
@@ -5895,20 +7543,20 @@ def render_estimation_diagnostics(model_id, vintage, run_id):
     Output("est-agg-anchor-note", "children"),
     Output("est-agg-weekly-rejection", "children"),
     Output("est-agg-weekly-note", "children"),
-    Input("est-vintage-select", "value"),
+    Input("production-vintage-select", "value"),
     Input("registry-store", "data"),
     Input("estimation-result-store", "data"),
 )
 def render_estimation_aggregate_validation(vintage, _registry, _result_store):
     if not vintage:
         return "Select a vintage.", "—", "", "—", "", "—", "", "—", ""
-    rows = list_aggregates(
-        REGISTRY_PATH,
-        vintage=str(vintage),
-        forecast_name="unconditional",
-        status="complete",
-        present_only=True,
-    )
+    rows = _registry_table("aggregates")
+    if not rows.empty:
+        rows = rows.loc[
+            rows["vintage"].astype(str).eq(str(vintage))
+            & rows["forecast_name"].astype(str).eq("unconditional")
+            & rows["status"].astype(str).eq("complete")
+        ].copy()
     if rows.empty:
         return (
             html.Div("No completed HICP Energy aggregate is registered for this vintage."),
@@ -5922,7 +7570,11 @@ def render_estimation_aggregate_validation(vintage, _registry, _result_store):
     else:
         directory = Path(str(directory_value))
     try:
-        diag = load_aggregate_validation(directory)
+        diag = snapshot_get_or_build(
+            "aggregate_validation",
+            (_registry_snapshot_id(), str(directory.resolve())),
+            lambda: load_aggregate_validation(directory),
+        )
         def sci(value):
             return "—" if value is None or pd.isna(value) else f"{float(value):.3e}"
         add = diag.get("drawwise_contribution_additivity_error")
@@ -5976,24 +7628,32 @@ def _selected_structural_run_directory(context: dict | None) -> Path:
 @callback(
     Output("structural-run-banner", "children"),
     Output("structural-reference-date", "options"),
-    Output("structural-reference-date", "value"),
     Output("structural-shock", "options"),
     Output("structural-shock", "value"),
     Output("structural-response", "options"),
     Output("structural-response", "value"),
-    Output("structural-volatility-variable", "options"),
-    Output("structural-volatility-variable", "value"),
     Input("ctx-store", "data"),
     Input("url", "pathname"),
+    State("structural-shock", "value"),
+    State("structural-response", "value"),
 )
-def structural_controls(context, pathname):
+def structural_controls(context, pathname, current_shock, current_response):
     if (pathname or "") != "/structural":
         raise PreventUpdate
     try:
         directory = _selected_structural_run_directory(context)
-        contract = structural_run_contract(
-            directory,
-            project_root=PROJECT_ROOT,
+        contract = snapshot_get_or_build(
+            "structural_run_contract",
+            (
+                _registry_snapshot_id(),
+                str(context.get("model_id")),
+                str(context.get("vintage")),
+                str(context.get("run_id")),
+            ),
+            lambda: structural_run_contract(
+                directory,
+                project_root=PROJECT_ROOT,
+            ),
         )
         variables = list(contract["variables"])
         target = str(contract["target"])
@@ -6008,70 +7668,257 @@ def structural_controls(context, pathname):
             for date in dates
         ]
         variable_options = [
-            {
-                "label": name.replace("_", " ").title(),
-                "value": name,
-            }
+            {"label": name.replace("_", " ").title(), "value": name}
             for name in variables
         ]
         banner_children = [
             html.Strong(contract["model_label"]),
             html.Span(f" · vintage {contract['vintage']}"),
             html.Span(f" · run {_short_run(contract['run_id'])}"),
-            html.Span(
-                f" · {contract['available_posterior_draws']:,} posterior draws available"
-            ),
+            html.Span(f" · {contract['available_posterior_draws']:,} posterior draws"),
             html.Span(
                 " · recursive ordering: "
                 + " → ".join(name.replace("_", " ").title() for name in variables)
             ),
-            html.Span(
-                f" · missing data: {str(contract['missing_data_method']).upper()}"
-            ),
+            html.Span(f" · missing data: {str(contract['missing_data_method']).upper()}"),
         ]
         if variables and target == variables[0]:
             banner_children.append(
                 html.Span(
-                    " · Identification note: this saved BVAR is target-first. "
-                    "Recursive contemporaneous interpretation follows that exact "
-                    "estimated order; the dashboard does not silently reorder it.",
+                    " · Identification note: this saved BVAR is target-first; recursive "
+                    "contemporaneous interpretation follows the estimated order.",
                     className="estimation-error-text",
                 )
             )
-        banner = html.Div(banner_children)
         return (
-            banner,
+            html.Div(banner_children),
             date_options,
-            contract["default_reference_date"],
             variable_options,
-            variables[0],
+            current_shock if current_shock in variables else variables[0],
             variable_options,
-            target if target in variables else variables[-1],
-            variable_options,
-            target if target in variables else variables[-1],
+            (
+                current_response
+                if current_response in variables
+                else (target if target in variables else variables[-1])
+            ),
         )
     except Exception as exc:
         message = html.Div(
             [html.Strong("Structural analysis unavailable: "), html.Span(str(exc))],
             className="estimation-error-text",
         )
-        return message, [], None, [], None, [], None, [], None
+        return message, [], [], None, [], None
 
 
 @callback(
-    output=Output("structural-store", "data"),
+    Output("structural-reference-date", "value"),
+    Input("structural-reference-regime", "value"),
+    Input("ctx-store", "data"),
+    State("structural-volatility-store", "data"),
+    State("structural-reference-date", "options"),
+    State("structural-reference-date", "value"),
+    prevent_initial_call=False,
+)
+def structural_reference_regime(regime, context, store, options, current):
+    values = [item.get("value") for item in (options or []) if item.get("value")]
+    if not values:
+        return None
+    trigger = ctx.triggered_id
+    if trigger == "ctx-store":
+        return values[-1]
+    if trigger == "structural-reference-regime":
+        same_run = bool(
+            store
+            and store.get("ok")
+            and context
+            and str(store.get("model_id")) == str(context.get("model_id"))
+            and str(store.get("run_id")) == str(context.get("run_id"))
+        )
+        if str(regime or "latest") == "latest" or not same_run:
+            return values[-1]
+        chosen = reference_regime_date(store, str(regime))
+        return chosen if chosen in set(values) else values[-1]
+    return current if current in set(values) else values[-1]
+
+@callback(
+    Output("structural-shock-size-label", "children"),
+    Output("structural-shock-size-unit", "children"),
+    Output("structural-shock-interpretation", "children"),
+    Input("structural-shock-unit", "value"),
+    Input("structural-shock-size", "value"),
+    Input("structural-shock", "value"),
+    Input("structural-volatility-store", "data"),
+)
+def structural_shock_definition(shock_unit, shock_size, shock, store):
+    mode = str(shock_unit or DEFAULT_SHOCK_UNIT)
+    try:
+        size = float(shock_size)
+    except (TypeError, ValueError):
+        size = float(DEFAULT_SHOCK_SIZE)
+    shock_name = str(shock or "selected shock").replace("_", " ").title()
+    units = dict((store or {}).get("units", {}) or {})
+    native_unit = str(units.get(shock, "native units") or "native units")
+
+    if mode == "level":
+        label = "Impact size"
+        unit = native_unit
+        interpretation = html.Div(
+            [
+                html.Strong("Level-normalised IRF · "),
+                html.Span(
+                    f"{shock_name} moves by +{size:g} {native_unit} on impact. "
+                    "This magnitude applies to the IRF only. FEVD remains defined from "
+                    "one-standard-deviation structural shocks; recursive HD is unchanged."
+                ),
+            ]
+        )
+    else:
+        label = "Shock magnitude"
+        unit = "σ"
+        interpretation = html.Div(
+            [
+                html.Strong("Structural-SD IRF · "),
+                html.Span(
+                    f"{size:g}σ at the selected joint SV reference state. "
+                    "The IRF scale depends on the shocked equation's λ at that date. "
+                    "FEVD always uses 1σ shocks; recursive HD is unchanged."
+                ),
+            ]
+        )
+    return label, unit, interpretation
+
+
+_STRUCTURAL_CACHE_TTL_SECONDS = 6 * 60 * 60
+_STRUCTURAL_FAST_CACHE_NAMESPACE = "structural-fast-v2"
+_STRUCTURAL_VOL_CACHE_NAMESPACE = "structural-volatility-v2"
+_STRUCTURAL_HD_CACHE_NAMESPACE = "structural-hd-lazy-v1"
+
+
+def _structural_cache_identity(
+    context: dict,
+    *,
+    posterior_draws: int,
+) -> dict:
+    return {
+        "model_id": str(context.get("model_id") or ""),
+        "vintage": str(context.get("vintage") or ""),
+        "run_id": str(context.get("run_id") or ""),
+        "posterior_draws": int(posterior_draws),
+    }
+
+
+def _structural_vol_cache_key(
+    context: dict,
+    *,
+    posterior_draws: int,
+) -> str:
+    identity = {
+        "namespace": _STRUCTURAL_VOL_CACHE_NAMESPACE,
+        **_structural_cache_identity(
+            context,
+            posterior_draws=posterior_draws,
+        ),
+    }
+    return _STRUCTURAL_VOL_CACHE_NAMESPACE + "::" + json.dumps(
+        identity, sort_keys=True, separators=(",", ":")
+    )
+
+
+def _structural_fast_cache_key(
+    context: dict,
+    *,
+    posterior_draws: int,
+    reference_date,
+    horizon: int,
+    shock_unit: str,
+    shock_size: float,
+) -> str:
+    identity = {
+        "namespace": _STRUCTURAL_FAST_CACHE_NAMESPACE,
+        **_structural_cache_identity(
+            context,
+            posterior_draws=posterior_draws,
+        ),
+        "reference_date": (
+            None
+            if reference_date is None
+            else pd.Timestamp(reference_date).isoformat()
+        ),
+        "horizon": int(horizon),
+        "shock_unit": str(shock_unit),
+        "shock_size": float(shock_size),
+    }
+    return _STRUCTURAL_FAST_CACHE_NAMESPACE + "::" + json.dumps(
+        identity, sort_keys=True, separators=(",", ":")
+    )
+
+
+def _structural_hd_cache_key(
+    identity_payload: dict,
+    *,
+    split_outlier_amplification: bool,
+) -> str:
+    identity = {
+        "namespace": _STRUCTURAL_HD_CACHE_NAMESPACE,
+        "model_id": str(identity_payload.get("model_id") or ""),
+        "vintage": str(identity_payload.get("vintage") or ""),
+        "run_id": str(identity_payload.get("run_id") or ""),
+        "posterior_draws": int(identity_payload.get("posterior_draws") or 0),
+        "selected_draw_indices": [
+            int(value)
+            for value in identity_payload.get("selected_draw_indices", [])
+        ],
+        "split_outlier_amplification": bool(split_outlier_amplification),
+    }
+    return _STRUCTURAL_HD_CACHE_NAMESPACE + "::" + json.dumps(
+        identity, sort_keys=True, separators=(",", ":")
+    )
+
+
+def _valid_structural_payload(payload: object, context: dict, kind: str) -> bool:
+    return bool(
+        isinstance(payload, dict)
+        and payload.get("ok")
+        and str(payload.get("payload_kind") or "") == kind
+        and str(payload.get("model_id")) == str(context.get("model_id"))
+        and str(payload.get("vintage")) == str(context.get("vintage"))
+        and str(payload.get("run_id")) == str(context.get("run_id"))
+    )
+
+
+def _structural_hd_placeholder(message: str) -> go.Figure:
+    fig = go.Figure()
+    fig.add_annotation(
+        x=0.5,
+        y=0.52,
+        xref="paper",
+        yref="paper",
+        text=message,
+        showarrow=False,
+        font={"size": 13, "color": "#6B7280"},
+    )
+    fig.update_layout(
+        template="plotly_white",
+        height=560,
+        margin={"l": 48, "r": 24, "t": 40, "b": 48},
+        xaxis={"visible": False},
+        yaxis={"visible": False},
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+    )
+    return fig
+
+
+@callback(
+    output=Output("structural-volatility-store", "data"),
     inputs=[
         Input("structural-run", "n_clicks"),
         Input("url", "pathname"),
-        Input("ctx-store", "data"),
+        Input("structural-draws", "value"),
     ],
     state=[
-        State("structural-reference-date", "value"),
-        State("structural-horizon", "value"),
-        State("structural-draws", "value"),
-        State("structural-shock-unit", "value"),
-        State("structural-shock-size", "value"),
-        State("structural-hd-options", "value"),
+        State("ctx-store", "data"),
+        State("structural-volatility-store", "data"),
     ],
     background=True,
     running=[
@@ -6087,72 +7934,314 @@ def structural_controls(context, pathname):
     progress_default=(
         0,
         "Idle",
-        "Opening Structural automatically computes the default analysis for the selected saved run.",
+        "Opening Structural automatically activates the frozen default analysis.",
     ),
     prevent_initial_call=False,
 )
-def compute_structural_analysis(
+def load_structural_volatility(
     set_progress,
-    n_clicks,
+    _n_clicks,
     pathname,
-    context,
-    reference_date,
-    horizon,
     posterior_draws,
-    shock_unit,
-    shock_size,
-    hd_options,
+    context,
+    current_store,
 ):
-    # Structural V1.1 computes the default view automatically when the user
-    # enters the page or selects another saved run. The button remains the
-    # explicit recompute action after changing horizon/reference/draw settings.
     if (pathname or "") != "/structural":
         raise PreventUpdate
+    if not context or not all(context.get(key) for key in ("model_id", "vintage", "run_id")):
+        raise PreventUpdate
 
-    trigger = ctx.triggered_id
-    manual_recompute = trigger == "structural-run"
-    effective_reference = reference_date if manual_recompute else None
+    draws_requested = int(posterior_draws or DEFAULT_STRUCTURAL_DRAWS)
+    request_signature = {
+        "model_id": str(context.get("model_id") or ""),
+        "vintage": str(context.get("vintage") or ""),
+        "run_id": str(context.get("run_id") or ""),
+        "posterior_draws": draws_requested,
+    }
+    manual_refresh = ctx.triggered_id == "structural-run"
+    if (
+        not manual_refresh
+        and isinstance(current_store, dict)
+        and current_store.get("ok")
+        and current_store.get("dashboard_request_signature") == request_signature
+    ):
+        # A route revisit with the same state is intentionally a true no-op.
+        raise PreventUpdate
 
     try:
         directory = _selected_structural_run_directory(context)
+        key = _structural_vol_cache_key(
+            context,
+            posterior_draws=draws_requested,
+        )
+        cached = _diskcache.get(key)
+        if _valid_structural_payload(cached, context, "volatility") and not manual_refresh:
+            cached = dict(cached)
+            cached["dashboard_request_signature"] = request_signature
+            cached.setdefault("cache_usage", {}).update(
+                {
+                    "server_volatility_cache_hit": True,
+                    "cache_namespace": _STRUCTURAL_VOL_CACHE_NAMESPACE,
+                }
+            )
+            set_progress(
+                (
+                    100,
+                    "Volatility ready · cache hit",
+                    "Reference-state cards are available; IRF/FEVD resolve automatically.",
+                )
+            )
+            return cached
+
         set_progress(
             (
-                10,
-                "Loading posterior",
+                25,
+                "Loading posterior volatility",
                 f"Reading persisted draws for {_short_run(str(context.get('run_id', '')))}.",
             )
         )
-        # compute_structural_v1 performs the same deterministic draw-subset
-        # convention used by the notebooks (linspace across the retained chain).
-        set_progress(
-            (
-                30,
-                "Recursive identification",
-                "Computing regular structural impact matrices and impulse responses.",
-            )
-        )
-        payload = compute_structural_v1(
+        payload = compute_structural_volatility_v1(
             directory,
             project_root=PROJECT_ROOT,
-            reference_date=effective_reference,
-            horizon=int(horizon or STRUCTURAL_DEFAULT_HORIZON),
-            posterior_draws=int(posterior_draws or DEFAULT_STRUCTURAL_DRAWS),
-            shock_unit=str(shock_unit or DEFAULT_SHOCK_UNIT),
-            shock_size=float(shock_size or DEFAULT_SHOCK_SIZE),
-            split_outlier_amplification="split_outliers" in set(hd_options or []),
+            posterior_draws=draws_requested,
+        )
+        payload["dashboard_request_signature"] = request_signature
+        payload["cache_usage"] = {
+            "server_volatility_cache_hit": False,
+            "cache_namespace": _STRUCTURAL_VOL_CACHE_NAMESPACE,
+        }
+        _diskcache.set(
+            key,
+            payload,
+            expire=_STRUCTURAL_CACHE_TTL_SECONDS,
         )
         set_progress(
             (
                 100,
-                "Structural analysis ready",
-                "IRF, FEVD and historical decomposition were computed from saved Gibbs draws.",
+                "Volatility ready",
+                "Reference-state cards are available; IRF/FEVD resolve automatically.",
             )
         )
         return payload
     except Exception as exc:
-        set_progress((0, "Structural analysis failed", str(exc).splitlines()[0]))
+        set_progress((0, "Volatility load failed", str(exc).splitlines()[0]))
         return {
             "ok": False,
+            "payload_kind": "volatility",
+            "dashboard_request_signature": request_signature,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
+@callback(
+    output=Output("structural-store", "data"),
+    inputs=[
+        Input("structural-volatility-store", "data"),
+        Input("structural-reference-date", "value"),
+        Input("structural-horizon", "value"),
+        Input("structural-shock-unit", "value"),
+        Input("structural-shock-size", "value"),
+    ],
+    state=[
+        State("url", "pathname"),
+        State("ctx-store", "data"),
+        State("structural-draws", "value"),
+        State("structural-store", "data"),
+    ],
+    background=True,
+    prevent_initial_call=False,
+)
+def compute_structural_analysis(
+    volatility_store,
+    reference_date,
+    horizon,
+    shock_unit,
+    shock_size,
+    pathname,
+    context,
+    posterior_draws,
+    current_store,
+):
+    if (pathname or "") != "/structural":
+        raise PreventUpdate
+    if not volatility_store or not volatility_store.get("ok"):
+        raise PreventUpdate
+
+    draws_requested = int(posterior_draws or DEFAULT_STRUCTURAL_DRAWS)
+    horizon_requested = int(horizon or STRUCTURAL_DEFAULT_HORIZON)
+    shock_unit_requested = str(shock_unit or DEFAULT_SHOCK_UNIT)
+    shock_size_requested = float(shock_size or DEFAULT_SHOCK_SIZE)
+    effective_reference = reference_date
+    request_signature = {
+        "model_id": str(context.get("model_id") or ""),
+        "vintage": str(context.get("vintage") or ""),
+        "run_id": str(context.get("run_id") or ""),
+        "posterior_draws": draws_requested,
+        "reference_date": None if effective_reference is None else pd.Timestamp(effective_reference).isoformat(),
+        "horizon": horizon_requested,
+        "shock_unit": shock_unit_requested,
+        "shock_size": shock_size_requested,
+    }
+    if (
+        isinstance(current_store, dict)
+        and current_store.get("ok")
+        and current_store.get("dashboard_request_signature") == request_signature
+    ):
+        raise PreventUpdate
+
+    try:
+        directory = _selected_structural_run_directory(context)
+        key = _structural_fast_cache_key(
+            context,
+            posterior_draws=draws_requested,
+            reference_date=effective_reference,
+            horizon=horizon_requested,
+            shock_unit=shock_unit_requested,
+            shock_size=shock_size_requested,
+        )
+        cached = _diskcache.get(key)
+        if _valid_structural_payload(cached, context, "irf_fevd"):
+            cached = dict(cached)
+            cached["dashboard_request_signature"] = request_signature
+            cached.setdefault("cache_usage", {}).update(
+                {
+                    "server_fast_cache_hit": True,
+                    "cache_namespace": _STRUCTURAL_FAST_CACHE_NAMESPACE,
+                }
+            )
+            return cached
+
+        payload = compute_structural_irf_fevd_v1(
+            directory,
+            project_root=PROJECT_ROOT,
+            reference_date=effective_reference,
+            horizon=horizon_requested,
+            posterior_draws=draws_requested,
+            shock_unit=shock_unit_requested,
+            shock_size=shock_size_requested,
+        )
+        payload["dashboard_request_signature"] = request_signature
+        payload["cache_usage"] = {
+            "server_fast_cache_hit": False,
+            "cache_namespace": _STRUCTURAL_FAST_CACHE_NAMESPACE,
+        }
+        _diskcache.set(
+            key,
+            payload,
+            expire=_STRUCTURAL_CACHE_TTL_SECONDS,
+        )
+        return payload
+    except Exception as exc:
+        return {
+            "ok": False,
+            "payload_kind": "irf_fevd",
+            "dashboard_request_signature": request_signature,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
+@callback(
+    output=Output("structural-hd-key-store", "data"),
+    inputs=[
+        Input("structural-hd-run", "n_clicks"),
+        Input("structural-volatility-store", "data"),
+        Input("structural-hd-options", "value"),
+    ],
+    state=[
+        State("url", "pathname"),
+        State("ctx-store", "data"),
+        State("structural-hd-key-store", "data"),
+    ],
+    background=True,
+    running=[
+        (Output("structural-hd-run", "disabled"), True, False),
+        (Output("structural-hd-cancel", "disabled"), False, True),
+    ],
+    cancel=[Input("structural-hd-cancel", "n_clicks")],
+    prevent_initial_call=False,
+)
+def resolve_or_compute_structural_hd(
+    _n_clicks,
+    volatility_store,
+    hd_options,
+    pathname,
+    context,
+    current_state,
+):
+    if (pathname or "") != "/structural":
+        raise PreventUpdate
+    if not volatility_store or not volatility_store.get("ok"):
+        raise PreventUpdate
+
+    split_outliers = "split_outliers" in set(hd_options or [])
+    key = _structural_hd_cache_key(
+        volatility_store,
+        split_outlier_amplification=split_outliers,
+    )
+    manual_refresh = ctx.triggered_id == "structural-hd-run"
+    if (
+        not manual_refresh
+        and isinstance(current_state, dict)
+        and current_state.get("ok")
+        and current_state.get("ready")
+        and str(current_state.get("cache_key")) == str(key)
+    ):
+        raise PreventUpdate
+
+    cached = _diskcache.get(key)
+    if (
+        isinstance(cached, dict)
+        and cached.get("ok")
+        and str(cached.get("payload_kind")) == "historical_decomposition"
+        and str(cached.get("run_id")) == str(volatility_store.get("run_id"))
+        and not manual_refresh
+    ):
+        return {
+            "ok": True,
+            "ready": True,
+            "cache_key": key,
+            "cache_hit": True,
+            "run_id": cached.get("run_id"),
+            "posterior_draws": cached.get("posterior_draws"),
+            "diagnostics": cached.get("diagnostics", {}),
+        }
+
+    try:
+        directory = _selected_structural_run_directory(context)
+        payload = compute_structural_hd_v1(
+            directory,
+            project_root=PROJECT_ROOT,
+            posterior_draws=int(
+                volatility_store.get("posterior_draws")
+                or DEFAULT_STRUCTURAL_DRAWS
+            ),
+            split_outlier_amplification=split_outliers,
+        )
+        if [
+            int(value)
+            for value in payload.get("selected_draw_indices", [])
+        ] != [
+            int(value)
+            for value in volatility_store.get("selected_draw_indices", [])
+        ]:
+            raise StructuralDashboardError(
+                "HD deterministic draw subset differs from the active volatility block."
+            )
+        _diskcache.set(key, payload, expire=None)
+        return {
+            "ok": True,
+            "ready": True,
+            "cache_key": key,
+            "cache_hit": False,
+            "run_id": payload.get("run_id"),
+            "posterior_draws": payload.get("posterior_draws"),
+            "diagnostics": payload.get("diagnostics", {}),
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "ready": False,
+            "cache_key": key,
             "error": f"{type(exc).__name__}: {exc}",
         }
 
@@ -6171,11 +8260,13 @@ def compute_structural_analysis(
     Output("structural-stat-shock-scale", "children"),
     Output("structural-stat-shock-scale-note", "children"),
     Input("structural-store", "data"),
+    Input("structural-hd-key-store", "data"),
 )
-def structural_stats(store):
+def structural_stats(store, hd_state):
     if not store or not store.get("ok"):
         return "—", "", "—", "", "—", "", "—", "", "—", "", "—", ""
     diag = dict(store.get("diagnostics", {}) or {})
+    hd_diag = dict((hd_state or {}).get("diagnostics", {}) or {})
     ordering = " → ".join(
         str(name).replace("_", " ").title()
         for name in store.get("recursive_ordering", [])
@@ -6183,7 +8274,7 @@ def structural_stats(store):
     ref = pd.Timestamp(store["reference_date"]).strftime(
         "%Y-%m-%d" if store.get("frequency") == "weekly" else "%Y-%m"
     )
-    hd_error = diag.get("hd_max_reconstruction_error_drawwise")
+    hd_error = hd_diag.get("hd_max_reconstruction_error_drawwise")
     fevd_error = diag.get("fevd_max_share_sum_error")
     return (
         "Recursive",
@@ -6193,40 +8284,156 @@ def structural_stats(store):
         f"{int(store.get('posterior_draws', 0)):,}",
         f"of {int(store.get('available_posterior_draws', 0)):,} saved draws",
         "—" if hd_error is None else f"{float(hd_error):.3e}",
-        "max draw-wise |reconstructed − observed|",
+        (
+            "max draw-wise |reconstructed − observed|"
+            if hd_error is not None
+            else "HD not computed for the active run/settings"
+        ),
         "—" if fevd_error is None else f"{float(fevd_error):.3e}",
         "max draw-wise |sum FEVD shares − 1|",
         (
-            f"{float(store.get('shock_size', 1.0)):g} unit"
+            f"{float(store.get('shock_size', 1.0)):g} native units"
             if str(store.get("shock_unit")) == "level"
             else f"{float(store.get('shock_size', 1.0)):g}σ"
         ),
         (
-            "impact-normalised shocked variable"
+            "IRF impact-normalised in each shocked variable's native unit; FEVD remains 1σ"
             if str(store.get("shock_unit")) == "level"
-            else "regular structural standard deviations"
+            else "IRF in structural standard deviations; FEVD remains 1σ"
         ),
     )
 
 
 @callback(
-    Output("structural-volatility-graph", "figure"),
-    Input("structural-store", "data"),
-    Input("structural-volatility-variable", "value"),
+    Output("structural-volatility-cards", "children"),
+    Output("structural-volatility-relative-graph", "figure"),
+    Output("structural-reference-effects", "children"),
+    Output("structural-reference-status", "children"),
+    Input("structural-volatility-store", "data"),
     Input("structural-reference-date", "value"),
-    Input("structural-volatility-graph", "relayoutData"),
+    Input("structural-shock-unit", "value"),
 )
-def structural_volatility_graph(store, variable, reference_date, relayout_data):
-    return volatility_history_figure(
-        store,
-        variable=variable,
-        reference_date=reference_date,
-        relayout_data=relayout_data,
-    )
+def structural_volatility_state(store, reference_date, shock_unit):
+    if not store or not store.get("ok"):
+        return [], relative_volatility_state_figure(store, reference_date=reference_date), [], ""
 
+    snapshot = reference_volatility_snapshot(store, reference_date)
+    cards = []
+    for j, item in enumerate(snapshot.get("cards", [])):
+        unit = str(item.get("unit") or "")
+        sv = item.get("persistent_q50")
+        ratio = item.get("relative_sd")
+        percentile = item.get("percentile")
+        outlier_p = item.get("outlier_probability")
+        cards.append(
+            html.Div(
+                [
+                    html.Div(
+                        [
+                            html.Div(item["label"], style={"fontWeight": 700, "fontSize": "13px", "color": "#0F172A"}),
+                            html.Div(
+                                "—" if not np.isfinite(percentile) else f"P{int(round(percentile))}",
+                                style={"fontSize": "11px", "fontWeight": 700, "color": "#64748B"},
+                            ),
+                        ],
+                        style={"display": "flex", "justifyContent": "space-between", "alignItems": "center"},
+                    ),
+                    dcc.Graph(
+                        figure=volatility_sparkline_figure(store, variable=item["variable"], reference_date=reference_date),
+                        config={"displayModeBar": False, "responsive": True},
+                        style={"height": "105px"},
+                    ),
+                    html.Div(
+                        [
+                            html.Div(
+                                [
+                                    html.Span("√λ ", style={"color": "#64748B"}),
+                                    html.Strong("—" if not np.isfinite(sv) else f"{float(sv):.4g}"),
+                                    html.Span(f" {unit}" if unit else ""),
+                                ]
+                            ),
+                            html.Div(
+                                [
+                                    html.Strong("—" if not np.isfinite(ratio) else f"×{float(ratio):.2f}"),
+                                    html.Span(" own median", style={"color": "#64748B"}),
+                                ]
+                            ),
+                            html.Div(
+                                "" if not np.isfinite(outlier_p) else f"P(outlier) {float(outlier_p):.0%}",
+                                style={"color": "#94A3B8", "fontSize": "10px"},
+                            ),
+                        ],
+                        style={"display": "flex", "justifyContent": "space-between", "gap": "10px", "fontSize": "11px", "alignItems": "baseline"},
+                    ),
+                ],
+                style={
+                    "border": "1px solid #E2E8F0", "borderRadius": "12px",
+                    "background": "#FFFFFF", "padding": "12px 14px 10px 14px",
+                    "boxShadow": "0 1px 2px rgba(15,23,42,.04)",
+                },
+            )
+        )
+
+    chip_base = {
+        "display": "inline-flex", "alignItems": "center", "padding": "7px 10px",
+        "borderRadius": "999px", "fontSize": "11px", "fontWeight": 700,
+        "border": "1px solid #DCE3EC", "background": "#F8FAFC", "color": "#334155",
+    }
+    irf_text = (
+        "IRF 1σ · date-dependent"
+        if str(shock_unit or "structural_std") == "structural_std"
+        else "IRF unit-level · invariant"
+    )
+    effects = [
+        html.Span("✓ " + irf_text, style={**chip_base, "color": "#166534", "background": "#F0FDF4", "borderColor": "#BBF7D0"}),
+        html.Span("✓ FEVD · date-dependent", style={**chip_base, "color": "#166534", "background": "#F0FDF4", "borderColor": "#BBF7D0"}),
+        html.Span("— Recursive HD · invariant", style=chip_base),
+        html.Span("— Outlier multiplier · excluded from IRF / FEVD", style=chip_base),
+    ]
+
+    selected = pd.Timestamp(reference_date) if reference_date else None
+    computed = pd.Timestamp(store.get("reference_date")) if store.get("reference_date") else None
+    frequency = str(store.get("frequency", "monthly"))
+    fmt = "%Y-%m-%d" if frequency == "weekly" else "%Y-%m"
+    if selected is not None and computed is not None and selected != computed:
+        status = html.Div(
+            [
+                html.Strong(f"Selected {selected.strftime(fmt)} · "),
+                html.Span(
+                    f"charts are still computed at {computed.strftime(fmt)}. Click Recompute structural analysis to apply this SV state to 1σ IRFs and FEVD."
+                ),
+            ],
+            style={
+                "padding": "9px 11px", "borderRadius": "9px", "border": "1px solid #FCD34D",
+                "background": "#FFFBEB", "color": "#92400E", "fontSize": "11px",
+            },
+        )
+    else:
+        ref_text = computed.strftime(fmt) if computed is not None else "—"
+        joint_p = snapshot.get("joint_percentile")
+        stress = snapshot.get("joint_stress")
+        status = html.Div(
+            [
+                html.Strong(f"Active state · {ref_text}"),
+                html.Span(
+                    " · joint stress "
+                    + ("—" if stress is None or not np.isfinite(stress) else f"{float(stress):.2f}×")
+                    + ("" if joint_p is None or not np.isfinite(joint_p) else f" · P{int(round(float(joint_p)))}")
+                ),
+            ],
+            style={"fontSize": "11px", "color": "#475569"},
+        )
+
+    return (
+        cards,
+        relative_volatility_state_figure(store, reference_date=reference_date),
+        effects,
+        status,
+    )
 
 @callback(
     Output("structural-irf-graph", "figure"),
+    Output("structural-irf-table", "data"),
     Input("structural-store", "data"),
     Input("structural-response", "value"),
     Input("structural-shock", "value"),
@@ -6234,38 +8441,95 @@ def structural_volatility_graph(store, variable, reference_date, relayout_data):
     Input("structural-irf-fan", "value"),
 )
 def structural_irf_graph(store, response, shock, metric, fan_mode):
-    return irf_figure(
-        store,
-        response=response,
-        shock=shock,
-        metric=metric or "cumulative",
-        fan_mode=fan_mode or "68",
+    resolved_metric = metric or "cumulative"
+    return (
+        irf_figure(
+            store, response=response, shock=shock,
+            metric=resolved_metric, fan_mode=fan_mode or "68",
+        ),
+        structural_irf_records(
+            store, response=response, shock=shock, metric=resolved_metric
+        ),
     )
 
 
 @callback(
     Output("structural-fevd-graph", "figure"),
+    Output("structural-fevd-table", "data"),
+    Output("structural-fevd-table", "columns"),
     Input("structural-store", "data"),
     Input("structural-response", "value"),
 )
 def structural_fevd_graph(store, response):
-    return fevd_figure(store, response=response)
+    rows, columns = structural_fevd_table(store, response=response)
+    return fevd_figure(store, response=response), rows, columns
+
+
+@callback(
+    Output("structural-hd-status", "children"),
+    Output("structural-hd-status", "className"),
+    Input("structural-hd-key-store", "data"),
+)
+def structural_hd_status(hd_state):
+    if not hd_state:
+        return (
+            "Historical decomposition · waiting for active Structural run.",
+            "selection-banner",
+        )
+    if not hd_state.get("ok"):
+        return (
+            "Historical decomposition unavailable · "
+            + str(hd_state.get("error") or "unknown error"),
+            "banner-error",
+        )
+    if not hd_state.get("ready"):
+        return (
+            "Historical decomposition not cached for this run/draw/outlier setting. "
+            "The rest of Structural is already usable; compute HD only if needed.",
+            "selection-banner",
+        )
+    hit = bool(hd_state.get("cache_hit"))
+    draws = int(hd_state.get("posterior_draws") or 0)
+    return (
+        "Historical decomposition ready"
+        + (" · cache hit" if hit else " · newly computed")
+        + (f" · {draws:,} draws" if draws else ""),
+        "selection-banner",
+    )
 
 
 @callback(
     Output("structural-hd-graph", "figure"),
-    Input("structural-store", "data"),
+    Output("structural-hd-table", "data"),
+    Input("structural-hd-key-store", "data"),
     Input("structural-response", "value"),
     Input("structural-hd-window", "value"),
     Input("structural-hd-graph", "relayoutData"),
 )
-def structural_hd_graph(store, response, window, relayout_data):
+def structural_hd_graph(hd_state, response, window, relayout_data):
+    if not hd_state or not hd_state.get("ready"):
+        return (
+            _structural_hd_placeholder(
+                "Historical decomposition is not computed for the active run/settings."
+            ),
+            [],
+        )
+    key = str(hd_state.get("cache_key") or "")
+    payload = _diskcache.get(key) if key else None
+    if not isinstance(payload, dict) or not payload.get("ok"):
+        return (
+            _structural_hd_placeholder(
+                "Historical decomposition cache entry is unavailable or expired."
+            ),
+            [],
+        )
     last_obs = None if window is None or int(window) < 0 else int(window)
-    return historical_decomposition_figure(
-        store,
-        response=response,
-        last_obs=last_obs,
-        relayout_data=relayout_data,
+    return (
+        historical_decomposition_figure(
+            payload, response=response, last_obs=last_obs,
+            relayout_data=relayout_data,
+        ),
+        structural_hd_records(payload, response=response),
     )
 
 
@@ -6274,38 +8538,111 @@ def structural_hd_graph(store, response, window, relayout_data):
 # Router
 # ---------------------------------------------------------------------------
 
+@callback(
+    Output("energy-nav", "style"),
+    Output("headline-nav", "style"),
+    Output("core-nav", "style"),
+    Input("url", "pathname"),
+)
+def domain_navigation_styles(pathname: str | None):
+    path = pathname or ""
+    hidden = {"display": "none"}
+    if path in {"/", "/data", "/overview"}:
+        return hidden, hidden, hidden
+    if path.startswith("/core"):
+        return hidden, hidden, {}
+    if domain_from_path(pathname) == "headline":
+        return hidden, {}, hidden
+    return {}, hidden, hidden
+
+
 
 @callback(
+    Output("global-topbar", "style"),
+    Output("selection-banner", "style"),
+    Input("url", "pathname"),
+)
+def data_shell_visibility(pathname: str | None):
+    if (pathname or "") in {
+        "/",
+        "/overview",
+        "/data",
+        "/economic-data",
+        "/estimation",
+        "/headline/estimation",
+        "/headline/diagnostics",
+    }:
+        return {"display": "none"}, {"display": "none"}
+    return {}, {}
+
+
+
+@callback(
+    Output("page-overview", "style"),
+    Output("page-data", "style"),
+    Output("page-economic-data", "style"),
     Output("page-forecast", "style"),
     Output("page-aggregate", "style"),
     Output("page-scenarios", "style"),
     Output("page-structural", "style"),
     Output("page-estimation", "style"),
+    Output("page-headline-forecast", "style"),
+    Output("page-headline-scenarios", "style"),
+    Output("page-headline-structural", "style"),
+    Output("page-headline-diagnostics", "style"),
+    Output("page-core-forecast", "style"),
+    Output("page-core-scenarios", "style"),
     Input("url", "pathname"),
 )
 def route(pathname: str | None):
-    """Toggle pre-mounted pages instead of injecting callback targets dynamically.
-
-    Keeping the Forecast controls in the initial DOM is important: ``data-store``
-    can be populated during app bootstrap, and the metric/series callbacks must
-    already have mounted Output components when that happens.
-    """
-    pathname = pathname or "/forecast"
+    pathname = pathname or "/overview"
     route_name = {
-        "/": "forecast",
+        "/": "overview",
+        "/overview": "overview",
+        "/data": "data",
+        "/economic-data": (
+            "economic-data" if ECONOMIC_DATA_ENABLED else "overview"
+        ),
         "/forecast": "forecast",
         "/aggregate": "aggregate",
         "/scenarios": "scenarios",
         "/structural": "structural",
         "/estimation": "estimation",
-    }.get(pathname, "forecast")
+        "/headline": "headline-forecast",
+        "/headline/overview": "headline-forecast",
+        "/headline/forecast": "headline-forecast",
+        "/headline/contributions": "headline-forecast",
+        "/headline/components": "headline-forecast",
+        "/headline/scenarios": "headline-scenarios",
+        "/headline/structural": "headline-structural",
+        "/headline/diagnostics": "headline-estimation",
+        "/headline/estimation": "headline-estimation",
+        "/core": "core-forecast",
+        "/core/forecast": "core-forecast",
+        "/core/scenarios": "core-scenarios",
+    }.get(pathname, "overview")
+
     visible = {"display": "block"}
     hidden = {"display": "none"}
-    names = ("forecast", "aggregate", "scenarios", "structural", "estimation")
+    names = (
+        "overview",
+        "data",
+        "economic-data",
+        "forecast",
+        "aggregate",
+        "scenarios",
+        "structural",
+        "estimation",
+        "headline-forecast",
+        "headline-scenarios",
+        "headline-structural",
+        "headline-estimation",
+        "core-forecast",
+        "core-scenarios",
+    )
     return tuple(visible if name == route_name else hidden for name in names)
 
 
-# ---------------------------------------------------------------------------
 # Forecast-page callbacks: all downstream of data-store, no filesystem I/O
 # ---------------------------------------------------------------------------
 
@@ -6369,6 +8706,7 @@ def series_options(store: dict | None, metric: str | None, current: str | None):
 
 @callback(
     Output("forecast-graph", "figure"),
+    Output("forecast-summary-table", "data"),
     Output("forecast-values-table", "data"),
     Output("stat-observed", "children"),
     Output("stat-observed-date", "children"),
@@ -6394,7 +8732,7 @@ def update_forecast_view(
         empty = _empty_forecast_figure(
             "Forecast display is not available yet. Check the run banner above."
         )
-        return empty, [], "—", "", "—", "", "—", "", "—", ""
+        return empty, [], [], "—", "", "—", "", "—", "", "—", ""
 
     context = dict((store or {}).get("context") or {})
     fig = forecast_figure(frame, metric=metric, series=series, fan_mode=fan_mode, context=context)
@@ -6402,11 +8740,14 @@ def update_forecast_view(
     fan = _forecast_rows(frame, metric, series)
     future = fan.loc[fan["segment"] == "forecast"].copy()
 
-    table = fan[["date", "segment", "q05", "q16", "q50", "q84", "q95"]].copy()
+    table = fan[["date", "segment", "q05", "q16", "value", "q50", "q84", "q95"]].copy()
     table["date"] = table["date"].dt.strftime("%Y-%m-%d")
-    for column in ("q05", "q16", "q50", "q84", "q95"):
+    for column in ("q05", "q16", "value", "q50", "q84", "q95"):
         table[column] = table[column].round(4)
     table_data = table.to_dict("records")
+    summary_data = forecast_summary_records(
+        frame, series=series, metric=metric, max_months=None
+    )
 
     observed_value = observed_date = first_value = first_date = terminal_value = terminal_date = "—"
     if not history.empty:
@@ -6416,9 +8757,9 @@ def update_forecast_view(
     if not future.empty:
         first = future.iloc[0]
         last = future.iloc[-1]
-        first_value = _format_number(first["q50"])
+        first_value = _format_number(first["value"])
         first_date = pd.Timestamp(first["date"]).strftime("%Y-%m-%d")
-        terminal_value = _format_number(last["q50"])
+        terminal_value = _format_number(last["value"])
         terminal_date = pd.Timestamp(last["date"]).strftime("%Y-%m-%d")
 
     horizon = int(len(future))
@@ -6430,6 +8771,7 @@ def update_forecast_view(
     unit = "months" if frequency == "monthly" else "weeks" if frequency == "weekly" else "periods"
     return (
         fig,
+        summary_data,
         table_data,
         observed_value,
         observed_date,
@@ -6446,6 +8788,8 @@ def update_forecast_view(
 # ---------------------------------------------------------------------------
 # Tax-scenario page callbacks
 # ---------------------------------------------------------------------------
+
+TAX_SCENARIO_INPUT_UX_VERSION = "human-excise-units-v1"
 
 
 def _normalise_scenario_period(value, frequency: str) -> pd.Timestamp:
@@ -6469,28 +8813,178 @@ def _normalise_scenario_period(value, frequency: str) -> pd.Timestamp:
     return timestamp.normalize()
 
 
+def _scenario_excise_display_spec(source_unit: str | None) -> dict[str, object]:
+    """Return a human-facing excise unit without changing the model contract.
+
+    Model/source units remain authoritative internally:
+      * Electricity: EUR/kWh  -> c€/kWh
+      * Gas:         EUR/MWh  -> c€/kWh
+      * WOB fuels:   EUR per 1,000 litres -> c€/litre
+
+    ``display_factor`` is defined as:
+        displayed_value = source_value * display_factor
+    """
+    raw = str(source_unit or "source unit")
+    norm = (
+        raw.casefold()
+        .replace("€", "eur")
+        .replace(",", "")
+        .replace(" ", "")
+        .replace("liters", "litres")
+    )
+
+    if "eur/kwh" in norm or "eurperkwh" in norm:
+        return {
+            "source_unit": raw,
+            "display_unit": "c€/kWh",
+            "display_factor": 100.0,
+            "step": 0.1,
+            "scaled": True,
+        }
+    if "eur/mwh" in norm or "eurpermwh" in norm:
+        # 1 EUR/MWh = 0.1 c€/kWh.
+        return {
+            "source_unit": raw,
+            "display_unit": "c€/kWh",
+            "display_factor": 0.1,
+            "step": 0.1,
+            "scaled": True,
+        }
+    if (
+        "eurper1000litres" in norm
+        or "eur/1000litres" in norm
+        or "eurper1000litre" in norm
+        or "eur/1000litre" in norm
+    ):
+        # 1 EUR / 1,000 litres = 0.1 c€/litre.
+        return {
+            "source_unit": raw,
+            "display_unit": "c€/litre",
+            "display_factor": 0.1,
+            "step": 0.1,
+            "scaled": True,
+        }
+
+    return {
+        "source_unit": raw,
+        "display_unit": raw,
+        "display_factor": 1.0,
+        "step": 0.1,
+        "scaled": False,
+    }
+
+
+def _scenario_excise_to_display(value, source_unit: str | None) -> float:
+    spec = _scenario_excise_display_spec(source_unit)
+    return float(value or 0.0) * float(spec["display_factor"])
+
+
+def _scenario_excise_from_display(value, source_unit: str | None) -> float:
+    spec = _scenario_excise_display_spec(source_unit)
+    factor = float(spec["display_factor"])
+    if factor <= 0:
+        raise ValueError("Excise display factor must be positive.")
+    return float(value or 0.0) / factor
+
+
+def _scenario_excise_plausibility_error(
+    *,
+    displayed_delta: float,
+    source_delta: float,
+    source_baseline: float,
+    source_unit: str | None,
+) -> str | None:
+    """Reject only unmistakable unit mistakes; normal stress tests remain valid."""
+    spec = _scenario_excise_display_spec(source_unit)
+    scenario_source = float(source_baseline) + float(source_delta)
+
+    if scenario_source < -1e-12:
+        return (
+            "The requested excise change would make the excise level negative. "
+            f"Baseline is {_scenario_excise_to_display(source_baseline, source_unit):.2f} "
+            f"{spec['display_unit']}."
+        )
+
+    baseline_abs = abs(float(source_baseline))
+    if bool(spec["scaled"]) and baseline_abs > 1e-12:
+        multiple = abs(float(source_delta)) / baseline_abs
+        if multiple > 10.0:
+            return (
+                f"Excise change {float(displayed_delta):+.2f} {spec['display_unit']} "
+                f"is {multiple:.1f}× the baseline excise. This is likely a unit mistake. "
+                f"The editor expects {spec['display_unit']}, while the model stores "
+                f"{spec['source_unit']} internally."
+            )
+    return None
+
+
 def _scenario_component_contract_for_row(
     vintage: str,
     model_id: str,
     row,
 ):
-    """Load and validate the actual saved-run tax-scenario contract."""
+    """Load the saved-run tax-scenario contract once per frozen snapshot."""
     from energy_bvar_io import load_energy_bvar_forecast
 
-    forecast = load_energy_bvar_forecast(Path(str(row["directory"])))
-    dataset = (
-        PROJECT_ROOT
-        / "data"
-        / "processed"
-        / str(vintage)
-        / model_spec(model_id).dataset_file
-    )
-    return component_tax_scenario_contract(
-        model_id,
-        forecast,
-        dataset_path=dataset,
+    directory = Path(str(row["directory"]))
+    key = (
+        _registry_snapshot_id(),
+        str(vintage),
+        str(model_id),
+        str(directory.resolve()),
     )
 
+    def _build():
+        forecast = load_energy_bvar_forecast(directory)
+        dataset = (
+            PROJECT_ROOT
+            / "data"
+            / "processed"
+            / str(vintage)
+            / model_spec(model_id).dataset_file
+        )
+        return component_tax_scenario_contract(
+            model_id,
+            forecast,
+            dataset_path=dataset,
+        )
+
+    return snapshot_get_or_build(
+        "tax_scenario_contract",
+        key,
+        _build,
+    )
+
+
+
+def _cached_conditional_aggregate_contract(directory: Path) -> dict:
+    directory = Path(directory)
+    return snapshot_get_or_build(
+        "conditional_aggregate_contract",
+        (_registry_snapshot_id(), str(directory.resolve())),
+        lambda: conditional_aggregate_contract(directory),
+    )
+
+
+def _cached_conditional_component_contract(
+    directory: Path,
+    *,
+    model_id: str,
+) -> dict:
+    directory = Path(directory)
+    return snapshot_get_or_build(
+        "conditional_component_contract",
+        (
+            _registry_snapshot_id(),
+            str(directory.resolve()),
+            str(model_id),
+        ),
+        lambda: conditional_component_contract(
+            directory,
+            model_id=str(model_id),
+            project_root=PROJECT_ROOT,
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -6508,7 +9002,11 @@ def _scenario_component_contract_for_row(
 def conditional_aggregate_options(vintage, _, current):
     if not vintage:
         return [], None
-    frame = list_aggregates(REGISTRY_PATH, vintage=str(vintage), present_only=True)
+    frame = _registry_table("aggregates")
+    if not frame.empty:
+        frame = frame.loc[
+            frame["vintage"].astype(str).eq(str(vintage))
+        ].copy()
     if frame.empty:
         return [], None
     frame = frame.loc[frame["status"].astype(str) == "complete"].copy()
@@ -6524,7 +9022,7 @@ def conditional_aggregate_options(vintage, _, current):
     for _idx, row in frame.iterrows():
         directory = Path(str(row["directory"]))
         try:
-            contract = conditional_aggregate_contract(directory)
+            contract = _cached_conditional_aggregate_contract(directory)
             if not contract.get("model_ids"):
                 continue
         except Exception:
@@ -6559,7 +9057,7 @@ def conditional_component_options(
     if row is None:
         return [], None
     try:
-        contract = conditional_aggregate_contract(Path(str(row["directory"])))
+        contract = _cached_conditional_aggregate_contract(Path(str(row["directory"])))
         model_ids = list(contract.get("model_ids", []) or [])
     except Exception:
         return [], None
@@ -6594,10 +9092,9 @@ def conditional_variable_options(
     if row is None or not model_id:
         return [], None
     try:
-        contract = conditional_component_contract(
+        contract = _cached_conditional_component_contract(
             Path(str(row["directory"])),
             model_id=str(model_id),
-            project_root=PROJECT_ROOT,
         )
     except Exception:
         return [], None
@@ -6652,10 +9149,9 @@ def conditional_path_defaults(
             "Select an aggregate, component and conditioned variable.",
         )
     try:
-        contract = conditional_component_contract(
+        contract = _cached_conditional_component_contract(
             Path(str(row["directory"])),
             model_id=str(model_id),
-            project_root=PROJECT_ROOT,
         )
         latest = dict(contract.get("latest_observed", {}) or {}).get(
             str(condition_variable), {}
@@ -7007,6 +9503,7 @@ def conditional_result_banner(store, model_id):
     Output("conditional-stat-aggregate-note", "children"),
     Output("conditional-stat-draws", "children"),
     Output("conditional-stat-draws-note", "children"),
+    Output("conditional-effect-table", "data"),
     Input("conditional-store", "data"),
     Input("conditional-component-select", "value"),
 )
@@ -7014,7 +9511,7 @@ def conditional_stats(store, model_id):
     payload = conditional_set_payload(store, model_id)
     values = conditional_kpis(payload)
     if values.get("condition_level") is None:
-        return "—", "", "—", "", "—", "", "—", ""
+        return "—", "", "—", "", "—", "", "—", "", []
 
     unit = str(values.get("condition_unit") or "")
     comp = values.get("component_impact")
@@ -7051,6 +9548,11 @@ def conditional_stats(store, model_id):
             ""
             if draws is None
             else f"matched from {int(original):,} saved aggregate draws"
+        ),
+        dual_impact_records(
+            payload.get("component_impact_yoy"),
+            payload.get("aggregate_impact_yoy"),
+            max_months=None,
         ),
     )
 
@@ -7102,10 +9604,22 @@ def conditional_figures(store, model_id, fan_mode):
 def _scenario_component_forecast_row(vintage: str | None, model_id: str | None, forecast_name: str | None):
     if not vintage or not model_id or not forecast_name:
         return None
-    forecasts = list_forecasts(REGISTRY_PATH, model_id=str(model_id), vintage=str(vintage), forecast_name=str(forecast_name), valid_only=True, present_only=True)
+    forecasts = _registry_table("forecasts")
+    if not forecasts.empty:
+        forecasts = forecasts.loc[
+            forecasts["model_id"].astype(str).eq(str(model_id))
+            & forecasts["vintage"].astype(str).eq(str(vintage))
+            & forecasts["forecast_name"].astype(str).eq(str(forecast_name))
+        ].copy()
     if forecasts.empty:
         return None
-    runs = list_runs(REGISTRY_PATH, model_id=str(model_id), vintage=str(vintage), status="complete", present_only=True)
+    runs = _registry_table("runs")
+    if not runs.empty:
+        runs = runs.loc[
+            runs["model_id"].astype(str).eq(str(model_id))
+            & runs["vintage"].astype(str).eq(str(vintage))
+            & runs["status"].astype(str).eq("complete")
+        ].copy()
     promoted = set(runs.loc[runs["promoted"].fillna(0).astype(int)==1,"run_id"].astype(str)) if not runs.empty else set()
     promoted_rows = forecasts.loc[forecasts["run_id"].astype(str).isin(promoted)]
     if len(promoted_rows)==1: return promoted_rows.iloc[0]
@@ -7138,79 +9652,421 @@ def scenario_component_options(vintage, forecast_name, _, current):
     return options, value
 
 
-@callback(Output("scenario-start-date","date"), Output("scenario-start-date","min_date_allowed"), Output("scenario-start-date","max_date_allowed"), Output("scenario-vat-delta","value"), Output("scenario-excise-delta","value"), Output("scenario-excise-label","children"), Output("scenario-support-note","children"), Output("scenario-start-date","disabled"), Output("scenario-vat-delta","disabled"), Output("scenario-excise-delta","disabled"), Input("scenario-component-select","value"), Input("vintage-select","value"), Input("forecast-select","value"), Input("registry-store","data"), Input("scenario-store","data"))
+@callback(
+    Output("scenario-start-date","date"),
+    Output("scenario-start-date","min_date_allowed"),
+    Output("scenario-start-date","max_date_allowed"),
+    Output("scenario-vat-delta","value"),
+    Output("scenario-excise-delta","value"),
+    Output("scenario-excise-label","children"),
+    Output("scenario-excise-delta","step"),
+    Output("scenario-support-note","children"),
+    Output("scenario-start-date","disabled"),
+    Output("scenario-vat-delta","disabled"),
+    Output("scenario-excise-delta","disabled"),
+    Input("scenario-component-select","value"),
+    Input("vintage-select","value"),
+    Input("forecast-select","value"),
+    Input("registry-store","data"),
+    Input("scenario-store","data"),
+)
 def scenario_control_defaults(model_id, vintage, forecast_name, _, scenario_store):
     if not model_id or not vintage or not forecast_name:
-        return None,None,None,0.0,0.0,"Excise change","No scenario-capable component forecast is available.",True,True,True
-    row=_scenario_component_forecast_row(vintage,model_id,forecast_name)
+        return (
+            None, None, None, 0.0, 0.0, "Excise change", 0.1,
+            "No scenario-capable component forecast is available.",
+            True, True, True,
+        )
+
+    row = _scenario_component_forecast_row(vintage, model_id, forecast_name)
     if row is None:
-        return None,None,None,0.0,0.0,"Excise change",f"{model_spec(model_id).label}: no unique saved forecast. Promote one run if several coexist.",True,True,True
+        return (
+            None, None, None, 0.0, 0.0, "Excise change", 0.1,
+            f"{model_spec(model_id).label}: no unique saved forecast. "
+            "Promote one run if several coexist.",
+            True, True, True,
+        )
+
     try:
-        contract = _scenario_component_contract_for_row(str(vintage), model_id, row)
+        contract = _scenario_component_contract_for_row(
+            str(vintage), model_id, row
+        )
     except Exception as exc:
-        return None,None,None,0.0,0.0,"Excise change",f"Scenario controls unavailable: {exc}",True,True,True
-    existing=scenario_set_payload(scenario_store,model_id); em=dict((existing or {}).get("meta",{}) or {})
-    unit=str(contract.get("excise_unit","source unit"))
-    frequency=str(contract.get("frequency","monthly"))
-    min_start=_normalise_scenario_period(contract["min_start"], frequency)
-    max_start=_normalise_scenario_period(contract["max_start"], frequency)
-    default_start=_normalise_scenario_period(contract["default_start"], frequency)
-    start=_normalise_scenario_period(em.get("scenario_start") or default_start, frequency)
+        return (
+            None, None, None, 0.0, 0.0, "Excise change", 0.1,
+            f"Scenario controls unavailable: {exc}",
+            True, True, True,
+        )
+
+    existing = scenario_set_payload(scenario_store, model_id)
+    em = dict((existing or {}).get("meta", {}) or {})
+    source_unit = str(contract.get("excise_unit", "source unit"))
+    display = _scenario_excise_display_spec(source_unit)
+
+    frequency = str(contract.get("frequency", "monthly"))
+    min_start = _normalise_scenario_period(contract["min_start"], frequency)
+    max_start = _normalise_scenario_period(contract["max_start"], frequency)
+    default_start = _normalise_scenario_period(contract["default_start"], frequency)
+    start = _normalise_scenario_period(
+        em.get("scenario_start") or default_start,
+        frequency,
+    )
     if start < min_start or start > max_start:
-        start=default_start
-    freq_label="monthly periods" if frequency=="monthly" else "weekly periods (Monday)"
+        start = default_start
+
+    source_baseline = float(contract["baseline_excise_at_start"])
+    display_baseline = _scenario_excise_to_display(
+        source_baseline, source_unit
+    )
+    stored_source_delta = float(em.get("excise_delta", 0.0) or 0.0)
+    display_delta = _scenario_excise_to_display(
+        stored_source_delta, source_unit
+    )
+
+    freq_label = (
+        "monthly periods"
+        if frequency == "monthly"
+        else "weekly periods (Monday)"
+    )
     tax_source_note = (
         "WOB VAT + excise tax block · "
         if frequency == "weekly"
         else "VAT + excise tax bridge · "
     )
-    note=(
+
+    conversion_note = ""
+    if bool(display["scaled"]):
+        conversion_note = (
+            f" Editor unit: {display['display_unit']}; model/source unit: "
+            f"{display['source_unit']}."
+        )
+
+    note = (
         f"{model_spec(model_id).label} · run {str(row['run_id'])[:12]} · "
-        f"available scenario window {min_start.date().isoformat()} — {max_start.date().isoformat()} "
-        f"({freq_label}) · {tax_source_note}baseline at first future period: VAT "
+        f"available scenario window {min_start.date().isoformat()} — "
+        f"{max_start.date().isoformat()} ({freq_label}) · "
+        f"{tax_source_note}baseline at first future period: VAT "
         f"{contract['baseline_vat_at_start']:.2f}% · excise "
-        f"{contract['baseline_excise_at_start']:.3f} {unit}. "
-        "Enter a non-zero VAT and/or excise change; zero/zero removes the component from the active set."
+        f"{display_baseline:.2f} {display['display_unit']}."
+        f"{conversion_note} Enter a non-zero VAT and/or excise change; "
+        "zero/zero removes the component from the active set."
     )
-    return start.date(),min_start.date(),max_start.date(),float(em.get("vat_delta_pp",0.0) or 0.0),float(em.get("excise_delta",0.0) or 0.0),f"Excise change ({unit})",note,False,False,False
+
+    return (
+        start.date(),
+        min_start.date(),
+        max_start.date(),
+        float(em.get("vat_delta_pp", 0.0) or 0.0),
+        display_delta,
+        f"Excise change ({display['display_unit']})",
+        float(display["step"]),
+        note,
+        False,
+        False,
+        False,
+    )
 
 
-@callback(Output("scenario-store","data"), Output("scenario-banner","children"), Input("scenario-apply","n_clicks"), Input("scenario-remove","n_clicks"), Input("scenario-reset-all","n_clicks"), State("vintage-select","value"), State("forecast-select","value"), State("scenario-component-select","value"), State("scenario-start-date","date"), State("scenario-vat-delta","value"), State("scenario-excise-delta","value"), State("scenario-store","data"), prevent_initial_call=True)
-def mutate_scenario_set(_apply,_remove,_reset,vintage,forecast_name,model_id,start_date,vat_delta,excise_delta,current_store):
-    trigger=ctx.triggered_id
-    if trigger=="scenario-reset-all": return clear_scenario_set(vintage=vintage,forecast_name=forecast_name), html.Div("All component tax scenarios cleared.",className="selection-banner")
-    if not model_id: return no_update, html.Div("Select a component.",className="banner-error")
-    if trigger=="scenario-remove": return remove_scenario_component(current_store,model_id), html.Div(f"{model_spec(model_id).label}: scenario removed.",className="selection-banner")
-    if trigger!="scenario-apply": raise PreventUpdate
-    if not vintage or not forecast_name or start_date is None: return no_update, html.Div("Vintage, forecast and start date are required.",className="banner-error")
-    row=_scenario_component_forecast_row(vintage,model_id,forecast_name)
-    if row is None: return no_update, html.Div(f"{model_spec(model_id).label}: no unique promoted/saved run is available.",className="banner-error")
-    vat_delta=float(vat_delta or 0.0); excise_delta=float(excise_delta or 0.0)
-    if abs(vat_delta)<1e-15 and abs(excise_delta)<1e-15:
-        return remove_scenario_component(current_store,model_id), html.Div(f"{model_spec(model_id).label}: zero changes, component removed from the active set.",className="selection-banner")
+@callback(
+    Output("scenario-tax-preview", "children"),
+    Input("scenario-component-select", "value"),
+    Input("vintage-select", "value"),
+    Input("forecast-select", "value"),
+    Input("scenario-vat-delta", "value"),
+    Input("scenario-excise-delta", "value"),
+    Input("registry-store", "data"),
+)
+def scenario_tax_input_preview(
+    model_id,
+    vintage,
+    forecast_name,
+    vat_delta,
+    excise_delta_display,
+    _,
+):
+    if not model_id or not vintage or not forecast_name:
+        return "Select a scenario-capable component to preview the tax change."
+
+    row = _scenario_component_forecast_row(vintage, model_id, forecast_name)
+    if row is None:
+        return "No unique saved component forecast is available."
+
+    try:
+        contract = _scenario_component_contract_for_row(
+            str(vintage), model_id, row
+        )
+        source_unit = str(contract.get("excise_unit", "source unit"))
+        display = _scenario_excise_display_spec(source_unit)
+        baseline_source = float(contract["baseline_excise_at_start"])
+        baseline_display = _scenario_excise_to_display(
+            baseline_source, source_unit
+        )
+        delta_display = float(excise_delta_display or 0.0)
+        delta_source = _scenario_excise_from_display(
+            delta_display, source_unit
+        )
+        scenario_display = _scenario_excise_to_display(
+            baseline_source + delta_source,
+            source_unit,
+        )
+        base_vat = float(contract["baseline_vat_at_start"])
+        delta_vat = float(vat_delta or 0.0)
+        scenario_vat = base_vat + delta_vat
+        guard = _scenario_excise_plausibility_error(
+            displayed_delta=delta_display,
+            source_delta=delta_source,
+            source_baseline=baseline_source,
+            source_unit=source_unit,
+        )
+    except Exception as exc:
+        return html.Span(f"Tax-input preview unavailable: {exc}")
+
+    pieces = [
+        html.Strong("Scenario preview · "),
+        html.Span(
+            f"VAT {base_vat:.2f}% {delta_vat:+.2f} pp → "
+            f"{scenario_vat:.2f}%"
+        ),
+        html.Span(
+            f" · Excise {baseline_display:.2f} "
+            f"{display['display_unit']} {delta_display:+.2f} → "
+            f"{scenario_display:.2f} {display['display_unit']}"
+        ),
+    ]
+    if bool(display["scaled"]):
+        pieces.append(
+            html.Span(
+                f" · internal model change "
+                f"{delta_source:+.6g} {display['source_unit']}",
+                style={"color": "#64748b"},
+            )
+        )
+    if guard:
+        pieces.append(
+            html.Span(
+                " · WARNING: " + guard,
+                style={"color": "#B42318", "fontWeight": "700"},
+            )
+        )
+    return pieces
+
+
+@callback(
+    Output("scenario-store","data"),
+    Output("scenario-banner","children"),
+    Input("scenario-apply","n_clicks"),
+    Input("scenario-remove","n_clicks"),
+    Input("scenario-reset-all","n_clicks"),
+    State("vintage-select","value"),
+    State("forecast-select","value"),
+    State("scenario-component-select","value"),
+    State("scenario-start-date","date"),
+    State("scenario-vat-delta","value"),
+    State("scenario-excise-delta","value"),
+    State("scenario-store","data"),
+    prevent_initial_call=True,
+)
+def mutate_scenario_set(
+    _apply,
+    _remove,
+    _reset,
+    vintage,
+    forecast_name,
+    model_id,
+    start_date,
+    vat_delta,
+    excise_delta_display,
+    current_store,
+):
+    trigger = ctx.triggered_id
+
+    if trigger == "scenario-reset-all":
+        return (
+            clear_scenario_set(
+                vintage=vintage,
+                forecast_name=forecast_name,
+            ),
+            html.Div(
+                "All component tax scenarios cleared.",
+                className="selection-banner",
+            ),
+        )
+
+    if not model_id:
+        return no_update, html.Div(
+            "Select a component.",
+            className="banner-error",
+        )
+
+    if trigger == "scenario-remove":
+        return (
+            remove_scenario_component(current_store, model_id),
+            html.Div(
+                f"{model_spec(model_id).label}: scenario removed.",
+                className="selection-banner",
+            ),
+        )
+
+    if trigger != "scenario-apply":
+        raise PreventUpdate
+
+    if not vintage or not forecast_name or start_date is None:
+        return no_update, html.Div(
+            "Vintage, forecast and start date are required.",
+            className="banner-error",
+        )
+
+    row = _scenario_component_forecast_row(
+        vintage, model_id, forecast_name
+    )
+    if row is None:
+        return no_update, html.Div(
+            f"{model_spec(model_id).label}: no unique promoted/saved "
+            "run is available.",
+            className="banner-error",
+        )
+
+    vat_delta = float(vat_delta or 0.0)
+    excise_delta_display = float(excise_delta_display or 0.0)
+
     try:
         from energy_bvar_io import load_energy_bvar_forecast
-        forecast_dir=Path(str(row["directory"])); run_dir=forecast_dir.parent.parent
-        forecast=load_energy_bvar_forecast(forecast_dir)
-        dataset=PROJECT_ROOT/"data"/"processed"/str(vintage)/model_spec(model_id).dataset_file
-        contract=component_tax_scenario_contract(model_id,forecast,dataset_path=dataset)
-        frequency=str(contract.get("frequency","monthly"))
-        effective_start=_normalise_scenario_period(start_date, frequency)
-        min_start=_normalise_scenario_period(contract["min_start"], frequency)
-        max_start=_normalise_scenario_period(contract["max_start"], frequency)
-        if effective_start < min_start or effective_start > max_start:
+
+        forecast_dir = Path(str(row["directory"]))
+        run_dir = forecast_dir.parent.parent
+        forecast = load_energy_bvar_forecast(forecast_dir)
+        dataset = (
+            PROJECT_ROOT
+            / "data"
+            / "processed"
+            / str(vintage)
+            / model_spec(model_id).dataset_file
+        )
+        contract = component_tax_scenario_contract(
+            model_id,
+            forecast,
+            dataset_path=dataset,
+        )
+
+        source_unit = str(
+            contract.get("excise_unit", "source unit")
+        )
+        display = _scenario_excise_display_spec(source_unit)
+        excise_delta = _scenario_excise_from_display(
+            excise_delta_display,
+            source_unit,
+        )
+
+        if (
+            abs(vat_delta) < 1e-15
+            and abs(excise_delta) < 1e-15
+        ):
+            return (
+                remove_scenario_component(
+                    current_store, model_id
+                ),
+                html.Div(
+                    f"{model_spec(model_id).label}: zero changes, "
+                    "component removed from the active set.",
+                    className="selection-banner",
+                ),
+            )
+
+        guard = _scenario_excise_plausibility_error(
+            displayed_delta=excise_delta_display,
+            source_delta=excise_delta,
+            source_baseline=float(
+                contract["baseline_excise_at_start"]
+            ),
+            source_unit=source_unit,
+        )
+        if guard:
             return no_update, html.Div(
-                f"Scenario start must lie inside the selected forecast horizon: "
-                f"{min_start.date().isoformat()} — {max_start.date().isoformat()}.",
+                [
+                    html.Strong("Scenario not applied: "),
+                    html.Span(guard),
+                ],
                 className="banner-error",
             )
-        result=build_saved_component_tax_scenario(run_dir,project_root=PROJECT_ROOT,forecast_name=str(forecast_name),start_date=effective_start,vat_delta_pp=vat_delta,excise_delta=excise_delta,max_draws=500)
-        payload=scenario_payload(result); payload.setdefault("meta",{}).update({"vintage":str(vintage),"run_id":str(row["run_id"]),"forecast_name":str(forecast_name)})
-        updated=upsert_scenario_component(current_store,payload,vintage=str(vintage),forecast_name=str(forecast_name))
+
+        frequency = str(contract.get("frequency", "monthly"))
+        effective_start = _normalise_scenario_period(
+            start_date, frequency
+        )
+        min_start = _normalise_scenario_period(
+            contract["min_start"], frequency
+        )
+        max_start = _normalise_scenario_period(
+            contract["max_start"], frequency
+        )
+        if effective_start < min_start or effective_start > max_start:
+            return no_update, html.Div(
+                f"Scenario start must lie inside the selected forecast "
+                f"horizon: {min_start.date().isoformat()} — "
+                f"{max_start.date().isoformat()}.",
+                className="banner-error",
+            )
+
+        result = build_saved_component_tax_scenario(
+            run_dir,
+            project_root=PROJECT_ROOT,
+            forecast_name=str(forecast_name),
+            start_date=effective_start,
+            vat_delta_pp=vat_delta,
+            excise_delta=excise_delta,
+            max_draws=500,
+        )
+        payload = scenario_payload(result)
+        payload.setdefault("meta", {}).update(
+            {
+                "vintage": str(vintage),
+                "run_id": str(row["run_id"]),
+                "forecast_name": str(forecast_name),
+            }
+        )
+        updated = upsert_scenario_component(
+            current_store,
+            payload,
+            vintage=str(vintage),
+            forecast_name=str(forecast_name),
+        )
+
     except Exception as exc:
-        return no_update, html.Div([html.Strong("Scenario calculation failed: "),html.Span(str(exc))],className="banner-error")
-    meta=payload["meta"]; count=len(scenario_set_components(updated))
-    return updated, html.Div([html.Strong(str(result["hicp_label"])),html.Span(f" · VAT {vat_delta:+.2f} pp"),html.Span(f" · excise {excise_delta:+.3f} {meta['excise_unit']}"),html.Span(f" · {meta['n_draws_effective']} paired draws"),html.Span(f" · {count} active component scenario"+("s" if count!=1 else ""))],className="selection-banner")
+        return no_update, html.Div(
+            [
+                html.Strong("Scenario calculation failed: "),
+                html.Span(str(exc)),
+            ],
+            className="banner-error",
+        )
+
+    meta = payload["meta"]
+    count = len(scenario_set_components(updated))
+    display_delta = _scenario_excise_to_display(
+        float(meta.get("excise_delta", 0.0) or 0.0),
+        meta.get("excise_unit"),
+    )
+    display_unit = _scenario_excise_display_spec(
+        meta.get("excise_unit")
+    )["display_unit"]
+
+    return updated, html.Div(
+        [
+            html.Strong(str(result["hicp_label"])),
+            html.Span(f" · VAT {vat_delta:+.2f} pp"),
+            html.Span(
+                f" · excise {display_delta:+.2f} {display_unit}"
+            ),
+            html.Span(
+                f" · {meta['n_draws_effective']} paired draws"
+            ),
+            html.Span(
+                f" · {count} active component scenario"
+                + ("s" if count != 1 else "")
+            ),
+        ],
+        className="selection-banner",
+    )
 
 
 @callback(
@@ -7231,6 +10087,11 @@ def render_scenario_set_summary(store, selected_model_id):
         selected=(str(selected_model_id)==model_id)
         start=pd.to_datetime(row.get("scenario_start"),errors="coerce")
         start_label="—" if pd.isna(start) else pd.Timestamp(start).date().isoformat()
+        excise_display_spec = _scenario_excise_display_spec(row.get("excise_unit"))
+        excise_display_delta = _scenario_excise_to_display(
+            row.get("excise_delta", 0.0),
+            row.get("excise_unit"),
+        )
         cards.append(
             html.Button(
                 [
@@ -7252,7 +10113,10 @@ def render_scenario_set_summary(store, selected_model_id):
                         [
                             html.Span(f"start {start_label}"),
                             html.Span(f" · VAT {row['vat_delta_pp']:+.2f} pp"),
-                            html.Span(f" · excise {row['excise_delta']:+.3f} {row['excise_unit']}"),
+                            html.Span(
+                                f" · excise {excise_display_delta:+.2f} "
+                                f"{excise_display_spec['display_unit']}"
+                            ),
                         ],
                         style={"marginTop":"3px","fontSize":"12px","color":"#64748b"},
                     ),
@@ -7297,12 +10161,25 @@ def select_scenario_card(clicks):
     return str(model_id)
 
 
-@callback(Output("scenario-baseline-terminal","children"),Output("scenario-terminal-date","children"),Output("scenario-scenario-terminal","children"),Output("scenario-terminal-date-2","children"),Output("scenario-impact-terminal","children"),Output("scenario-impact-interval","children"),Output("scenario-draws","children"),Output("scenario-draws-note","children"),Input("scenario-store","data"),Input("scenario-component-select","value"))
+@callback(Output("scenario-baseline-terminal","children"),Output("scenario-terminal-date","children"),Output("scenario-scenario-terminal","children"),Output("scenario-terminal-date-2","children"),Output("scenario-impact-terminal","children"),Output("scenario-impact-interval","children"),Output("scenario-draws","children"),Output("scenario-draws-note","children"),Output("scenario-effect-table","data"),Input("scenario-store","data"),Input("scenario-component-select","value"))
 def scenario_stat_cards(store,model_id):
     values=scenario_kpis(scenario_set_payload(store,model_id))
-    if values.get("terminal_date") is None: return "—","","—","","—","","—",""
+    if values.get("terminal_date") is None: return "—","","—","","—","","—","",[]
     date=pd.Timestamp(values["terminal_date"]).date().isoformat(); low=values.get("impact_low"); high=values.get("impact_high"); interval="" if low is None or high is None else f"68% [{low:+.2f}, {high:+.2f}] pp"; draws=values.get("n_draws")
-    return f"{values['baseline_terminal']:.2f}%",date,f"{values['scenario_terminal']:.2f}%",date,f"{values['impact_terminal']:+.2f} pp",interval,("—" if draws is None else f"{int(draws):,}"),"matched baseline/scenario"
+    payload=scenario_set_payload(store,model_id)
+    frames=scenario_frames(payload) if payload else {}
+    fans=frames.get("fans", pd.DataFrame())
+    def _tax_block(name):
+        if fans is None or fans.empty or "name" not in fans:
+            return pd.DataFrame()
+        return fans.loc[fans["name"].astype(str).eq(name)].copy()
+    table=paired_effect_records(
+        _tax_block("baseline_yoy"),
+        _tax_block("scenario_yoy"),
+        _tax_block("yoy_impact_pp"),
+        max_months=None,
+    )
+    return f"{values['baseline_terminal']:.2f}%",date,f"{values['scenario_terminal']:.2f}%",date,f"{values['impact_terminal']:+.2f} pp",interval,("—" if draws is None else f"{int(draws):,}"),"matched baseline/scenario",table
 
 
 @callback(Output("scenario-main-graph","figure"),Output("scenario-level-impact","figure"),Output("scenario-yoy-impact","figure"),Output("scenario-tax-graph","figure"),Input("scenario-store","data"),Input("scenario-component-select","value"),Input("scenario-fan","value"))
@@ -7317,15 +10194,22 @@ def scenario_figures(store,model_id,fan_mode):
 @callback(
     Output("scenario-tax-selected-agg-store", "data"),
     Input("scenario-store", "data"),
-    Input("scenario-component-select", "value"),
-    Input("conditional-agg-select", "value"),
-    Input("vintage-select", "value"),
+    State("conditional-agg-select", "value"),
+    State("vintage-select", "value"),
 )
 def selected_tax_aggregate_marginal(
-    tax_store, model_id, aggregate_run_id, vintage
+    tax_store,
+    aggregate_run_id,
+    vintage,
 ):
-    payload = scenario_set_payload(tax_store, model_id)
-    if not payload or not model_id or not aggregate_run_id or not vintage:
+    """Precompute every active component's marginal Energy effect once.
+
+    The only Input is ``scenario-store``; that store changes after the explicit
+    Apply/Remove/Reset scenario action. Selecting a component afterwards merely
+    chooses among these already-computed results.
+    """
+    summaries = scenario_set_summary(tax_store)
+    if not summaries or not aggregate_run_id or not vintage:
         return None
 
     aggregate_row = _selected_aggregate_row(vintage, aggregate_run_id)
@@ -7336,92 +10220,125 @@ def selected_tax_aggregate_marginal(
     run_ids = _run_ids_from_aggregate_metadata(metadata)
     if not run_ids:
         return {
-            "error": "Selected aggregate lacks exact component-run provenance."
+            "by_model": {},
+            "errors": {
+                "*": "Selected aggregate lacks exact component-run provenance."
+            },
         }
 
-    single = clear_scenario_set(
-        vintage=str(vintage),
-        forecast_name=str(metadata.get("forecast_name") or "unconditional"),
+    forecast_name = str(
+        metadata.get("forecast_name") or "unconditional"
     )
-    single = upsert_scenario_component(
-        single,
-        payload,
-        vintage=str(vintage),
-        forecast_name=str(metadata.get("forecast_name") or "unconditional"),
-    )
-    tax_scenarios = scenario_set_to_tax_scenarios(single)
-    signature = scenario_set_signature(single)
-    cache_key = "selected-tax-agg-v2::" + json.dumps(
-        {
-            "aggregate": str(aggregate_run_id),
-            "model_id": str(model_id),
-            "signature": signature,
-        },
-        sort_keys=True,
-        default=str,
-    )
-    cached = _diskcache.get(cache_key)
-    if isinstance(cached, dict):
-        return cached
+    by_model: dict[str, dict] = {}
+    errors: dict[str, str] = {}
 
-    try:
-        outcome = run_aggregate(
-            str(vintage),
-            project_root=PROJECT_ROOT,
-            results_root=RESULTS_ROOT,
-            forecast_name=str(metadata.get("forecast_name") or "unconditional"),
-            run_ids=run_ids,
-            n_aggregate_draws=min(
-                500,
-                max(
-                    1,
-                    int(metadata.get("n_aggregate_draws_requested") or 500),
-                ),
-            ),
-            pairing_seed=int(metadata.get("pairing_seed") or 2026),
-            tax_scenarios=tax_scenarios,
-            weekly_tax_mode="strict",
-            persist=False,
+    for item in summaries:
+        model_id = str(item.get("model_id") or "")
+        payload = scenario_set_payload(tax_store, model_id)
+        if not model_id or not payload:
+            continue
+
+        single = clear_scenario_set(
+            vintage=str(vintage),
+            forecast_name=forecast_name,
         )
-        result = aggregate_live_scenario_payload(
-            outcome,
+        single = upsert_scenario_component(
+            single,
+            payload,
+            vintage=str(vintage),
+            forecast_name=forecast_name,
+        )
+        tax_scenarios = scenario_set_to_tax_scenarios(single)
+        signature = scenario_set_signature(single)
+        cache_key = "selected-tax-agg-v3::" + json.dumps(
             {
-                "scenario_count": 1,
-                "scenario_components": [str(model_id)],
-                "scenario_signature": signature,
+                "aggregate": str(aggregate_run_id),
+                "model_id": model_id,
+                "signature": signature,
             },
+            sort_keys=True,
+            default=str,
         )
-        result.setdefault("meta", {}).update(
-            {
-                "aggregate_run_id": str(aggregate_run_id),
-                "selected_tax_model_id": str(model_id),
-            }
-        )
-        _diskcache.set(cache_key, result, expire=3600)
-        return result
-    except Exception as exc:
-        return {"error": f"{type(exc).__name__}: {exc}"}
+        cached = _diskcache.get(cache_key)
+        if isinstance(cached, dict):
+            by_model[model_id] = cached
+            continue
+
+        try:
+            outcome = run_aggregate(
+                str(vintage),
+                project_root=PROJECT_ROOT,
+                results_root=RESULTS_ROOT,
+                forecast_name=forecast_name,
+                run_ids=run_ids,
+                n_aggregate_draws=min(
+                    500,
+                    max(
+                        1,
+                        int(
+                            metadata.get("n_aggregate_draws_requested")
+                            or 500
+                        ),
+                    ),
+                ),
+                pairing_seed=int(metadata.get("pairing_seed") or 2026),
+                tax_scenarios=tax_scenarios,
+                weekly_tax_mode="strict",
+                persist=False,
+            )
+            result = aggregate_live_scenario_payload(
+                outcome,
+                {
+                    "scenario_count": 1,
+                    "scenario_components": [model_id],
+                    "scenario_signature": signature,
+                },
+            )
+            result.setdefault("meta", {}).update(
+                {
+                    "aggregate_run_id": str(aggregate_run_id),
+                    "selected_tax_model_id": model_id,
+                }
+            )
+            _diskcache.set(cache_key, result, expire=3600)
+            by_model[model_id] = result
+        except Exception as exc:
+            errors[model_id] = f"{type(exc).__name__}: {exc}"
+
+    return {
+        "by_model": by_model,
+        "errors": errors,
+        "aggregate_run_id": str(aggregate_run_id),
+        "vintage": str(vintage),
+    }
 
 
 @callback(
     Output("scenario-tax-energy-graph", "figure"),
     Input("scenario-tax-selected-agg-store", "data"),
     Input("scenario-fan", "value"),
+    Input("scenario-component-select", "value"),
 )
-def selected_tax_energy_figure(store, fan_mode):
-    if not store:
+def selected_tax_energy_figure(store, fan_mode, model_id):
+    if not store or not model_id:
         return empty_aggregate_figure(
             "Add/select a tax scenario to display its marginal HICP Energy effect."
         )
-    if store.get("error"):
-        return empty_aggregate_figure(str(store["error"]))
+    errors = dict(store.get("errors") or {})
+    if model_id in errors:
+        return empty_aggregate_figure(str(errors[model_id]))
+    payload = dict((store.get("by_model") or {}).get(str(model_id)) or {})
+    if not payload:
+        return empty_aggregate_figure(
+            "The selected component has no precomputed marginal Energy effect."
+        )
     return tidy_aggregate_figure(
         aggregate_live_impact_figure(
-            store,
+            payload,
             fan_mode=fan_mode or "68",
             uirevision=(
-                f"{store.get('meta',{}).get('aggregate_run_id','agg')}::"
-                f"{store.get('meta',{}).get('selected_tax_model_id','tax')}::marginal"
+                f"{payload.get('meta',{}).get('aggregate_run_id','agg')}::"
+                f"{payload.get('meta',{}).get('selected_tax_model_id','tax')}::marginal"
             ),
         )
     )
@@ -7430,7 +10347,11 @@ def selected_tax_energy_figure(store, fan_mode):
 def _selected_aggregate_row(vintage: str | None, aggregate_run_id: str | None):
     if not vintage or not aggregate_run_id:
         return None
-    frame = list_aggregates(REGISTRY_PATH, vintage=str(vintage), present_only=True)
+    frame = _registry_table("aggregates")
+    if not frame.empty:
+        frame = frame.loc[
+            frame["vintage"].astype(str).eq(str(vintage))
+        ].copy()
     if frame.empty:
         return None
     selected = frame.loc[frame["aggregate_run_id"].astype(str) == str(aggregate_run_id)]
@@ -7438,38 +10359,62 @@ def _selected_aggregate_row(vintage: str | None, aggregate_run_id: str | None):
 
 
 def _aggregate_metadata(directory: Path) -> dict:
-    path = Path(directory) / "metadata.json"
-    if not path.is_file():
-        fallback = Path(directory) / "aggregate_config.json"
-        path = fallback if fallback.is_file() else path
-    if not path.is_file():
-        return {}
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-    return value if isinstance(value, dict) else {}
+    directory = Path(directory)
+    key = (_registry_snapshot_id(), str(directory.resolve()))
+
+    def _build():
+        path = directory / "metadata.json"
+        if not path.is_file():
+            fallback = directory / "aggregate_config.json"
+            path = fallback if fallback.is_file() else path
+        if not path.is_file():
+            return {}
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    return snapshot_get_or_build(
+        "aggregate_metadata",
+        key,
+        _build,
+    )
 
 
 def _aggregate_forecast_origin(directory: Path) -> pd.Timestamp | None:
-    """Latest first-future month across component stores = aggregate forecast origin."""
-    metadata = _aggregate_metadata(directory)
-    stores = dict(metadata.get("component_forecast_stores", {}) or {})
-    starts: list[pd.Timestamp] = []
-    for raw in stores.values():
-        path = Path(str(raw)) / "forecast_metadata.json"
-        if not path.is_file():
-            continue
-        try:
-            fm = json.loads(path.read_text(encoding="utf-8"))
-            future = list(fm.get("future_dates", []) or [])
-            if not future:
+    """Latest first-future month across component stores, loaded once."""
+    directory = Path(directory)
+    key = (_registry_snapshot_id(), str(directory.resolve()))
+
+    def _build():
+        metadata = _aggregate_metadata(directory)
+        stores = dict(metadata.get("component_forecast_stores", {}) or {})
+        starts: list[pd.Timestamp] = []
+        for raw in stores.values():
+            path = Path(str(raw)) / "forecast_metadata.json"
+            if not path.is_file():
                 continue
-            first = pd.Timestamp(future[0]).to_period("M").to_timestamp(how="start")
-            starts.append(first)
-        except Exception:
-            continue
-    return max(starts) if starts else None
+            try:
+                fm = json.loads(path.read_text(encoding="utf-8"))
+                future = list(fm.get("future_dates", []) or [])
+                if not future:
+                    continue
+                first = (
+                    pd.Timestamp(future[0])
+                    .to_period("M")
+                    .to_timestamp(how="start")
+                )
+                starts.append(first)
+            except Exception:
+                continue
+        return max(starts) if starts else None
+
+    return snapshot_get_or_build(
+        "aggregate_forecast_origin",
+        key,
+        _build,
+    )
 
 
 def _run_ids_from_aggregate_metadata(metadata: dict) -> dict[str, str]:
@@ -7511,7 +10456,7 @@ def aggregate_options(vintage: str | None, _: dict | None, current: str | None):
     """
     if not vintage:
         return [], None
-    frame = list_aggregates(REGISTRY_PATH, present_only=True)
+    frame = _registry_table("aggregates")
     if frame.empty:
         return [], None
     frame = frame.loc[frame["vintage"].astype(str) == str(vintage)]
@@ -7547,7 +10492,7 @@ def aggregate_options(vintage: str | None, _: dict | None, current: str | None):
 
 def _no_aggregate_banner(vintage: str | None) -> html.Div:
     """Say what the registry actually holds instead of showing a blank page."""
-    frame = list_aggregates(REGISTRY_PATH, present_only=True)
+    frame = _registry_table("aggregates")
     if frame.empty:
         return html.Div(
             [
@@ -7602,7 +10547,11 @@ def load_aggregate_display(aggregate_run_id: str | None, vintage: str | None, _:
     if not aggregate_run_id:
         return None, _no_aggregate_banner(vintage)
 
-    frame_rows = list_aggregates(REGISTRY_PATH, vintage=vintage, present_only=True)
+    frame_rows = _registry_table("aggregates")
+    if not frame_rows.empty:
+        frame_rows = frame_rows.loc[
+            frame_rows["vintage"].astype(str).eq(str(vintage))
+        ].copy()
     selected = frame_rows.loc[
         frame_rows["aggregate_run_id"].astype(str) == str(aggregate_run_id)
     ]
@@ -7620,6 +10569,20 @@ def load_aggregate_display(aggregate_run_id: str | None, vintage: str | None, _:
             ],
             className="banner-error",
         )
+
+    aggregate_snapshot_ref = (
+        f"{_registry_snapshot_id()}::aggregate-display::"
+        f"{vintage}::{aggregate_run_id}"
+    )
+    cached_aggregate = snapshot_get(
+        "aggregate_display",
+        aggregate_snapshot_ref,
+    )
+    if (
+        isinstance(cached_aggregate, tuple)
+        and len(cached_aggregate) == 2
+    ):
+        return cached_aggregate
 
     directory = Path(str(row["directory"]))
     display_path = directory / DISPLAY_FILENAME
@@ -7674,9 +10637,7 @@ def load_aggregate_display(aggregate_run_id: str | None, vintage: str | None, _:
     # not mutate the persisted aggregate contract.
     aggregate_metadata: dict = {}
     try:
-        aggregate_metadata = json.loads(
-            (directory / "metadata.json").read_text(encoding="utf-8")
-        )
+        aggregate_metadata = _aggregate_metadata(directory)
     except Exception as exc:
         meta["aggregate_metadata_read_error"] = str(exc)
     if aggregate_metadata:
@@ -7714,6 +10675,32 @@ def load_aggregate_display(aggregate_run_id: str | None, vintage: str | None, _:
         meta["historical_contributions_available"] = False
         meta["historical_contributions_reason"] = str(exc)
 
+    # Tax-layer accounting is derived once from the exact selected aggregate,
+    # its saved pairing provenance and the same processed tax contexts used by
+    # production.  Presentation callbacks below consume only the frozen frame.
+    tax_decomposition_frame = pd.DataFrame()
+    tax_decomposition_meta: dict = {"available": False}
+    try:
+        tax_decomposition_frame, tax_contract = build_tax_contribution_decomposition(
+            directory,
+            project_root=PROJECT_ROOT,
+        )
+        tax_decomposition_meta = {"available": True, **dict(tax_contract)}
+        meta["tax_decomposition_available"] = True
+        meta["tax_decomposition_contract_version"] = tax_contract.get(
+            "contract_version"
+        )
+        meta["tax_decomposition_additivity_max_error"] = tax_contract.get(
+            "aggregate_additivity_max_abs_error"
+        )
+    except Exception as exc:
+        tax_decomposition_meta = {
+            "available": False,
+            "reason": str(exc),
+        }
+        meta["tax_decomposition_available"] = False
+        meta["tax_decomposition_reason"] = str(exc)
+
     # Never trust stale fit flags embedded by an older display builder.  The
     # fitted cache above is now the sole source of truth for model-fit overlays.
     meta["bvar_fitted_available"] = bool(fitted_meta.get("available"))
@@ -7750,19 +10737,50 @@ def load_aggregate_display(aggregate_run_id: str | None, vintage: str | None, _:
         ],
         className="selection-banner",
     )
-    return {
+    fitted_snapshot_ref = aggregate_snapshot_ref + "::fitted"
+    contribution_snapshot_ref = aggregate_snapshot_ref + "::history-contrib"
+    tax_decomposition_snapshot_ref = aggregate_snapshot_ref + "::tax-decomposition"
+    snapshot_put_frame(aggregate_snapshot_ref, frame)
+    if not fitted_frame.empty:
+        snapshot_put_frame(fitted_snapshot_ref, fitted_frame)
+    if not historical_contribution_frame.empty:
+        snapshot_put_frame(
+            contribution_snapshot_ref,
+            historical_contribution_frame,
+        )
+    if not tax_decomposition_frame.empty:
+        snapshot_put_frame(
+            tax_decomposition_snapshot_ref,
+            tax_decomposition_frame,
+        )
+
+    aggregate_store = {
+        "snapshot_ref": aggregate_snapshot_ref,
         "frame_json": _json_frame(frame),
         "meta": meta,
+        "fitted_snapshot_ref": fitted_snapshot_ref,
         "fitted_frame_json": (
             None if fitted_frame.empty else _json_frame(fitted_frame)
         ),
         "fitted_meta": fitted_meta,
+        "historical_contribution_snapshot_ref": contribution_snapshot_ref,
         "historical_contribution_frame_json": (
             None
             if historical_contribution_frame.empty
             else _json_frame(historical_contribution_frame)
         ),
-    }, banner
+        # Heavy tax-accounting data remain server-side; the browser carries
+        # only the immutable reference plus compact audit metadata.
+        "tax_decomposition_snapshot_ref": tax_decomposition_snapshot_ref,
+        "tax_decomposition_meta": tax_decomposition_meta,
+    }
+    result = (aggregate_store, banner)
+    snapshot_put(
+        "aggregate_display",
+        aggregate_snapshot_ref,
+        result,
+    )
+    return result
 
 
 @callback(
@@ -7797,23 +10815,30 @@ _FITTED_COMPONENT_COLORS = {
 
 
 def _fitted_frame_from_store(store: dict | None) -> pd.DataFrame:
-    if not store or not store.get("fitted_frame_json"):
-        return pd.DataFrame()
-    frame = pd.read_json(StringIO(store["fitted_frame_json"]), orient="split")
-    if "date" in frame:
-        frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
-    return frame
+    return snapshot_frame_from_store(
+        store,
+        json_key="fitted_frame_json",
+        reference_key="fitted_snapshot_ref",
+    )
 
 
 def _historical_contribution_frame_from_store(store: dict | None) -> pd.DataFrame:
-    if not store or not store.get("historical_contribution_frame_json"):
-        return pd.DataFrame()
-    frame = pd.read_json(
-        StringIO(store["historical_contribution_frame_json"]), orient="split"
+    return snapshot_frame_from_store(
+        store,
+        json_key="historical_contribution_frame_json",
+        reference_key="historical_contribution_snapshot_ref",
     )
-    if "date" in frame:
-        frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
-    return frame
+
+
+def _tax_decomposition_frame_from_store(store: dict | None) -> pd.DataFrame:
+    # Intentionally no JSON fallback: this accounting object is built once at
+    # aggregate bootstrap and kept server-side.  If it is gone, require an
+    # explicit aggregate/snapshot reload rather than silently touching disk.
+    return snapshot_frame_from_store(
+        store,
+        json_key="__tax_decomposition_no_browser_payload__",
+        reference_key="tax_decomposition_snapshot_ref",
+    )
 
 
 def _aggregate_figure_base(
@@ -7897,10 +10922,11 @@ def aggregate_overlay_options(store: dict | None, current: list[str] | None):
     if fitted_available:
         note = (
             "Component fitted = posterior one-step conditional BVAR fitted HICP "
-            "paths after the same tax/frequency adapters. Aggregated fitted = "
-            "draw-wise Laspeyres aggregation of those six paths; quantiles are "
-            "computed only after aggregation. The deterministic accounting "
-            "reconstruction is audit-only and is not plotted as model fit."
+            "paths over each component's full natural valid history after the same "
+            "tax/frequency adapters. Aggregated fitted begins only at the natural "
+            "common six-component overlap and is aggregated draw-by-draw with "
+            "Laspeyres weights. The deterministic accounting reconstruction is "
+            "audit-only and is not plotted as model fit."
         )
     else:
         reason = str(fitted_meta.get("reason") or "fitted cache not materialised")
@@ -7917,13 +10943,14 @@ def aggregate_overlay_options(store: dict | None, current: list[str] | None):
     Output("agg-terminal-date", "children"),
     Output("agg-draws", "children"),
     Output("agg-draws-unit", "children"),
+    Output("agg-summary-table", "data"),
     Input("agg-store", "data"),
     Input("agg-metric", "value"),
 )
 def aggregate_stat_cards(store: dict | None, metric: str | None):
     frame = _frame_from_store(store)
     if frame.empty or not metric:
-        return ("—", "", "—", "", "—", "", "—", "")
+        return ("—", "", "—", "", "—", "", "—", "", [])
     values = aggregate_kpis(frame, metric)
 
     def stamp(value):
@@ -7939,6 +10966,7 @@ def aggregate_stat_cards(store: dict | None, metric: str | None):
         stamp(values.get("terminal_date")),
         "—" if draws is None else f"{draws:,}",
         "effective" if draws is not None else "",
+        forecast_summary_records(frame, series=None, metric=metric, max_months=None),
     )
 
 
@@ -7948,14 +10976,12 @@ def aggregate_stat_cards(store: dict | None, metric: str | None):
     Input("agg-metric", "value"),
     Input("agg-fan", "value"),
     Input("agg-historical-overlays", "value"),
-    Input("agg-graph", "relayoutData"),
 )
 def aggregate_graph(
     store: dict | None,
     metric: str | None,
     fan_mode: str | None,
     historical_overlays: list[str] | None,
-    relayout_data: dict | None,
 ):
     frame = _frame_from_store(store)
     if frame.empty:
@@ -7989,15 +11015,15 @@ def aggregate_graph(
         ].copy()
         for series, label in _FITTED_COMPONENT_LABELS.items():
             part = rows.loc[rows["series"].astype(str) == series].sort_values("date")
-            part = part.dropna(subset=["date", "q50"])
+            part = part.dropna(subset=["date", "posterior_mean"])
             if part.empty:
                 continue
             fig.add_trace(
                 go.Scatter(
                     x=part["date"],
-                    y=part["q50"].astype(float),
+                    y=part["posterior_mean"].astype(float),
                     mode="lines",
-                    name=f"{label} BVAR fitted",
+                    name=f"{label} BVAR fitted · posterior mean",
                     line={
                         "width": 1.55,
                         "dash": "dot",
@@ -8013,14 +11039,14 @@ def aggregate_graph(
             & (fitted["series"].astype(str) == "hicp_energy")
             & (fitted["metric"].astype(str) == str(metric))
         ].sort_values("date")
-        part = part.dropna(subset=["date", "q50"])
+        part = part.dropna(subset=["date", "posterior_mean"])
         if not part.empty:
             fig.add_trace(
                 go.Scatter(
                     x=part["date"],
-                    y=part["q50"].astype(float),
+                    y=part["posterior_mean"].astype(float),
                     mode="lines",
-                    name="Aggregated BVAR fitted HICP Energy",
+                    name="Aggregated BVAR fitted HICP Energy · posterior mean",
                     line={"width": 2.7, "dash": "dash", "color": "#7C3AED"},
                     hovertemplate=(
                         "%{y:.2f}<extra>Aggregated BVAR fitted HICP Energy</extra>"
@@ -8028,21 +11054,14 @@ def aggregate_graph(
                 )
             )
 
-    # Recompute the vertical range from the *visible* horizontal window.
-    # This prevents large historical fitted spikes from being clipped after
-    # zooming while keeping a much more readable local scale.
-    fig = tidy_aggregate_figure(
+    # Freeze the server-rendered economic figure. Browser pan/zoom remains
+    # interactive via Plotly, but relayoutData no longer calls Python or
+    # automatically changes the y-axis.
+    return tidy_aggregate_figure(
         fig,
         height=680,
         uirevision=revision,
     )
-    fig = adapt_yaxis_to_visible_window(
-        fig,
-        relayout_data,
-        include_zero=(str(metric) == "yoy"),
-        padding_fraction=0.08,
-    )
-    return fig
 
 
 @callback(
@@ -8071,6 +11090,150 @@ def aggregate_contributions(
         forecast_origin=meta.get("forecast_origin"),
         uirevision=revision + "::timeline",
     )
+
+
+@callback(
+    Output("agg-tax-horizon", "options"),
+    Output("agg-tax-horizon", "value"),
+    Input("agg-store", "data"),
+    State("agg-tax-horizon", "value"),
+)
+def aggregate_tax_horizon_options(
+    store: dict | None, current: str | None
+):
+    tax_frame = _tax_decomposition_frame_from_store(store)
+    meta = dict((store or {}).get("meta", {}) or {})
+    options = tax_horizon_options(tax_frame, meta.get("forecast_origin"))
+    values = [str(item.get("value")) for item in options]
+    if current in values:
+        return options, current
+    # Priority contract: Latest observed, then M+1 / M+2 / M+3.
+    preferred = next(
+        (key for key in ("latest", "m1", "m2", "m3", "m6", "m12") if key in values),
+        None,
+    )
+    return options, preferred
+
+
+@callback(
+    Output("agg-tax-contrib", "figure"),
+    Input("agg-store", "data"),
+    Input("agg-tax-component", "value"),
+    Input("agg-tax-mode", "value"),
+)
+def aggregate_tax_contribution_chart(
+    store: dict | None,
+    component: str | None,
+    display_mode: str | None,
+):
+    tax_frame = _tax_decomposition_frame_from_store(store)
+    meta = dict((store or {}).get("meta", {}) or {})
+    tax_meta = dict((store or {}).get("tax_decomposition_meta", {}) or {})
+    if tax_frame.empty:
+        reason = str(tax_meta.get("reason") or "")
+        if bool(tax_meta.get("available")) and not reason:
+            reason = (
+                "Tax decomposition snapshot expired. Reload the aggregate or use "
+                "Refresh snapshot explicitly."
+            )
+        return empty_aggregate_figure(
+            reason or "Tax-layer contribution decomposition unavailable"
+        )
+    return tax_contribution_figure(
+        tax_frame,
+        component=str(component or "all"),
+        forecast_origin=meta.get("forecast_origin"),
+        display_mode=str(display_mode or "bars"),
+        uirevision=f"{meta.get('aggregate_run_id', 'agg')}::tax-layers",
+    )
+
+
+@callback(
+    Output("agg-tax-table", "data"),
+    Output("agg-tax-note", "children"),
+    Output("agg-tax-table-title", "children"),
+    Input("agg-store", "data"),
+    Input("agg-tax-horizon", "value"),
+)
+def aggregate_tax_contribution_table(
+    store: dict | None, horizon: str | None
+):
+    tax_frame = _tax_decomposition_frame_from_store(store)
+    tax_meta = dict((store or {}).get("tax_decomposition_meta", {}) or {})
+    meta = dict((store or {}).get("meta", {}) or {})
+    if tax_frame.empty:
+        reason = str(tax_meta.get("reason") or "")
+        if bool(tax_meta.get("available")) and not reason:
+            reason = (
+                "Tax decomposition snapshot expired. Reload the aggregate or use "
+                "Refresh snapshot explicitly."
+            )
+        return [], html.Div(
+            reason or "Tax-layer contribution decomposition unavailable.",
+            className="banner-error",
+        ), "Tax-layer contribution — unavailable"
+    if not horizon:
+        return [], html.Div(
+            "No readable tax-decomposition period is available.",
+            className="selection-banner",
+        ), "Tax-layer contribution — no period available"
+    records, note = tax_matrix_records(
+        tax_frame,
+        horizon=str(horizon),
+        forecast_origin=meta.get("forecast_origin"),
+    )
+    period_title = tax_matrix_period_title(
+        tax_frame,
+        horizon=str(horizon),
+        forecast_origin=meta.get("forecast_origin"),
+    )
+    # Human-readable signed pp values; the underlying frozen frame remains
+    # numeric and is shared with the chart.
+    numeric_columns = (
+        "Pre-tax / market",
+        "Excise",
+        "VAT",
+        "Unsplit",
+        "Tax total",
+        "Total contribution",
+    )
+    formatted = []
+    for row in records:
+        item = dict(row)
+        for key in numeric_columns:
+            value = item.get(key)
+            item[key] = (
+                "—"
+                if value is None or not np.isfinite(float(value))
+                else f"{float(value):+.3f}"
+            )
+        formatted.append(item)
+
+    audit = tax_meta.get("aggregate_additivity_max_abs_error")
+    audit_text = (
+        ""
+        if audit is None or not np.isfinite(float(audit))
+        else f" · additivity max error {float(audit):.2e}"
+    )
+    origin = meta.get("forecast_origin")
+    origin_text = ""
+    if origin is not None:
+        try:
+            origin_text = f" · forecast origin {pd.Timestamp(origin).strftime('%B %Y')}"
+        except Exception:
+            origin_text = ""
+    return formatted, html.Div(
+        [
+            html.Strong(note),
+            html.Span(origin_text),
+            html.Span(audit_text),
+            html.Span(
+                " · VAT includes VAT-on-excise; tax splits require comparable t and t-12 bridges; "
+                "otherwise the exact contribution remains Unsplit."
+            ),
+        ],
+        className="selection-banner",
+    ), period_title
 
 
 @callback(
@@ -8160,20 +11323,186 @@ def aggregate_conditional_scenario_impacts(
     )
 
 
+def _conditional_headline_bridge_data(
+    conditional_store: Mapping[str, Any] | None,
+    *,
+    selected_vintage: str | None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Build the Headline bridge from one exact active Energy conditional.
+
+    The conditional computation already produced and replay-validated the
+    draw-wise HICP Energy level paths. This function only compacts their saved
+    posterior summaries; it does not rerun a BVAR or a conditional forecast.
+    """
+    summaries = conditional_set_summary(conditional_store)
+    if not summaries:
+        return None, None
+    if len(summaries) != 1:
+        return None, (
+            "Headline transfer requires exactly one active Energy conditional scenario. "
+            "The current Energy conditionals are standalone marginal scenarios and are "
+            "not jointly propagated or summed."
+        )
+
+    summary = summaries[0]
+    model_id = str(summary.get("model_id") or "")
+    payload = conditional_set_payload(conditional_store, model_id)
+    if not payload:
+        return None, "The active Energy conditional payload is unavailable."
+    if str(payload.get("contract_version") or "") != CONDITIONAL_CONTRACT_VERSION:
+        return None, (
+            "The active Energy conditional predates the Headline bridge payload. "
+            "Return to Energy Scenarios and click Add / update conditional once."
+        )
+
+    meta = dict(payload.get("meta", {}) or {})
+    vintage = str(meta.get("vintage") or "")
+    aggregate_run_id = str(meta.get("aggregate_run_id") or "")
+    forecast_name = str(meta.get("forecast_name") or "unconditional")
+    if not vintage or not aggregate_run_id or not model_id:
+        return None, "The active Energy conditional lacks vintage/aggregate/model lineage."
+    if selected_vintage and str(selected_vintage) != vintage:
+        return None, (
+            f"The active Energy conditional belongs to vintage {vintage}; "
+            f"Headline currently selects {selected_vintage}."
+        )
+
+    baseline = pd.DataFrame(list(payload.get("aggregate_baseline_level", []) or []))
+    scenario = pd.DataFrame(list(payload.get("aggregate_scenario_level", []) or []))
+    required = {"date", "mean", "q16", "q50", "q84"}
+    if baseline.empty or scenario.empty or not required.issubset(baseline.columns) or not required.issubset(scenario.columns):
+        return None, (
+            "The active Energy conditional does not contain bridge-ready HICP Energy "
+            "level summaries. Recompute it once with Add / update conditional."
+        )
+
+    try:
+        baseline["date"] = pd.to_datetime(baseline["date"]).dt.to_period("M").dt.to_timestamp()
+        scenario["date"] = pd.to_datetime(scenario["date"]).dt.to_period("M").dt.to_timestamp()
+    except Exception as exc:
+        return None, f"The Energy conditional bridge calendar is unreadable: {exc}"
+    baseline = baseline.sort_values("date").reset_index(drop=True)
+    scenario = scenario.sort_values("date").reset_index(drop=True)
+    if baseline["date"].duplicated().any() or scenario["date"].duplicated().any():
+        return None, "The Energy conditional bridge contains duplicate months."
+    if not baseline["date"].equals(scenario["date"]):
+        return None, "Energy conditional baseline/scenario bridge calendars differ."
+    if len(scenario) < 2:
+        return None, "The Energy conditional bridge needs at least two monthly levels."
+
+    baseline_level: dict[str, list[float]] = {}
+    scenario_level: dict[str, list[float]] = {}
+    for statistic in ("mean", "q16", "q50", "q84"):
+        b = pd.to_numeric(baseline[statistic], errors="coerce").to_numpy(dtype=float)
+        s = pd.to_numeric(scenario[statistic], errors="coerce").to_numpy(dtype=float)
+        if not np.isfinite(b).all() or not np.isfinite(s).all() or np.any(b <= 0) or np.any(s <= 0):
+            return None, f"Energy conditional {statistic} level path contains invalid values."
+        baseline_level[statistic] = b.tolist()
+        scenario_level[statistic] = s.tolist()
+
+    condition_variable = str(meta.get("condition_variable") or "")
+    condition_description = str(meta.get("condition_description") or "")
+    scenario_start = meta.get("scenario_start")
+    signature = [{
+        "model_id": model_id,
+        "condition_variable": condition_variable,
+        "condition_description": condition_description,
+        "aggregate_run_id": aggregate_run_id,
+    }]
+    bridge = {
+        "contract": ENERGY_BRIDGE_CONTRACT_VERSION,
+        "vintage": vintage,
+        "aggregate_run_id": aggregate_run_id,
+        "forecast_name": forecast_name,
+        "scenario_active": True,
+        "n_draws": int(meta.get("n_aggregate_draws_paired") or 0),
+        "dates": [pd.Timestamp(x).isoformat() for x in scenario["date"]],
+        "baseline_level": baseline_level,
+        "scenario_level": scenario_level,
+        "scenario_signature": signature,
+        "scenario_components": [model_id],
+        "scenario_starts": ({model_id: scenario_start} if scenario_start else {}),
+        "transfer_contract": "month_to_month_growth_reanchored_on_headline_energy",
+        "interpretation": (
+            "one deterministic Energy HICP conditional summary path is converted to "
+            "monthly growth; full Energy-path uncertainty is not integrated out inside "
+            "the Headline BVAR"
+        ),
+    }
+    store = {
+        "meta": {
+            "vintage": vintage,
+            "aggregate_run_id": aggregate_run_id,
+            "aggregate_forecast_name": forecast_name,
+            "n_draws": bridge["n_draws"],
+            "scenario_type": "conditional",
+            "scenario_components": [model_id],
+            "scenario_count": 1,
+            "scenario_starts": bridge["scenario_starts"],
+        },
+        "headline_bridge": bridge,
+    }
+    return store, None
+
+
 @callback(
     Output("agg-scenario-store", "data"),
     Output("agg-scenario-banner", "children"),
-    Input("url", "pathname"),
-    Input("agg-select", "value"),
-    Input("vintage-select", "value"),
     Input("scenario-store", "data"),
-    Input("agg-store", "data"),
+    Input("conditional-store", "data"),
+    State("agg-select", "value"),
+    State("vintage-select", "value"),
 )
-def compute_live_aggregate_tax_scenario(pathname,aggregate_run_id,vintage,scenario_store,aggregate_store):
-    if (pathname or "/forecast")!="/aggregate": raise PreventUpdate
-    if not aggregate_run_id or not vintage: return None,"Select an aggregate run."
-    summaries=scenario_set_summary(scenario_store)
-    if not summaries: return None,"No active component tax scenario. Configure one or more components in Scenarios."
+def compute_live_aggregate_tax_scenario(
+    scenario_store,
+    conditional_store,
+    aggregate_run_id,
+    vintage,
+):
+    # This callback is downstream only of explicit scenario actions. Route,
+    # aggregate-dropdown and vintage navigation are deliberately States so
+    # browsing the dashboard can never launch a new aggregate calculation.
+    conditional_summaries = conditional_set_summary(conditional_store)
+    tax_summaries = scenario_set_summary(scenario_store)
+    if conditional_summaries and tax_summaries:
+        return None, html.Div(
+            [
+                html.Strong("Energy → Headline bridge blocked: "),
+                html.Span(
+                    "both a conditional scenario and a tax scenario are active. "
+                    "Clear one set first; the current contracts do not define an exact joint propagation."
+                ),
+            ],
+            className="banner-error",
+        )
+    if conditional_summaries:
+        bridge_store, error = _conditional_headline_bridge_data(
+            conditional_store,
+            selected_vintage=vintage,
+        )
+        if error:
+            return None, html.Div(
+                [html.Strong("Energy → Headline bridge blocked: "), html.Span(error)],
+                className="banner-error",
+            )
+        bridge = dict((bridge_store or {}).get("headline_bridge") or {})
+        component = (bridge.get("scenario_components") or ["conditional"])[0]
+        return bridge_store, html.Div(
+            [
+                html.Strong("Conditional Energy scenario linked"),
+                html.Span(
+                    f" · {str(component).replace('_', ' ')} · vintage {bridge.get('vintage')} "
+                    f"· {int(bridge.get('n_draws') or 0):,} paired aggregate draws"
+                ),
+            ],
+            className="selection-banner",
+        )
+
+    if not aggregate_run_id or not vintage:
+        return None, "Select an aggregate run."
+    summaries = tax_summaries
+    if not summaries:
+        return None, "No active component tax scenario. Configure one or more components in Scenarios."
     set_vintage=None if not scenario_store else scenario_store.get("vintage")
     if set_vintage is None:
         fp=scenario_set_payload(scenario_store,summaries[0]["model_id"]); set_vintage=dict((fp or {}).get("meta",{}) or {}).get("vintage")
@@ -8191,11 +11520,16 @@ def compute_live_aggregate_tax_scenario(pathname,aggregate_run_id,vintage,scenar
     combined_meta={"scenario_start":min(parsed).isoformat() if parsed else None,"scenario_starts":starts,"scenario_components":[x["model_id"] for x in summaries],"scenario_count":len(summaries),"scenario_signature":signature}
     cache_key="agg-tax-scenario-v2::"+json.dumps({"aggregate_run_id":str(aggregate_run_id),"vintage":str(vintage),"scenario_set":signature,"forecast_name":forecast_name,"n_draws":n_draws,"pairing_seed":pairing_seed},sort_keys=True,default=str)
     cached=_diskcache.get(cache_key)
-    if isinstance(cached,dict): payload=cached
+    if (
+        isinstance(cached, dict)
+        and str(((cached.get("headline_bridge") or {}).get("contract")))
+        == ENERGY_BRIDGE_CONTRACT_VERSION
+    ):
+        payload = cached
     else:
         try:
             outcome=run_aggregate(str(vintage),project_root=PROJECT_ROOT,results_root=RESULTS_ROOT,forecast_name=forecast_name,run_ids=run_ids,n_aggregate_draws=n_draws,pairing_seed=pairing_seed,tax_scenarios=tax_scenarios,weekly_tax_mode="strict",persist=False)
-            payload=aggregate_live_scenario_payload(outcome,combined_meta); payload.setdefault("meta",{}).update({"aggregate_run_id":str(aggregate_run_id),"aggregate_forecast_name":forecast_name}); _diskcache.set(cache_key,payload,expire=3600)
+            payload=aggregate_live_scenario_payload(outcome,combined_meta); payload.setdefault("meta",{}).update({"aggregate_run_id":str(aggregate_run_id),"aggregate_forecast_name":forecast_name}); payload["headline_bridge"]=energy_outcome_headline_bridge(outcome,combined_meta); _diskcache.set(cache_key,payload,expire=3600)
         except Exception as exc:
             return None,html.Div([html.Strong("HICP Energy scenario propagation failed: "),html.Span(str(exc))],className="banner-error")
     parts=[html.Strong(f"Combined scenario · {len(summaries)} component"+("s" if len(summaries)!=1 else ""))]
@@ -8275,6 +11609,142 @@ def aggregate_table(store: dict | None):
         return []
     meta = dict((store or {}).get("meta", {}) or {})
     return aggregate_provenance_table_v2(frame, meta).to_dict("records")
+
+
+# ---------------------------------------------------------------------------
+# Headline slice-3 callbacks — display_v1 only, no filesystem I/O
+# ---------------------------------------------------------------------------
+
+
+def _headline_pct(value) -> str:
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    if not np.isfinite(value):
+        return "—"
+    return f"{value:.2f}%"
+
+
+def _headline_date(value) -> str:
+    if value is None or pd.isna(value):
+        return ""
+    return pd.Timestamp(value).strftime("%Y-%m-%d")
+
+
+
+
+
+
+
+
+
+# ---------------------------------------------------------------------------
+# Headline slice-4 callbacks — structural + diagnostics from display_v1 only
+# ---------------------------------------------------------------------------
+
+
+def _headline_diag_number(value, *, percent=False, scientific=False):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    if not np.isfinite(number):
+        return "—"
+    if scientific:
+        return f"{number:.2e}"
+    if percent:
+        return f"{100.0 * number:.2f}%"
+    return f"{number:.3f}"
+
+
+@callback(
+    Output("headline-root-table", "data"),
+    Output("headline-mcmc-table", "data"),
+    Output("headline-validation-table", "data"),
+    Output("headline-diag-radius", "children"),
+    Output("headline-diag-rejection", "children"),
+    Output("headline-diag-hd-error", "children"),
+    Output("headline-diag-fevd-error", "children"),
+    Input("data-store", "data"),
+)
+def headline_diagnostics_callback(store: dict | None):
+    frame = _frame_from_store(store)
+    kpis = stability_diagnostic_kpis(frame)
+    return (
+        root_diagnostic_records(frame),
+        mcmc_diagnostic_records(frame),
+        validation_diagnostic_records(frame),
+        _headline_diag_number(kpis.get("median_spectral_radius")),
+        _headline_diag_number(kpis.get("B_instability_rejection_rate"), percent=True),
+        _headline_diag_number(kpis.get("hd_max_reconstruction_error"), scientific=True),
+        _headline_diag_number(kpis.get("fevd_max_share_sum_error"), scientific=True),
+    )
+
+
+
+
+# ---------------------------------------------------------------------------
+# Headline Dashboard Slice 5 — callbacks on the real unified Dash app
+# ---------------------------------------------------------------------------
+
+register_headline_slice5_callbacks(
+    app,
+    results_root=RESULTS_ROOT,
+    registry_path=REGISTRY_PATH,
+    background_manager=background_callback_manager,
+    store_id="data-store",
+    vintage_selector_id="production-vintage-select",
+)
+
+
+
+# ---------------------------------------------------------------------------
+# Headline Dashboard Slice 6 — conditional/scenario callbacks
+# ---------------------------------------------------------------------------
+
+register_headline_slice6_callbacks(
+    app,
+    results_root=RESULTS_ROOT,
+    project_root=PROJECT_ROOT,
+    store_id="data-store",
+    energy_scenario_store_id="agg-scenario-store",
+)
+
+# Headline Structural — live saved-posterior analysis with the same UX contract
+# as Energy Structural. No BVAR re-estimation occurs in these callbacks.
+register_headline_structural_callbacks(
+    app,
+    results_root=RESULTS_ROOT,
+    project_root=PROJECT_ROOT,
+    store_id="data-store",
+)
+
+register_core_dashboard_callbacks(
+    app,
+    results_root=RESULTS_ROOT,
+    project_root=PROJECT_ROOT,
+    store_id="data-store",
+)
+
+register_overview_callbacks(
+    app,
+    results_root=RESULTS_ROOT,
+    registry_path=REGISTRY_PATH,
+    project_root=PROJECT_ROOT,
+    production_vintage_store_id="production-vintage-store",
+    registry_store_id="registry-store",
+)
+
+if (
+    ECONOMIC_DATA_ENABLED
+    and _register_economic_data_callbacks is not None
+):
+    _register_economic_data_callbacks(
+        app,
+        project_root=PROJECT_ROOT,
+        registry_store_id="registry-store",
+    )
 
 
 if __name__ == "__main__":

@@ -885,3 +885,78 @@ html, body {
     min-width: 0;
   }
 }
+
+
+/* -------------------------------------------------------------------------
+   Headline Delivery 5 — scoped visual polish.
+   Energy pages are intentionally untouched by this block.
+   ------------------------------------------------------------------------- */
+.headline-page {
+  gap: 18px;
+}
+
+.headline-page .panel-heading {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: flex-start;
+  gap: 4px;
+  padding-bottom: 12px;
+  margin-bottom: 4px;
+}
+
+.headline-page .panel-heading .eyebrow {
+  margin: 0 0 2px;
+}
+
+.headline-page .panel-title {
+  font-size: 16px;
+  line-height: 1.2;
+  font-weight: 680;
+}
+
+.headline-page .panel-subtitle {
+  max-width: 76ch;
+  margin: 2px 0 0;
+  line-height: 1.45;
+}
+
+.headline-page .chart-panel {
+  padding: 16px 18px 10px;
+}
+
+.headline-page .stat-card {
+  border-top: 2px solid var(--accent);
+  box-shadow: none;
+}
+
+.headline-page .stat-value {
+  font-variant-numeric: tabular-nums;
+}
+
+.headline-page .headline-overview-grid {
+  grid-template-columns: minmax(0, 2.25fr) minmax(260px, .75fr);
+  align-items: stretch;
+}
+
+.headline-page .headline-overview-grid > .panel {
+  min-height: 100%;
+}
+
+.headline-page .placeholder-text {
+  margin-left: 0;
+  margin-right: 0;
+}
+
+.headline-page .js-plotly-plot .plotly .legendtext,
+.headline-page .js-plotly-plot .plotly .xtick text,
+.headline-page .js-plotly-plot .plotly .ytick text {
+  font-variant-numeric: tabular-nums;
+}
+
+@media (max-width: 980px) {
+  .headline-page .headline-overview-grid {
+    grid-template-columns: 1fr;
+  }
+}
+

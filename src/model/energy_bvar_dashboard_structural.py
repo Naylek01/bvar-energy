@@ -42,12 +42,26 @@ from energy_bvar_pipeline import build_panel, model_contract, model_spec
 
 
 STRUCTURAL_CONTRACT_VERSION = "energy-structural-recursive-v1"
+STRUCTURAL_INVARIANT_CACHE_VERSION = "energy-structural-invariant-v1"
+STRUCTURAL_LAZY_HD_CONTRACT_VERSION = "energy-structural-lazy-hd-v1"
 DEFAULT_STRUCTURAL_DRAWS = 300
 DEFAULT_HORIZON = 24
 MAX_STRUCTURAL_DRAWS = 1000
 MAX_HORIZON = 104
 DEFAULT_SHOCK_UNIT = "structural_std"
 DEFAULT_SHOCK_SIZE = 1.0
+
+
+# Stable structural palette.  A colour always denotes the same shock order
+# within the selected BVAR.  The reference-state diagnostics use the same hues.
+_STRUCTURAL_COLOURS = (
+    "#2563EB",
+    "#10B981",
+    "#F59E0B",
+    "#EF4444",
+    "#8B5CF6",
+    "#0EA5E9",
+)
 
 
 class StructuralDashboardError(RuntimeError):
@@ -375,6 +389,268 @@ def _shock_scale_rows(irf: Mapping[str, Any]) -> list[dict[str, Any]]:
     return rows
 
 
+
+def _reference_state_frame(payload: Mapping[str, Any]) -> pd.DataFrame:
+    """Dimensionless joint SV state used only for reference-date selection.
+
+    The structural model has one regular stochastic variance ``lambda_j,t`` per
+    structural shock.  Raw variances are not comparable across variables because
+    the variables have different units.  For display and preset selection we
+    therefore normalise each structural standard deviation by *its own* sample
+    median, square the ratio back to variance units, and form a geometric mean
+    across shocks.  This diagnostic is scale-free; the FEVD itself is still
+    computed from the full impact dynamics, not from these bars.
+    """
+    if not payload or not payload.get("ok"):
+        return pd.DataFrame()
+    frame = pd.DataFrame(payload.get("volatility", []))
+    needed = {"date", "variable", "persistent_q50"}
+    if frame.empty or not needed.issubset(frame.columns):
+        return pd.DataFrame()
+    frame = frame.copy()
+    frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+    frame["persistent_q50"] = pd.to_numeric(
+        frame["persistent_q50"], errors="coerce"
+    )
+    frame = frame.dropna(subset=["date", "persistent_q50"])
+    frame = frame.loc[frame["persistent_q50"] > 0.0]
+    if frame.empty:
+        return pd.DataFrame()
+
+    wide = frame.pivot_table(
+        index="date", columns="variable", values="persistent_q50", aggfunc="last"
+    ).sort_index()
+    ordered = [name for name in payload.get("variables", []) if name in wide.columns]
+    if not ordered:
+        return pd.DataFrame()
+    wide = wide.loc[:, ordered]
+    med = wide.median(axis=0, skipna=True).replace(0.0, np.nan)
+    relative_sd = wide.divide(med, axis=1)
+    relative_variance = relative_sd.pow(2.0)
+    positive = relative_variance.where(relative_variance > 0.0)
+    joint = np.exp(np.log(positive).mean(axis=1, skipna=True))
+
+    out = relative_variance.copy()
+    out["joint_stress"] = joint
+    out.index = pd.DatetimeIndex(out.index, name="date")
+    return out
+
+
+def reference_regime_date(
+    payload: Mapping[str, Any] | None,
+    regime: str = "latest",
+) -> str | None:
+    """Resolve a named reference-volatility regime to an observed model date."""
+    state = _reference_state_frame(payload or {})
+    if state.empty:
+        return None
+    joint = pd.to_numeric(state["joint_stress"], errors="coerce").dropna()
+    if joint.empty:
+        return None
+
+    key = str(regime or "latest").strip().lower()
+    if key == "latest":
+        chosen = joint.index[-1]
+    elif key in {"p10", "p50", "p90"}:
+        q = {"p10": 0.10, "p50": 0.50, "p90": 0.90}[key]
+        target = float(np.nanquantile(joint.to_numpy(dtype=float), q))
+        distance = np.abs(np.log(joint.to_numpy(dtype=float)) - np.log(target))
+        chosen = joint.index[int(np.nanargmin(distance))]
+    elif key in {"peak_2022", "peak2022"}:
+        block = joint.loc[joint.index.year == 2022]
+        chosen = block.idxmax() if not block.empty else joint.idxmax()
+    elif key in {"peak", "sample_peak"}:
+        chosen = joint.idxmax()
+    else:
+        raise StructuralDashboardError(
+            f"Unknown reference-volatility regime {regime!r}."
+        )
+    return pd.Timestamp(chosen).isoformat()
+
+
+def reference_volatility_snapshot(
+    payload: Mapping[str, Any] | None,
+    reference_date=None,
+) -> dict[str, Any]:
+    """Summarise the *joint* structural-SV vector at one reference date."""
+    if not payload or not payload.get("ok"):
+        return {"ok": False, "cards": []}
+    frame = pd.DataFrame(payload.get("volatility", []))
+    state = _reference_state_frame(payload)
+    if frame.empty or state.empty:
+        return {"ok": False, "cards": []}
+
+    frame = frame.copy()
+    frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
+    ref = pd.Timestamp(
+        reference_date
+        if reference_date is not None
+        else payload.get("reference_date", state.index[-1])
+    )
+    if ref.tzinfo is not None:
+        ref = ref.tz_localize(None)
+    available = pd.DatetimeIndex(state.index)
+    if ref not in available:
+        # Calendar controls should make this rare; nearest keeps the helper safe.
+        pos = int(np.argmin(np.abs((available - ref).asi8)))
+        ref = pd.Timestamp(available[pos])
+
+    cards: list[dict[str, Any]] = []
+    for variable in payload.get("variables", []):
+        history = frame.loc[frame["variable"].astype(str).eq(str(variable))].copy()
+        history = history.sort_values("date")
+        row = history.loc[history["date"].eq(ref)]
+        if row.empty or variable not in state.columns:
+            continue
+        row = row.iloc[-1]
+        rel_var = float(state.loc[ref, variable])
+        rel_sd = float(np.sqrt(rel_var)) if rel_var >= 0.0 else np.nan
+        series_state = pd.to_numeric(state[variable], errors="coerce").dropna()
+        percentile = (
+            100.0 * float((series_state <= rel_var).mean())
+            if len(series_state)
+            else np.nan
+        )
+        cards.append(
+            {
+                "variable": str(variable),
+                "label": str(variable).replace("_", " ").title(),
+                "unit": str((payload.get("units") or {}).get(variable, "")),
+                "persistent_q16": float(row.get("persistent_q16", np.nan)),
+                "persistent_q50": float(row.get("persistent_q50", np.nan)),
+                "persistent_q84": float(row.get("persistent_q84", np.nan)),
+                "relative_sd": rel_sd,
+                "relative_variance": rel_var,
+                "percentile": percentile,
+                "outlier_probability": float(row.get("outlier_probability", np.nan)),
+            }
+        )
+
+    joint = pd.to_numeric(state["joint_stress"], errors="coerce").dropna()
+    joint_value = float(state.loc[ref, "joint_stress"])
+    joint_percentile = 100.0 * float((joint <= joint_value).mean()) if len(joint) else np.nan
+    return {
+        "ok": True,
+        "reference_date": ref.isoformat(),
+        "joint_stress": joint_value,
+        "joint_percentile": joint_percentile,
+        "cards": cards,
+    }
+
+
+def volatility_sparkline_figure(
+    payload: Mapping[str, Any] | None,
+    *,
+    variable: str,
+    reference_date=None,
+) -> go.Figure:
+    """Compact, scale-free SV history for one variable card."""
+    state = _reference_state_frame(payload or {})
+    if state.empty or variable not in state.columns:
+        return _empty_figure("No SV history", height=105)
+    series = pd.to_numeric(state[variable], errors="coerce")
+    rel_sd = np.sqrt(series.clip(lower=0.0))
+    ref = pd.Timestamp(
+        reference_date
+        if reference_date is not None
+        else (payload or {}).get("reference_date", state.index[-1])
+    )
+    if ref.tzinfo is not None:
+        ref = ref.tz_localize(None)
+    if ref not in state.index:
+        ref = pd.Timestamp(state.index[-1])
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=state.index,
+            y=rel_sd,
+            mode="lines",
+            line={"width": 1.8, "color": "#2563EB"},
+            hovertemplate="%{x|%Y-%m-%d}<br>√λ / own median=%{y:.2f}×<extra></extra>",
+            showlegend=False,
+        )
+    )
+    fig.add_hline(y=1.0, line_width=1, line_color="#E5E7EB")
+    fig.add_shape(
+        type="line",
+        x0=ref.isoformat(), x1=ref.isoformat(), y0=0, y1=1,
+        xref="x", yref="paper",
+        line={"width": 1.2, "dash": "dot", "color": "#F97316"},
+    )
+    value = float(rel_sd.loc[ref]) if pd.notna(rel_sd.loc[ref]) else np.nan
+    if np.isfinite(value):
+        fig.add_trace(
+            go.Scatter(
+                x=[ref], y=[value], mode="markers",
+                marker={"size": 7, "color": "#F97316", "line": {"width": 1, "color": "white"}},
+                hovertemplate="Reference<br>√λ / own median=%{y:.2f}×<extra></extra>",
+                showlegend=False,
+            )
+        )
+    fig.update_layout(
+        template="plotly_white",
+        height=105,
+        margin={"l": 4, "r": 4, "t": 2, "b": 2},
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        hovermode="x",
+        dragmode=False,
+        xaxis={"visible": False, "fixedrange": True},
+        yaxis={"visible": False, "fixedrange": True, "rangemode": "tozero"},
+        uirevision=f"{(payload or {}).get('run_id')}::sv-card::{variable}",
+    )
+    return fig
+
+
+def relative_volatility_state_figure(
+    payload: Mapping[str, Any] | None,
+    *,
+    reference_date=None,
+) -> go.Figure:
+    """Dimensionless structural-variance multipliers at the selected date."""
+    snap = reference_volatility_snapshot(payload, reference_date)
+    if not snap.get("ok") or not snap.get("cards"):
+        return _empty_figure("No joint SV state is available.", height=250)
+    cards = list(snap["cards"])
+    labels = [card["label"] for card in cards]
+    values = [float(card["relative_variance"]) for card in cards]
+    colours = [_STRUCTURAL_COLOURS[i % len(_STRUCTURAL_COLOURS)] for i in range(len(cards))]
+
+    fig = go.Figure(
+        go.Bar(
+            x=values,
+            y=labels,
+            orientation="h",
+            marker={"color": colours},
+            text=[f"{value:.2f}×" for value in values],
+            textposition="outside",
+            cliponaxis=False,
+            hovertemplate="%{y}<br>λ / own-sample median=%{x:.2f}×<extra></extra>",
+            showlegend=False,
+        )
+    )
+    fig.add_vline(x=1.0, line_width=1.2, line_dash="dash", line_color="#94A3B8")
+    xmax = max(max(values) * 1.18, 1.35)
+    fig.update_layout(
+        template="plotly_white",
+        height=max(220, 58 * len(cards) + 58),
+        margin={"l": 10, "r": 54, "t": 18, "b": 42},
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        xaxis={
+            "title": "Structural variance relative to its own sample median (×)",
+            "range": [0.0, xmax],
+            "gridcolor": "#EEF2F7",
+            "zeroline": False,
+        },
+        yaxis={"autorange": "reversed", "showgrid": False},
+        hovermode="closest",
+        uirevision=f"{(payload or {}).get('run_id')}::sv-relative::{snap.get('reference_date')}",
+    )
+    return fig
+
+
 def _visible_x_window(
     relayout_data: Mapping[str, Any] | None,
 ) -> tuple[pd.Timestamp, pd.Timestamp] | None:
@@ -659,6 +935,340 @@ def _hd_rows(
     return rows, mean_error, observed_label
 
 
+def structural_invariant_cache_from_payload(
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Extract the reference-invariant Structural block from a valid payload."""
+    if not isinstance(payload, Mapping) or not bool(payload.get("ok")):
+        raise StructuralDashboardError(
+            "Cannot build a Structural invariant cache from an unsuccessful payload."
+        )
+
+    required = (
+        "model_id",
+        "vintage",
+        "run_id",
+        "posterior_draws",
+        "selected_draw_indices",
+        "split_outlier_amplification",
+        "requires_data_augmentation",
+        "hd_observed_label",
+        "volatility",
+        "hd",
+        "hd_component_names",
+        "diagnostics",
+    )
+    missing = [key for key in required if key not in payload]
+    if missing:
+        raise StructuralDashboardError(
+            f"Structural payload is missing invariant-cache fields {missing}."
+        )
+
+    diagnostics = dict(payload.get("diagnostics") or {})
+    return {
+        "cache_version": STRUCTURAL_INVARIANT_CACHE_VERSION,
+        "source_contract_version": str(payload.get("contract_version") or ""),
+        "model_id": str(payload["model_id"]),
+        "vintage": str(payload["vintage"]),
+        "run_id": str(payload["run_id"]),
+        "posterior_draws": int(payload["posterior_draws"]),
+        "selected_draw_indices": [
+            int(value) for value in payload.get("selected_draw_indices", [])
+        ],
+        "split_outlier_amplification": bool(
+            payload["split_outlier_amplification"]
+        ),
+        "requires_data_augmentation": bool(
+            payload["requires_data_augmentation"]
+        ),
+        "hd_observed_label": str(payload["hd_observed_label"]),
+        "volatility": list(payload.get("volatility") or []),
+        "hd": list(payload.get("hd") or []),
+        "hd_component_names": list(payload.get("hd_component_names") or []),
+        "diagnostics": {
+            "hd_max_reconstruction_error_drawwise": float(
+                diagnostics["hd_max_reconstruction_error_drawwise"]
+            ),
+            "hd_posterior_mean_reconstruction_error": float(
+                diagnostics["hd_posterior_mean_reconstruction_error"]
+            ),
+        },
+    }
+
+
+def _validated_structural_invariant_cache(
+    cache: Mapping[str, Any] | None,
+    *,
+    info: Mapping[str, Any],
+    split_outlier_amplification: bool,
+) -> dict[str, Any] | None:
+    """Validate that the invariant cache belongs to the exact saved run/subset."""
+    if cache is None:
+        return None
+    if not isinstance(cache, Mapping):
+        raise StructuralDashboardError("Structural invariant cache is not a mapping.")
+    if str(cache.get("cache_version") or "") != STRUCTURAL_INVARIANT_CACHE_VERSION:
+        raise StructuralDashboardError(
+            "Structural invariant cache has an incompatible version."
+        )
+    if str(cache.get("source_contract_version") or "") != STRUCTURAL_CONTRACT_VERSION:
+        raise StructuralDashboardError(
+            "Structural invariant cache was produced by another Structural contract."
+        )
+
+    for key in ("model_id", "vintage", "run_id"):
+        actual = str(cache.get(key) or "")
+        expected = str(info.get(key) or "")
+        if actual != expected:
+            raise StructuralDashboardError(
+                f"Structural invariant cache {key} mismatch: {actual!r} != {expected!r}."
+            )
+
+    if int(cache.get("posterior_draws", -1)) != int(
+        info["selected_posterior_draws"]
+    ):
+        raise StructuralDashboardError(
+            "Structural invariant cache posterior-draw count mismatch."
+        )
+
+    cached_indices = [
+        int(value) for value in cache.get("selected_draw_indices", [])
+    ]
+    expected_indices = [
+        int(value) for value in info.get("selected_draw_indices", [])
+    ]
+    if cached_indices != expected_indices:
+        raise StructuralDashboardError(
+            "Structural invariant cache draw indices mismatch."
+        )
+
+    if bool(cache.get("split_outlier_amplification")) != bool(
+        split_outlier_amplification
+    ):
+        raise StructuralDashboardError(
+            "Structural invariant cache uses another outlier-splitting convention."
+        )
+
+    if bool(cache.get("requires_data_augmentation")) != bool(
+        info.get("requires_data_augmentation", False)
+    ):
+        raise StructuralDashboardError(
+            "Structural invariant cache data-augmentation contract mismatch."
+        )
+
+    diagnostics = dict(cache.get("diagnostics") or {})
+    for key in (
+        "hd_max_reconstruction_error_drawwise",
+        "hd_posterior_mean_reconstruction_error",
+    ):
+        if key not in diagnostics or not np.isfinite(float(diagnostics[key])):
+            raise StructuralDashboardError(
+                f"Structural invariant cache lacks finite diagnostic {key!r}."
+            )
+
+    for key in ("volatility", "hd", "hd_component_names", "hd_observed_label"):
+        if key not in cache:
+            raise StructuralDashboardError(
+                f"Structural invariant cache lacks {key!r}."
+            )
+
+    return {
+        **dict(cache),
+        "volatility": list(cache.get("volatility") or []),
+        "hd": list(cache.get("hd") or []),
+        "hd_component_names": list(cache.get("hd_component_names") or []),
+        "diagnostics": diagnostics,
+    }
+
+
+def _structural_identity_payload(
+    info: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "contract_version": STRUCTURAL_CONTRACT_VERSION,
+        "model_id": info["model_id"],
+        "model_label": info["model_label"],
+        "vintage": info["vintage"],
+        "run_id": info["run_id"],
+        "frequency": info["frequency"],
+        "p": info["p"],
+        "variables": info["variables"],
+        "target": info["target"],
+        "units": info["units"],
+        "recursive_ordering": info["recursive_ordering"],
+        "posterior_draws": int(info["selected_posterior_draws"]),
+        "available_posterior_draws": int(info["available_posterior_draws"]),
+        "selected_draw_indices": info["selected_draw_indices"],
+        "missing_data_method": info["missing_data_method"],
+        "exog_names": info["exog_names"],
+        "requires_data_augmentation": bool(
+            info.get("requires_data_augmentation", False)
+        ),
+    }
+
+
+def compute_structural_volatility_v1(
+    run_directory: str | Path,
+    *,
+    project_root: str | Path,
+    posterior_draws: int = DEFAULT_STRUCTURAL_DRAWS,
+) -> dict[str, Any]:
+    """Load the saved posterior and materialise only SV/outlier history.
+
+    This is deliberately independent of IRF, FEVD and HD so the reference-state
+    cards can become usable before the rest of Structural is ready.
+    """
+    result, info = load_structural_result(
+        run_directory,
+        project_root=project_root,
+        posterior_draws=posterior_draws,
+    )
+    payload = {
+        **_structural_identity_payload(info),
+        "payload_kind": "volatility",
+        "reference_date": info["default_reference_date"],
+        "volatility": _volatility_rows(result),
+        "reference_dependence": {
+            "volatility_history": False,
+            "irf_structural_std": True,
+            "irf_level": False,
+            "fevd": True,
+            "hd_recursive": False,
+        },
+    }
+    return payload
+
+
+def compute_structural_irf_fevd_v1(
+    run_directory: str | Path,
+    *,
+    project_root: str | Path,
+    reference_date=None,
+    horizon: int = DEFAULT_HORIZON,
+    posterior_draws: int = DEFAULT_STRUCTURAL_DRAWS,
+    shock_unit: str = DEFAULT_SHOCK_UNIT,
+    shock_size: float = DEFAULT_SHOCK_SIZE,
+) -> dict[str, Any]:
+    """Compute only the reference-dependent IRF/FEVD block."""
+    horizon = int(horizon)
+    if horizon < 1 or horizon > MAX_HORIZON:
+        raise StructuralDashboardError(
+            f"horizon must lie in [1, {MAX_HORIZON}], got {horizon}."
+        )
+    shock_unit = str(shock_unit).strip().lower()
+    if shock_unit not in {"structural_std", "level"}:
+        raise StructuralDashboardError(
+            "shock_unit must be 'structural_std' or 'level'."
+        )
+    shock_size = float(shock_size)
+    if not np.isfinite(shock_size) or shock_size <= 0:
+        raise StructuralDashboardError(
+            f"shock_size must be a finite positive number, got {shock_size}."
+        )
+
+    result, info = load_structural_result(
+        run_directory,
+        project_root=project_root,
+        posterior_draws=posterior_draws,
+    )
+    reference = (
+        info["default_reference_date"]
+        if reference_date is None
+        else pd.Timestamp(reference_date).isoformat()
+    )
+    irf = impulse_responses(
+        result,
+        identification="recursive",
+        reference_date=reference,
+        horizon=horizon,
+        shock_unit=shock_unit,
+        shock_size=shock_size,
+        include_outlier_scale=False,
+    )
+    fevd = forecast_error_variance_decomposition(
+        result,
+        identification="recursive",
+        reference_date=reference,
+        horizon=horizon,
+        include_outlier_scale=False,
+    )
+    return {
+        **_structural_identity_payload(info),
+        "payload_kind": "irf_fevd",
+        "identification": "recursive",
+        "reference_date": pd.Timestamp(irf["reference_date"]).isoformat(),
+        "horizon": horizon,
+        "shock_unit": shock_unit,
+        "shock_size": shock_size,
+        "shock_scale_factors": _shock_scale_rows(irf),
+        "irf": _irf_rows(irf),
+        "fevd": _fevd_rows(fevd),
+        "reference_dependence": {
+            "irf_structural_std": True,
+            "irf_level": False,
+            "fevd": True,
+            "hd_recursive": False,
+            "outlier_scale_in_irf_fevd": False,
+        },
+        "diagnostics": {
+            "fevd_max_share_sum_error": float(fevd["max_share_sum_error"]),
+            "recursive_acceptance_rate": 1.0,
+        },
+    }
+
+
+def compute_structural_hd_v1(
+    run_directory: str | Path,
+    *,
+    project_root: str | Path,
+    posterior_draws: int = DEFAULT_STRUCTURAL_DRAWS,
+    split_outlier_amplification: bool = True,
+) -> dict[str, Any]:
+    """Compute only recursive historical decomposition.
+
+    The cache identity intentionally excludes reference date, IRF horizon and
+    shock scaling because recursive HD is invariant to all three.
+    """
+    result, info = load_structural_result(
+        run_directory,
+        project_root=project_root,
+        posterior_draws=posterior_draws,
+    )
+    reference = info["default_reference_date"]
+    hd = historical_decomposition(
+        result,
+        identification="recursive",
+        reference_date=reference,
+        split_outlier_amplification=bool(split_outlier_amplification),
+    )
+    hd_rows, mean_hd_error, hd_observed_label = _hd_rows(
+        hd,
+        requires_data_augmentation=bool(
+            info.get("requires_data_augmentation", False)
+        ),
+    )
+    return {
+        **_structural_identity_payload(info),
+        "payload_kind": "historical_decomposition",
+        "lazy_hd_contract_version": STRUCTURAL_LAZY_HD_CONTRACT_VERSION,
+        "identification": "recursive",
+        "split_outlier_amplification": bool(split_outlier_amplification),
+        "hd_observed_label": hd_observed_label,
+        "hd": hd_rows,
+        "hd_component_names": list(hd["component_names"]),
+        "diagnostics": {
+            "hd_max_reconstruction_error_drawwise": float(
+                hd["max_reconstruction_error"]
+            ),
+            "hd_posterior_mean_reconstruction_error": float(mean_hd_error),
+        },
+        "reference_dependence": {
+            "hd_recursive": False,
+        },
+    }
+
+
 def compute_structural_v1(
     run_directory: str | Path,
     *,
@@ -669,6 +1279,7 @@ def compute_structural_v1(
     shock_unit: str = DEFAULT_SHOCK_UNIT,
     shock_size: float = DEFAULT_SHOCK_SIZE,
     split_outlier_amplification: bool = True,
+    invariant_cache: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Compute recursive IRF, FEVD and HD from persisted Gibbs draws."""
     horizon = int(horizon)
@@ -717,20 +1328,43 @@ def compute_structural_v1(
         horizon=horizon,
         include_outlier_scale=False,
     )
-    hd = historical_decomposition(
-        result,
-        identification="recursive",
-        reference_date=reference,
-        split_outlier_amplification=bool(split_outlier_amplification),
-    )
-
     requires_augmentation = bool(
         info.get("requires_data_augmentation", False)
     )
-    hd_rows, mean_hd_error, hd_observed_label = _hd_rows(
-        hd,
-        requires_data_augmentation=requires_augmentation,
+    cached_invariant = _validated_structural_invariant_cache(
+        invariant_cache,
+        info=info,
+        split_outlier_amplification=bool(split_outlier_amplification),
     )
+
+    if cached_invariant is None:
+        hd = historical_decomposition(
+            result,
+            identification="recursive",
+            reference_date=reference,
+            split_outlier_amplification=bool(split_outlier_amplification),
+        )
+        hd_rows, mean_hd_error, hd_observed_label = _hd_rows(
+            hd,
+            requires_data_augmentation=requires_augmentation,
+        )
+        volatility_rows = _volatility_rows(result)
+        hd_component_names = list(hd["component_names"])
+        hd_max_reconstruction_error = float(hd["max_reconstruction_error"])
+        invariant_reused = False
+    else:
+        hd_rows = list(cached_invariant["hd"])
+        hd_observed_label = str(cached_invariant["hd_observed_label"])
+        volatility_rows = list(cached_invariant["volatility"])
+        hd_component_names = list(cached_invariant["hd_component_names"])
+        invariant_diagnostics = dict(cached_invariant["diagnostics"])
+        hd_max_reconstruction_error = float(
+            invariant_diagnostics["hd_max_reconstruction_error_drawwise"]
+        )
+        mean_hd_error = float(
+            invariant_diagnostics["hd_posterior_mean_reconstruction_error"]
+        )
+        invariant_reused = True
 
     payload = {
         "ok": True,
@@ -756,17 +1390,27 @@ def compute_structural_v1(
         "shock_unit": shock_unit,
         "shock_size": shock_size,
         "shock_scale_factors": _shock_scale_rows(irf),
+        "reference_dependence": {
+            "irf_structural_std": True,
+            "irf_level": False,
+            "fevd": True,
+            "hd_recursive": False,
+            "outlier_scale_in_irf_fevd": False,
+        },
         "split_outlier_amplification": bool(split_outlier_amplification),
         "requires_data_augmentation": requires_augmentation,
         "hd_observed_label": hd_observed_label,
-        "volatility": _volatility_rows(result),
+        "volatility": volatility_rows,
         "irf": _irf_rows(irf),
         "fevd": _fevd_rows(fevd),
         "hd": hd_rows,
-        "hd_component_names": list(hd["component_names"]),
+        "hd_component_names": hd_component_names,
+        "cache_usage": {
+            "reference_invariant_reused": bool(invariant_reused),
+        },
         "diagnostics": {
             "fevd_max_share_sum_error": float(fevd["max_share_sum_error"]),
-            "hd_max_reconstruction_error_drawwise": float(hd["max_reconstruction_error"]),
+            "hd_max_reconstruction_error_drawwise": hd_max_reconstruction_error,
             "hd_posterior_mean_reconstruction_error": float(mean_hd_error),
             "recursive_acceptance_rate": 1.0,
         },
@@ -793,29 +1437,46 @@ def _empty_figure(message: str, *, height: int = 500) -> go.Figure:
     return fig
 
 
-def _layout(fig: go.Figure, *, title: str, y_title: str, height: int = 540, uirevision: str) -> go.Figure:
+
+def _layout(
+    fig: go.Figure,
+    *,
+    title: str | None = None,
+    y_title: str | None = None,
+    height: int = 500,
+    uirevision: str,
+) -> go.Figure:
+    """Modern structural-chart geometry; the Dash card owns the visible heading."""
     fig.update_layout(
         template="plotly_white",
-        title={"text": title, "x": 0.01, "xanchor": "left"},
+        title=(None if not title else {"text": title, "x": 0.01, "xanchor": "left"}),
         height=height,
-        margin={"l": 68, "r": 28, "t": 78, "b": 88},
+        margin={"l": 68, "r": 28, "t": 34 if not title else 64, "b": 74},
         hovermode="x unified",
         dragmode="pan",
+        font={"family": "Inter, Segoe UI, sans-serif", "color": "#334155", "size": 12},
         legend={
             "orientation": "h",
             "x": 0.0,
             "xanchor": "left",
-            "y": -0.18,
-            "yanchor": "top",
+            "y": 1.08,
+            "yanchor": "bottom",
             "font": {"size": 10},
         },
-        xaxis={"showgrid": False, "linecolor": "#e5e7eb"},
-        yaxis={"title": y_title, "gridcolor": "#eef0f3", "zerolinecolor": "#d1d5db"},
+        xaxis={"showgrid": False, "linecolor": "#E2E8F0"},
+        yaxis={
+            "title": y_title,
+            "gridcolor": "#EEF2F7",
+            "zerolinecolor": "#CBD5E1",
+            "zerolinewidth": 1,
+        },
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
+        hoverlabel={"bgcolor": "white", "bordercolor": "#E2E8F0"},
         uirevision=uirevision,
     )
     return fig
+
 
 
 def irf_figure(
@@ -852,9 +1513,8 @@ def irf_figure(
         ))
         fig.add_trace(go.Scatter(
             x=part["horizon"], y=part["q05"],
-            mode="lines", line={"width": 0},
-            fill="tonexty", fillcolor="rgba(14,165,233,0.10)",
-            name="90% posterior interval", hoverinfo="skip",
+            mode="lines", line={"width": 0}, fill="tonexty",
+            fillcolor="rgba(37,99,235,0.10)", name="90% interval", hoverinfo="skip",
         ))
     if fan_mode in {"68", "both"}:
         fig.add_trace(go.Scatter(
@@ -863,36 +1523,27 @@ def irf_figure(
         ))
         fig.add_trace(go.Scatter(
             x=part["horizon"], y=part["q16"],
-            mode="lines", line={"width": 0},
-            fill="tonexty", fillcolor="rgba(14,165,233,0.22)",
-            name="68% posterior interval", hoverinfo="skip",
+            mode="lines", line={"width": 0}, fill="tonexty",
+            fillcolor="rgba(37,99,235,0.22)", name="68% interval", hoverinfo="skip",
         ))
     fig.add_trace(go.Scatter(
         x=part["horizon"], y=part["q50"],
-        mode="lines", line={"width": 2.5},
+        mode="lines+markers",
+        line={"width": 2.5, "color": "#2563EB"},
+        marker={"size": 4, "color": "#2563EB"},
         name="Posterior median",
-        hovertemplate="h=%{x}<br>%{y:.4g}<extra></extra>",
+        hovertemplate="h=%{x}<br>%{y:.4g}<extra>Posterior median</extra>",
     ))
-    fig.add_hline(y=0.0, line_width=1, line_color="#9ca3af")
+    fig.add_hline(y=0.0, line_width=1.1, line_color="#94A3B8")
     frequency = str(payload.get("frequency", "period"))
     x_title = "Weeks" if frequency == "weekly" else "Months" if frequency == "monthly" else "Periods"
-    fig.update_xaxes(title=f"Horizon ({x_title.lower()})")
+    fig.update_xaxes(title=f"Horizon ({x_title.lower()})", dtick=None)
     unit = str(payload.get("units", {}).get(response, ""))
     y_title = unit if metric == "change" else f"Cumulative {unit}".strip()
-    if str(payload.get("shock_unit")) == "level":
-        scale_text = (
-            f"{float(payload.get('shock_size', 1.0)):g}-unit impact-normalised"
-        )
-    else:
-        scale_text = f"{float(payload.get('shock_size', 1.0)):g}σ"
-
     return _layout(
         fig,
-        title=(
-            f"Impulse response — {response.replace('_', ' ').title()} to "
-            f"{shock.replace('_', ' ').title()} shock ({scale_text})"
-        ),
         y_title=y_title,
+        height=470,
         uirevision=(
             f"{payload.get('run_id')}::irf::{response}::{shock}::{metric}::"
             f"{payload.get('shock_unit')}::{payload.get('shock_size')}"
@@ -900,46 +1551,53 @@ def irf_figure(
     )
 
 
+
 def fevd_figure(
     payload: Mapping[str, Any] | None,
     *,
     response: str | None,
 ) -> go.Figure:
+    """Posterior-median FEVD as 100% stacked bars rather than an area wall."""
     if not payload:
-        return _empty_figure("Loading structural analysis…")
+        return _empty_figure("Loading structural analysis…", height=420)
     if not payload.get("ok"):
         return _empty_figure(
-            "Structural analysis failed: " + str(payload.get("error", "unknown error"))
+            "Structural analysis failed: " + str(payload.get("error", "unknown error")),
+            height=420,
         )
     if response not in payload["variables"]:
-        return _empty_figure("Select a valid response variable.")
+        return _empty_figure("Select a valid response variable.", height=420)
 
     frame = pd.DataFrame(payload["fevd"])
     part = frame.loc[frame["response"] == response].copy()
     if part.empty:
-        return _empty_figure("No FEVD summary is available for this response.")
+        return _empty_figure("No FEVD summary is available for this response.", height=420)
 
     fig = go.Figure()
-    for shock in payload["variables"]:
+    for j, shock in enumerate(payload["variables"]):
         block = part.loc[part["shock"] == shock].sort_values("horizon")
-        fig.add_trace(go.Scatter(
+        if block.empty:
+            continue
+        label = shock.replace("_", " ").title()
+        fig.add_trace(go.Bar(
             x=block["horizon"],
             y=block["q50"],
-            mode="lines",
-            stackgroup="one",
-            name=shock.replace("_", " ").title(),
-            hovertemplate="%{y:.1f}%<extra>" + shock.replace("_", " ").title() + "</extra>",
+            name=label,
+            marker={"color": _STRUCTURAL_COLOURS[j % len(_STRUCTURAL_COLOURS)]},
+            hovertemplate="h=%{x}<br>%{y:.1f}%<extra>" + label + "</extra>",
         ))
-    fig.update_yaxes(range=[0, 100])
+    fig.update_layout(barmode="stack", bargap=0.18)
+    fig.update_yaxes(range=[0, 100], ticksuffix="%")
     frequency = str(payload.get("frequency", "period"))
     unit = "weeks" if frequency == "weekly" else "months" if frequency == "monthly" else "periods"
     fig.update_xaxes(title=f"Forecast horizon ({unit})")
     return _layout(
         fig,
-        title=f"Forecast error variance decomposition — {response.replace('_', ' ').title()}",
-        y_title="Share of forecast-error variance (%)",
-        uirevision=f"{payload.get('run_id')}::fevd::{response}",
+        y_title="Forecast-error variance share",
+        height=420,
+        uirevision=f"{payload.get('run_id')}::fevd::{response}::{payload.get('reference_date')}",
     )
+
 
 
 def historical_decomposition_figure(
@@ -950,14 +1608,14 @@ def historical_decomposition_figure(
     relayout_data: Mapping[str, Any] | None = None,
 ) -> go.Figure:
     if not payload:
-        return _empty_figure("Loading structural analysis…", height=580)
+        return _empty_figure("Loading structural analysis…", height=560)
     if not payload.get("ok"):
         return _empty_figure(
             "Structural analysis failed: " + str(payload.get("error", "unknown error")),
-            height=580,
+            height=560,
         )
     if response not in payload["variables"]:
-        return _empty_figure("Select a valid response variable.", height=580)
+        return _empty_figure("Select a valid response variable.", height=560)
 
     frame = pd.DataFrame(payload["hd"])
     part = frame.loc[frame["response"] == response].copy()
@@ -966,23 +1624,36 @@ def historical_decomposition_figure(
     if last_obs is not None and int(last_obs) > 0:
         part = part.tail(int(last_obs))
     if part.empty:
-        return _empty_figure("No historical decomposition is available.", height=580)
+        return _empty_figure("No historical decomposition is available.", height=560)
 
+    variables = list(payload.get("variables", []))
     fig = go.Figure()
     for component in payload["hd_component_names"]:
         if component not in part.columns:
             continue
+        base_name = str(component).split(":", 1)[0].strip()
+        try:
+            colour_index = variables.index(base_name)
+        except ValueError:
+            colour_index = 0
+        colour = _STRUCTURAL_COLOURS[colour_index % len(_STRUCTURAL_COLOURS)]
+        is_outlier = "outlier amplification" in str(component).lower()
+        marker_colour = colour
+        opacity = 0.36 if is_outlier else 0.88
+        label = str(component).replace("_", " ").title()
         fig.add_trace(go.Bar(
             x=part["date"],
             y=part[component],
-            name=component.replace("_", " ").title(),
-            hovertemplate="%{y:.4g}<extra>" + component.replace("_", " ").title() + "</extra>",
+            name=label,
+            marker={"color": marker_colour},
+            opacity=opacity,
+            hovertemplate="%{y:.4g}<extra>" + label + "</extra>",
         ))
     fig.add_trace(go.Scatter(
         x=part["date"],
         y=part["observed"],
         mode="lines",
-        line={"width": 2.2, "color": "#111827"},
+        line={"width": 2.4, "color": "#0F172A"},
         name=str(payload.get("hd_observed_label", "Observed change")),
         hovertemplate=(
             "%{y:.4g}<extra>"
@@ -994,18 +1665,17 @@ def historical_decomposition_figure(
         x=part["date"],
         y=part["base"],
         mode="lines",
-        line={"width": 1.4, "dash": "dash", "color": "#6b7280"},
+        line={"width": 1.5, "dash": "dash", "color": "#64748B"},
         name="Base / initial conditions",
         hovertemplate="%{y:.4g}<extra>Base / initial conditions</extra>",
     ))
-    fig.update_layout(barmode="relative")
-    fig.add_hline(y=0.0, line_width=1, line_color="#9ca3af")
+    fig.update_layout(barmode="relative", bargap=0.0)
+    fig.add_hline(y=0.0, line_width=1.1, line_color="#94A3B8")
     unit = str(payload.get("units", {}).get(response, ""))
     fig = _layout(
         fig,
-        title=f"Historical decomposition — {response.replace('_', ' ').title()}",
         y_title=f"Change ({unit})" if unit else "Change",
-        height=600,
+        height=560,
         uirevision=f"{payload.get('run_id')}::hd::{response}::{last_obs}",
     )
     return _adaptive_hd_yaxis(fig, relayout_data)
@@ -1183,6 +1853,8 @@ def volatility_history_figure(
 
 __all__ = [
     "STRUCTURAL_CONTRACT_VERSION",
+    "STRUCTURAL_INVARIANT_CACHE_VERSION",
+    "STRUCTURAL_LAZY_HD_CONTRACT_VERSION",
     "DEFAULT_STRUCTURAL_DRAWS",
     "DEFAULT_HORIZON",
     "MAX_STRUCTURAL_DRAWS",
@@ -1194,8 +1866,16 @@ __all__ = [
     "structural_run_contract",
     "load_structural_result",
     "compute_structural_v1",
+    "compute_structural_volatility_v1",
+    "compute_structural_irf_fevd_v1",
+    "compute_structural_hd_v1",
+    "structural_invariant_cache_from_payload",
     "irf_figure",
     "fevd_figure",
     "historical_decomposition_figure",
     "volatility_history_figure",
+    "reference_regime_date",
+    "reference_volatility_snapshot",
+    "volatility_sparkline_figure",
+    "relative_volatility_state_figure",
 ]

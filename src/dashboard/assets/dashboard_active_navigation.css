@@ -1,0 +1,43 @@
+/* Inflation Dashboard — active navigation state v1 */
+
+.nav-link,
+.domain-pill {
+    position: relative;
+    transition:
+        color 140ms ease,
+        background-color 140ms ease,
+        border-color 140ms ease,
+        box-shadow 140ms ease,
+        transform 140ms ease;
+}
+
+.nav-link.is-active {
+    color: #003E63 !important;
+    background: linear-gradient(180deg, rgba(0,159,227,.13), rgba(0,159,227,.055)) !important;
+    border-color: rgba(0,159,227,.38) !important;
+    box-shadow: inset 0 -2px 0 #009FE3, 0 0 0 1px rgba(0,159,227,.05);
+    font-weight: 700 !important;
+}
+
+.nav-link.is-active .nav-icon {
+    color: #009FE3 !important;
+}
+
+.domain-pill.is-active {
+    color: #003E63 !important;
+    background: rgba(0,159,227,.11) !important;
+    border-color: rgba(0,159,227,.48) !important;
+    box-shadow: 0 0 0 2px rgba(0,159,227,.09);
+    font-weight: 700 !important;
+}
+
+.nav-link.is-active::after {
+    content: "";
+    position: absolute;
+    left: 12%;
+    right: 12%;
+    bottom: -1px;
+    height: 2px;
+    border-radius: 999px;
+    background: #009FE3;
+}

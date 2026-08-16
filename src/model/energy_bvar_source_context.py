@@ -11,6 +11,7 @@ both layouts without changing notebook calls.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -19,6 +20,15 @@ from typing import Mapping
 import numpy as np
 import pandas as pd
 
+
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 def read_processed_manifest(
     dataset_path: str | Path,
@@ -86,9 +96,27 @@ def _resolve_single_workbook(manifest: Mapping, manifest_path: Path) -> tuple[Pa
             raw = candidate
     if not raw.is_file():
         raise FileNotFoundError(
-            f"Raw single-workbook snapshot not found: {raw}. The v9 manifest points "
-            "to this workbook because tax/HICP context is not duplicated in the model CSVs."
+            f"Raw single-workbook snapshot not found: {raw}. This legacy processed "
+            "vintage has no immutable source_context sidecars. Restore the exact "
+            "workbook recorded by its manifest, or rebuild the vintage with the "
+            "current builder."
         )
+
+    # A living Excel workbook must never silently supply tax/HICP context to an
+    # older processed vintage. Current builders write immutable source_files
+    # sidecars, so this hash gate applies only to legacy workbook fallbacks.
+    expected_hash = str(manifest.get("raw_workbook_sha256") or "").strip().lower()
+    if expected_hash:
+        actual_hash = _sha256(raw).lower()
+        if actual_hash != expected_hash:
+            raise RuntimeError(
+                "Processed-vintage source context is not immutable: the workbook "
+                f"currently found at {raw} has SHA256 {actual_hash}, while the "
+                f"manifest records {expected_hash}. Refusing to mix vintages. "
+                "Restore the exact workbook or rebuild this processed vintage "
+                "with the current builder so source_context sidecars are persisted."
+            )
+
     sheets = manifest.get("sheet_mapping", {})
     if not isinstance(sheets, Mapping):
         raise ValueError("The v9 manifest has an invalid sheet_mapping entry.")
@@ -187,15 +215,30 @@ def load_manifest_source_frame(
     haver_ticker_map: Mapping[str, str] | None = None,
     simple_rename: Mapping[str, str] | None = None,
 ) -> tuple[pd.DataFrame, dict]:
-    """Load one source from either a legacy source CSV or the v9 workbook."""
+    """Load one immutable source context, with a guarded workbook fallback.
+
+    Current processed vintages should expose ``manifest['source_files']`` and
+    are therefore independent of subsequent edits to the living Excel workbook.
+    Legacy vintages may fall back to the workbook only when its SHA256 still
+    matches the hash frozen in the processed manifest.
+    """
     manifest, resolved_manifest_path = read_processed_manifest(dataset_path, manifest_path)
 
     legacy_value = manifest.get("source_files", {}).get(source)
     if legacy_value:
         legacy_path = Path(str(legacy_value))
+        if not legacy_path.is_absolute():
+            legacy_path = (resolved_manifest_path.parent / legacy_path).resolve()
         if legacy_path.is_file():
+            contract = manifest.get("source_context_contract", {})
+            mode = (
+                "processed_vintage_sidecar"
+                if isinstance(contract, Mapping)
+                and contract.get("mode") == "immutable_processed_vintage_sidecars"
+                else "legacy_source_csv"
+            )
             return _read_dated_csv(legacy_path), {
-                "mode": "legacy_source_csv",
+                "mode": mode,
                 "path": legacy_path,
                 "manifest_path": resolved_manifest_path,
             }

@@ -1,6 +1,4 @@
-"""Build the six ECB energy-STIP model datasets from ONE Excel workbook.
-
-This version replaces the former raw -> five source scripts -> interim -> builder
+"""This version replaces the former raw -> five source scripts -> interim -> builder
 architecture with one auditable workbook input.
 
 Expected workbook sheets
@@ -8,14 +6,15 @@ Expected workbook sheets
 The normal names are:
 
     Haver
-    Bloomberg
+    Bloomberg_copy
     European_Commission
     World_Bank
     Eurostat
     Eurostat_HICP
+    Eurostat_Headline_HICP   (optional; headline suite)
     Metadata                 (optional; audit only)
 
-``Bloomberg`` must be the VALUES-ONLY snapshot used by Python. A separate
+``Bloomberg_copy`` must be the VALUES-ONLY snapshot used by Python. A separate
 ``Bloomberg_Live`` sheet may contain Bloomberg formulas; this builder ignores it.
 The source sheets may be displayed newest-first or oldest-first: every reader
 parses the dates and sorts chronologically in memory before any time-series
@@ -24,20 +23,22 @@ calculation.
 Recommended raw layout
 ----------------------
 
-    data/raw/20260807/raw_energy_bvar.xlsx
+    data/raw/20260815/bvar_energy_raw_data.xlsm
 
 or simply
 
-    data/raw/raw_energy_bvar.xlsx
+    data/raw/bvar_energy_raw_data.xlsm
+
+Legacy ``raw_energy_bvar.xlsx`` / ``raw_energy_bvar.xlsm`` names remain supported.
 
 Run from the project root:
 
-    python src/data_pipeline/build_dataset_paper_six_models_v10.py
+    python src/data_pipeline/build_dataset_headline_joint_v14_FINAL.py
 
 or point explicitly to the workbook:
 
-    python src/data_pipeline/build_dataset_paper_six_models_v10.py \
-        --raw data/raw/20260807/raw_energy_bvar.xlsx
+    python src/data_pipeline/build_dataset_headline_joint_v14_FINAL.py \
+        --raw data/raw/20260815/bvar_energy_raw_data.xlsm
 
 Outputs are written directly to ``data/processed/<build_vintage>/``. No source
 pipeline is launched and no ``data/interim`` directory is read.
@@ -51,6 +52,16 @@ Important Bloomberg convention
                          the gasoil conversion used in the paper
 * TTFGDAHD BCFV Index : EUR/MWh, no FX conversion
 * EURUSD Curncy       : USD per EUR
+
+Final workbook/freshness contract
+---------------------------------
+The production workbook may be either ``.xlsm`` (preferred, because it retains
+the Config/VBA refresh controls) or ``.xlsx``. Python does **not** execute Excel
+VBA, Power Query, Haver, or Bloomberg formulas. Before running this builder,
+refresh the workbook in Excel, refresh the Haver block, refresh Bloomberg_Live,
+copy Bloomberg values into ``Bloomberg_copy``, wait for Power Query refreshes to
+finish, and save the workbook. The builder then reads only the saved/cached
+worksheet values.
 
 The processed model CSVs contain LEVELS, exactly as before. Absolute
 differences remain a model-layer transformation.
@@ -79,7 +90,44 @@ import pandas as pd
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_RAW_ROOT = PROJECT_ROOT / "data" / "raw"
 DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "data" / "processed"
-SCRIPT_VERSION = "2026-08-08-v10.1-hicp-decoupled-discovery"
+SCRIPT_VERSION = "2026-08-15-v14.1-final-dashboard-contract"
+
+SUPPORTED_WORKBOOK_SUFFIXES = {".xlsx", ".xlsm"}
+RAW_WORKBOOK_PATTERNS = (
+    "bvar_energy_raw_data*.xlsm",
+    "bvar_energy_raw_data*.xlsx",
+    "raw_energy_bvar*.xlsm",
+    "raw_energy_bvar*.xlsx",
+)
+PREFERRED_RAW_WORKBOOK_NAMES = (
+    "bvar_energy_raw_data.xlsm",
+    "raw_energy_bvar.xlsm",
+    "bvar_energy_raw_data.xlsx",
+    "raw_energy_bvar.xlsx",
+)
+
+# Immutable processed-vintage source context used by tax/HICP adapters.  These
+# compact sidecars sever future scenario/fitted calculations from subsequent
+# edits to the living raw workbook.
+SOURCE_CONTEXT_FILES = {
+    "haver": "source_context_haver.csv",
+    "european_commission": "source_context_european_commission.csv",
+    "eurostat": "source_context_eurostat_energy.csv",
+}
+
+# Files produced by the retired WP374 decomposition branch.  They are removed
+# only after a successful explicit overwrite so a v14 build cannot leave stale
+# objects that look current.
+DEPRECATED_HEADLINE_DECOMPOSITION_OUTPUTS = (
+    "unprocessed_food_monthly.csv",
+    "processed_food_monthly.csv",
+    "neig_monthly.csv",
+    "services_monthly.csv",
+    "compensation_per_employee_quarterly.csv",
+    "compensation_per_employee_monthly_linear.csv",
+    "vat_standard_ea.csv",
+    "vat_standard_ea_diagnostics.csv",
+)
 
 
 # ===========================================================================
@@ -110,21 +158,40 @@ SHEET_ALIASES = {
         "Eurostat_hicp",
         "EUROSTAT_HICP_VIEW",
     ),
+    "eurostat_headline_hicp": (
+        "Eurostat_Headline_HICP",
+        "EUROSTAT_HEADLINE_HICP_VIEW",
+        # Backward-compatible typo in the workbook used during development.
+        "EUROSTAT_HEDLINE_HICP_VIEW",
+    ),
     "metadata": ("Metadata",),
 }
 
 LIVE_SHEET_MARKERS = ("live", "formula", "bdh")
 
-HAVER_TICKERS = {
-    "H023HICP@EUDATA": "hicp_total",
-    "H023HN22@EUDATA": "hicp_car_fuels",
+# Haver is now intentionally minimal in the production workbook. Only series
+# actually consumed by the six Energy model panels are hard requirements.
+# Total HICP, car fuels and liquid fuels are supplied by the Eurostat HICP
+# lineage and therefore remain optional/backward-compatible Haver inputs.
+ENERGY_HAVER_REQUIRED_TICKERS = {
     "H023HW51@EUDATA": "hicp_electricity",
     "H023HW52@EUDATA": "hicp_gas",
-    "H023HW53@EUDATA": "hicp_liquid_fuels",
     "H023HW54@EUDATA": "hicp_solid_fuels",
     "H023HW55@EUDATA": "hicp_heat_energy",
     "H025PP@G10": "ppi_energy",
 }
+ENERGY_HAVER_OPTIONAL_TICKERS = {
+    "H023HICP@EUDATA": "hicp_total",
+    "H023HN22@EUDATA": "hicp_car_fuels",
+    "H023HW53@EUDATA": "hicp_liquid_fuels",
+}
+ENERGY_HAVER_TICKERS = {
+    **ENERGY_HAVER_REQUIRED_TICKERS,
+    **ENERGY_HAVER_OPTIONAL_TICKERS,
+}
+
+# Backward-compatible name used by older project code: all Energy Haver tickers.
+HAVER_TICKERS = ENERGY_HAVER_TICKERS
 
 # Exact Bloomberg snapshot tickers. There is deliberately NO PDS1 fallback:
 # GNEBM1 PVMO is now the project's refined-petroleum / Eurobob series.
@@ -286,6 +353,101 @@ EUROSTAT_HICP_EXPECTED_BREAKS = {
 }
 
 
+# Headline-suite HICP contract (ECOICOP v2 special aggregates).
+#
+# Monthly production Food is the official Eurostat FOOD aggregate.
+# Annual Food aggregation weight remains FOOD_NP + FOOD_P because the
+# Headline four-component weight identity is defined from those official
+# item-weight blocks.
+HEADLINE_HICP_INDEX_SERIES = {
+    "TOTAL": "hicp_total",
+    "NRG": "hicp_energy",
+    "FOOD": "hicp_food",
+    "FOOD_NP": "hicp_unprocessed_food",
+    "FOOD_P": "hicp_processed_food",
+    "IGD_NNRG": "hicp_neig",
+    "SERV": "hicp_services",
+}
+HEADLINE_HICP_WEIGHT_SERIES = {
+    "TOTAL": "hicp_total",
+    "NRG": "hicp_energy",
+    "FOOD_NP": "hicp_unprocessed_food",
+    "FOOD_P": "hicp_processed_food",
+    "IGD_NNRG": "hicp_neig",
+    "SERV": "hicp_services",
+}
+HEADLINE_HICP_INDEX_OUTPUT_ORDER = [
+    "hicp_total",
+    "hicp_energy",
+    "hicp_food",
+    "hicp_unprocessed_food",
+    "hicp_processed_food",
+    "hicp_neig",
+    "hicp_services",
+]
+HEADLINE_HICP_WEIGHT_OUTPUT_ORDER = [
+    "hicp_total",
+    "hicp_energy",
+    "hicp_unprocessed_food",
+    "hicp_processed_food",
+    "hicp_neig",
+    "hicp_services",
+]
+HEADLINE_COMPONENTS_FOR_TOTAL = [
+    "hicp_energy",
+    "hicp_unprocessed_food",
+    "hicp_processed_food",
+    "hicp_neig",
+    "hicp_services",
+]
+HEADLINE_WEIGHT_TOLERANCE_PER_THOUSAND = 0.10
+
+# Final production Headline contract: ONE joint monthly BVAR over the four
+# aggregate HICP components. No alternative component model datasets are built.
+HEADLINE_JOINT_SPEC = {
+    "file": "headline_joint_monthly.csv",
+    "frequency": "monthly",
+    "lags": 12,
+    "comparison_lags": [6, 12],
+    "columns": [
+        "hicp_energy",
+        "hicp_food",
+        "hicp_neig",
+        "hicp_services",
+    ],
+    "equations": {
+        "headline_joint": [
+            "hicp_energy",
+            "hicp_food",
+            "hicp_neig",
+            "hicp_services",
+        ]
+    },
+    "target_columns": [
+        "hicp_energy",
+        "hicp_food",
+        "hicp_neig",
+        "hicp_services",
+    ],
+    "transformations": {
+        "hicp_energy": "logdiff",
+        "hicp_food": "logdiff",
+        "hicp_neig": "logdiff",
+        "hicp_services": "logdiff",
+    },
+    "baseline": "dense BVAR(12)",
+    "sensitivity": "dense BVAR(6) only",
+    "source_contract": {
+        "hicp_energy": "Eurostat NRG",
+        "hicp_food": "Eurostat FOOD",
+        "hicp_neig": "Eurostat IGD_NNRG",
+        "hicp_services": "Eurostat SERV",
+        "food_weight": "Eurostat FOOD_NP + FOOD_P",
+    },
+}
+
+
+
 # ===========================================================================
 # Model specification
 # ===========================================================================
@@ -436,19 +598,40 @@ def _parse_vintage_name(name: str) -> date | None:
 
 
 def find_raw_workbook(raw_root: str | Path = DEFAULT_RAW_ROOT) -> Path:
-    """Find the latest single-workbook raw snapshot without grabbing old source XLSXs."""
+    """Find the latest production workbook (.xlsm preferred; .xlsx supported).
+
+    The final production filename is ``bvar_energy_raw_data.xlsm``. Legacy
+    ``raw_energy_bvar`` names remain supported so older snapshots stay readable.
+    Old source-specific XLSX files are never selected merely because they exist
+    below ``data/raw``.
+    """
     root = Path(raw_root)
     if not root.exists():
         raise FileNotFoundError(f"Raw-data folder does not exist: {root}")
 
-    candidates = [
-        p for p in root.rglob("raw_energy_bvar*.xlsx")
-        if p.is_file() and not p.name.startswith("~$")
-    ]
+    # Final production contract: the living top-level workbook wins over any
+    # dated/archive copies below data/raw.
+    for name in PREFERRED_RAW_WORKBOOK_NAMES:
+        canonical = root / name
+        if canonical.is_file() and not canonical.name.startswith("~$"):
+            return canonical.resolve()
+
+    candidates: list[Path] = []
+    seen: set[Path] = set()
+    for pattern in RAW_WORKBOOK_PATTERNS:
+        for path in root.rglob(pattern):
+            if not path.is_file() or path.name.startswith("~$"):
+                continue
+            resolved = path.resolve()
+            if resolved not in seen:
+                seen.add(resolved)
+                candidates.append(path)
 
     if not candidates:
         top_level = [
-            p for p in root.glob("*.xlsx")
+            p
+            for suffix in sorted(SUPPORTED_WORKBOOK_SUFFIXES)
+            for p in root.glob(f"*{suffix}")
             if p.is_file() and not p.name.startswith("~$")
         ]
         if len(top_level) == 1:
@@ -456,22 +639,29 @@ def find_raw_workbook(raw_root: str | Path = DEFAULT_RAW_ROOT) -> Path:
         elif len(top_level) > 1:
             listing = "\n  ".join(str(p) for p in top_level)
             raise FileNotFoundError(
-                "No file matching raw_energy_bvar*.xlsx was found and several "
-                f"top-level XLSX files exist below {root}:\n  {listing}\n"
-                "Pass --raw explicitly."
+                "No canonical bvar_energy_raw_data/raw_energy_bvar workbook was "
+                "found and several top-level Excel workbooks exist below "
+                f"{root}:\n  {listing}\nPass --raw explicitly."
             )
 
     if not candidates:
         raise FileNotFoundError(
-            f"No raw_energy_bvar*.xlsx workbook found below {root}. "
-            "Save the refreshed raw workbook there or pass --raw."
+            f"No production .xlsm/.xlsx workbook found below {root}. "
+            "Expected bvar_energy_raw_data* or raw_energy_bvar*. "
+            "Save the refreshed workbook there or pass --raw explicitly."
         )
 
-    def rank(path: Path) -> tuple[int, int, int]:
+    preference = {
+        name.casefold(): len(PREFERRED_RAW_WORKBOOK_NAMES) - rank
+        for rank, name in enumerate(PREFERRED_RAW_WORKBOOK_NAMES)
+    }
+
+    def rank(path: Path) -> tuple[int, int, int, int]:
         vintage = _parse_vintage_name(path.parent.name)
         vintage_ord = vintage.toordinal() if vintage else -1
-        preferred = int(path.name.lower() == "raw_energy_bvar.xlsx")
-        return vintage_ord, preferred, path.stat().st_mtime_ns
+        exact_preference = preference.get(path.name.casefold(), 0)
+        macro_enabled = int(path.suffix.casefold() == ".xlsm")
+        return vintage_ord, exact_preference, macro_enabled, path.stat().st_mtime_ns
 
     return max(candidates, key=rank)
 
@@ -624,75 +814,115 @@ def _finalize_source_frame(
 # ===========================================================================
 
 
+def _haver_period_columns(
+    raw: pd.DataFrame,
+    *,
+    ticker_row: int,
+) -> list[tuple[int, pd.Timestamp]]:
+    """Find the monthly date header belonging to a Haver horizontal block."""
+    best: list[tuple[int, pd.Timestamp]] = []
+    for r in range(0, ticker_row):
+        found: list[tuple[int, pd.Timestamp]] = []
+        for c, value in enumerate(raw.iloc[r].tolist()):
+            token = _clean_text(value).replace(" ", "")
+            match = re.fullmatch(r"(\d{4})(\d{2})(?:\*M)?", token, flags=re.I)
+            if match:
+                year, month = int(match.group(1)), int(match.group(2))
+                if 1900 <= year <= 2200 and 1 <= month <= 12:
+                    found.append((c, pd.Timestamp(year, month, 1)))
+        if len(found) > len(best):
+            best = found
+
+    if len(best) < 12:
+        raise ValueError(
+            "Could not locate a monthly Haver date header above Excel row "
+            f"{ticker_row + 1}; found only {len(best)} period columns."
+        )
+    return best
+
+
 def _read_haver_sheet(xls: pd.ExcelFile, sheet: str) -> tuple[pd.DataFrame, dict[str, object]]:
+    """Read only the monthly Haver series used by the Energy production models.
+
+    Headline production is sourced entirely from the Eurostat Headline HICP VIEW.
+    """
     raw = pd.read_excel(xls, sheet_name=sheet, header=None, dtype=object)
     raw_rows = len(raw)
 
+    ticker_contract: dict[str, tuple[str, bool]] = {}
+    for ticker, output in ENERGY_HAVER_REQUIRED_TICKERS.items():
+        ticker_contract[ticker] = (output, True)
+    for ticker, output in ENERGY_HAVER_OPTIONAL_TICKERS.items():
+        ticker_contract[ticker] = (output, False)
+
+    wanted = {ticker.casefold(): ticker for ticker in ticker_contract}
     ticker_locations: dict[str, tuple[int, int]] = {}
-    wanted = {ticker.casefold(): ticker for ticker in HAVER_TICKERS}
-    scan_rows = min(len(raw), 60)
+    scan_rows = min(len(raw), 120)
     for r in range(scan_rows):
         for c in range(raw.shape[1]):
-            text = _norm_text(raw.iat[r, c])
-            if text in wanted:
-                ticker_locations[wanted[text]] = (r, c)
+            token = _norm_text(raw.iat[r, c])
+            if token in wanted:
+                ticker_locations[wanted[token]] = (r, c)
 
-    missing = [ticker for ticker in HAVER_TICKERS if ticker not in ticker_locations]
-    if missing:
+    missing_energy = [
+        ticker for ticker in ENERGY_HAVER_REQUIRED_TICKERS
+        if ticker not in ticker_locations
+    ]
+    if missing_energy:
         raise ValueError(
-            f"Haver sheet is missing required ticker(s): {missing}. "
-            "Refresh/save the Haver block before running the builder."
+            f"Haver sheet is missing required Energy ticker(s): {missing_energy}. "
+            "Refresh/save the Energy Haver block before running the builder."
         )
 
-    first_ticker_row = min(r for r, _ in ticker_locations.values())
-
-    # Haver's horizontal block has one row of metadata/date headers immediately
-    # above the series, but locate it by content rather than by hard-coded row.
-    best_header_row = None
-    best_date_columns: list[tuple[int, pd.Timestamp]] = []
-    for r in range(max(0, first_ticker_row - 8), first_ticker_row):
-        found: list[tuple[int, pd.Timestamp]] = []
-        for c, value in enumerate(raw.iloc[r].tolist()):
-            text = _clean_text(value)
-            if re.fullmatch(r"\d{6}", text):
-                year = int(text[:4])
-                month = int(text[4:])
-                if 1900 <= year <= 2200 and 1 <= month <= 12:
-                    found.append((c, pd.Timestamp(year, month, 1)))
-        if len(found) > len(best_date_columns):
-            best_header_row = r
-            best_date_columns = found
-
-    if best_header_row is None or len(best_date_columns) < 12:
-        raise ValueError(
-            "Could not locate the YYYYMM date columns in the Haver sheet. "
-            "Expected the standard Haver horizontal export layout."
-        )
-
-    dates = pd.DatetimeIndex([stamp for _, stamp in best_date_columns], name="date")
-    panel = pd.DataFrame(index=dates)
+    series: dict[str, pd.Series] = {}
     error_markers = 0
-
-    for ticker, output_name in HAVER_TICKERS.items():
-        row, _ = ticker_locations[ticker]
-        values = []
-        for col, _stamp in best_date_columns:
+    for ticker, (output_name, _required) in ticker_contract.items():
+        location = ticker_locations.get(ticker)
+        if location is None:
+            continue
+        row, _col = location
+        period_columns = _haver_period_columns(raw, ticker_row=row)
+        values: list[object] = []
+        dates: list[pd.Timestamp] = []
+        for col, stamp in period_columns:
             value = raw.iat[row, col]
             if isinstance(value, str) and value.strip().startswith("#"):
                 error_markers += 1
             values.append(value)
-        panel[output_name] = pd.to_numeric(pd.Series(values), errors="coerce").to_numpy()
+            dates.append(stamp)
+        s = pd.Series(
+            pd.to_numeric(pd.Series(values), errors="coerce").to_numpy(),
+            index=pd.DatetimeIndex(dates, name="date"),
+            name=output_name,
+        )
+        if s.index.has_duplicates:
+            grouped = s.groupby(level=0)
+            for stamp, block in grouped:
+                if block.dropna().nunique() > 1:
+                    raise ValueError(
+                        f"haver {ticker}: conflicting duplicate period {stamp.date()}."
+                    )
+            s = grouped.last()
+        series[output_name] = s.sort_index()
 
-    # The horizontal Haver block has dates in columns, not rows; there are no
-    # invalid date rows once YYYYMM headers have been identified.
-    return _finalize_source_frame(
+    panel = pd.concat(series, axis=1).sort_index()
+    frame, stats = _finalize_source_frame(
         panel,
         source="haver",
         raw_rows=raw_rows,
         invalid_date_rows=0,
         error_markers=error_markers,
     )
-
+    stats["energy_tickers_required"] = ENERGY_HAVER_REQUIRED_TICKERS
+    stats["energy_tickers_optional"] = ENERGY_HAVER_OPTIONAL_TICKERS
+    stats["energy_optional_tickers_found"] = sorted(
+        t for t in ENERGY_HAVER_OPTIONAL_TICKERS if t in ticker_locations
+    )
+    stats["energy_optional_tickers_missing"] = sorted(
+        t for t in ENERGY_HAVER_OPTIONAL_TICKERS if t not in ticker_locations
+    )
+    stats["haver_contract"] = "monthly Energy inputs only"
+    return frame, stats
 
 def _read_bloomberg_sheet(xls: pd.ExcelFile, sheet: str) -> tuple[pd.DataFrame, dict[str, object]]:
     raw = pd.read_excel(xls, sheet_name=sheet, header=None, dtype=object)
@@ -1263,6 +1493,372 @@ def _read_eurostat_hicp_sheet(
     }
     return indices, weights, stats, audit
 
+
+def _read_headline_hicp_sheet(
+    xls: pd.ExcelFile,
+    sheet: str,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, object], dict[str, object]]:
+    """Read the Headline HICP Power Query view.
+
+    The monthly index block and annual weight block deliberately have different
+    ECOICOP coverage:
+
+    * indices: TOTAL, NRG, FOOD, FOOD_NP, FOOD_P, IGD_NNRG, SERV;
+    * weights: TOTAL, NRG, FOOD_NP, FOOD_P, IGD_NNRG, SERV.
+
+    ``FOOD`` is the official Eurostat aggregate used directly by the joint
+    Headline BVAR. Its four-component annual aggregation weight is still built
+    from ``FOOD_NP + FOOD_P``.
+    """
+    raw = pd.read_excel(xls, sheet_name=sheet, dtype=object)
+    if raw.empty:
+        raise ValueError(f"headline_hicp: sheet {sheet!r} is empty.")
+
+    raw.columns = [str(c).strip() for c in raw.columns]
+    missing = [c for c in EUROSTAT_HICP_REQUIRED_COLUMNS if c not in raw.columns]
+    if missing:
+        raise ValueError(f"headline_hicp: missing required column(s) {missing}.")
+
+    data = raw.loc[:, EUROSTAT_HICP_REQUIRED_COLUMNS].copy()
+    for c in (
+        "dataset", "measure", "series", "coicop18",
+        "geo", "statinfo", "freq", "unit", "flag",
+    ):
+        data[c] = data[c].map(_clean_text)
+
+    data["date"] = _parse_dates(data["date"])
+    data["year"] = pd.to_numeric(data["year"], errors="coerce").astype("Int64")
+    for c in ("value", "index_2025", "weight_per_thousand"):
+        data[c] = (
+            pd.to_numeric(data[c], errors="coerce")
+            .replace([np.inf, -np.inf], np.nan)
+        )
+
+    idx = data.loc[data["measure"] == "hicp_index"].copy()
+    wgt = data.loc[data["measure"] == "hicp_weight"].copy()
+    if idx.empty or wgt.empty:
+        raise ValueError("headline_hicp: both index and weight blocks are required.")
+
+    bad_idx = idx.loc[
+        (idx["dataset"] != EUROSTAT_HICP_INDEX_DATASET)
+        | (idx["freq"] != "M")
+        | (idx["unit"] != EUROSTAT_HICP_INDEX_UNIT)
+        | (idx["geo"] != EUROSTAT_HICP_GEO)
+    ]
+    if not bad_idx.empty:
+        raise ValueError(
+            "headline_hicp: monthly index contract changed. "
+            "Expected prc_hicp_minr / M / I25 / EA."
+        )
+
+    bad_wgt = wgt.loc[
+        (wgt["dataset"] != EUROSTAT_HICP_WEIGHT_DATASET)
+        | (wgt["freq"] != "A")
+        | (wgt["geo"] != EUROSTAT_HICP_GEO)
+    ]
+    if not bad_wgt.empty:
+        raise ValueError(
+            "headline_hicp: annual weight contract changed. "
+            "Expected prc_hicp_iw / A / EA."
+        )
+
+    expected_index_codes = set(HEADLINE_HICP_INDEX_SERIES)
+    observed_index_codes = set(idx["coicop18"])
+    if observed_index_codes != expected_index_codes:
+        raise ValueError(
+            "headline_hicp indices: ECOICOP coverage changed. "
+            f"Missing={sorted(expected_index_codes-observed_index_codes)}; "
+            f"unexpected={sorted(observed_index_codes-expected_index_codes)}."
+        )
+    for code, expected_series in HEADLINE_HICP_INDEX_SERIES.items():
+        observed = set(idx.loc[idx["coicop18"] == code, "series"])
+        if observed != {expected_series}:
+            raise ValueError(
+                f"headline_hicp indices: {code} expected "
+                f"{expected_series!r}, found {sorted(observed)}."
+            )
+
+    expected_weight_codes = set(HEADLINE_HICP_WEIGHT_SERIES)
+    observed_weight_codes = set(wgt["coicop18"])
+    if observed_weight_codes != expected_weight_codes:
+        raise ValueError(
+            "headline_hicp weights: ECOICOP coverage changed. "
+            f"Missing={sorted(expected_weight_codes-observed_weight_codes)}; "
+            f"unexpected={sorted(observed_weight_codes-expected_weight_codes)}."
+        )
+    for code, expected_series in HEADLINE_HICP_WEIGHT_SERIES.items():
+        observed = set(wgt.loc[wgt["coicop18"] == code, "series"])
+        if observed != {expected_series}:
+            raise ValueError(
+                f"headline_hicp weights: {code} expected "
+                f"{expected_series!r}, found {sorted(observed)}."
+            )
+
+    if idx["date"].isna().any() or idx["year"].isna().any():
+        raise ValueError("headline_hicp: index rows require date and year.")
+    if wgt["date"].notna().any() or wgt["year"].isna().any():
+        raise ValueError("headline_hicp: weight rows require date=null and year.")
+
+    index_year = idx["date"].dt.year.astype("Int64")
+    if not index_year.equals(idx["year"].astype("Int64")):
+        bad = idx.loc[
+            index_year != idx["year"].astype("Int64"),
+            ["series", "date", "year"],
+        ].head()
+        raise ValueError(f"headline_hicp: index date/year mismatch:\n{bad}")
+
+    bad_index_values = (
+        idx["value"].isna()
+        | idx["index_2025"].isna()
+        | idx["weight_per_thousand"].notna()
+        | ((idx["value"] - idx["index_2025"]).abs() > 1e-12)
+    )
+    if bad_index_values.any():
+        raise ValueError(
+            "headline_hicp: invalid hicp_index value mapping in "
+            f"{int(bad_index_values.sum())} row(s)."
+        )
+
+    bad_weight_values = (
+        wgt["value"].isna()
+        | wgt["weight_per_thousand"].isna()
+        | wgt["index_2025"].notna()
+        | ((wgt["value"] - wgt["weight_per_thousand"]).abs() > 1e-12)
+    )
+    if bad_weight_values.any():
+        raise ValueError(
+            "headline_hicp: invalid hicp_weight value mapping in "
+            f"{int(bad_weight_values.sum())} row(s)."
+        )
+
+    if idx.duplicated(["series", "date", "measure"]).any():
+        raise ValueError("headline_hicp: duplicate index keys.")
+    if wgt.duplicated(["series", "year", "measure"]).any():
+        raise ValueError("headline_hicp: duplicate weight keys.")
+
+    for series in HEADLINE_HICP_INDEX_OUTPUT_ORDER:
+        dates = pd.DatetimeIndex(
+            idx.loc[idx["series"] == series, "date"].sort_values()
+        )
+        if len(dates) == 0:
+            raise ValueError(f"headline_hicp {series}: no monthly observations.")
+        missing_dates = pd.date_range(
+            dates.min(), dates.max(), freq="MS"
+        ).difference(dates)
+        if len(missing_dates):
+            raise ValueError(
+                f"headline_hicp {series}: monthly gap at "
+                f"{missing_dates[0].date()}."
+            )
+
+    for series in HEADLINE_HICP_WEIGHT_OUTPUT_ORDER:
+        years = sorted(
+            wgt.loc[wgt["series"] == series, "year"]
+            .dropna().astype(int).unique()
+        )
+        if not years:
+            raise ValueError(f"headline_hicp {series}: no annual weights.")
+        missing_years = sorted(
+            set(range(years[0], years[-1] + 1)) - set(years)
+        )
+        if missing_years:
+            raise ValueError(
+                f"headline_hicp {series}: annual weight gap at "
+                f"{missing_years[0]}."
+            )
+
+    indices = (
+        idx.pivot(index="date", columns="series", values="index_2025")
+        .sort_index()
+        .reindex(columns=HEADLINE_HICP_INDEX_OUTPUT_ORDER)
+    )
+    indices.index = pd.DatetimeIndex(indices.index, name="date")
+
+    weights = (
+        wgt.assign(year_int=wgt["year"].astype(int))
+        .pivot(index="year_int", columns="series", values="weight_per_thousand")
+        .sort_index()
+        .reindex(columns=HEADLINE_HICP_WEIGHT_OUTPUT_ORDER)
+    )
+    weights.index.name = "year"
+
+    identities = []
+    for year, row in weights.iterrows():
+        components = row[HEADLINE_COMPONENTS_FOR_TOTAL]
+        if components.notna().all():
+            component_sum = float(components.sum())
+            error = component_sum - 1000.0
+            status = (
+                "pass"
+                if abs(error) <= HEADLINE_WEIGHT_TOLERANCE_PER_THOUSAND
+                else "fail"
+            )
+        else:
+            component_sum, error, status = np.nan, np.nan, "not_testable"
+
+        total_weight = row.get("hicp_total", np.nan)
+        identities.append(
+            {
+                "year": int(year),
+                "component_weight_sum": component_sum,
+                "component_sum_minus_1000": error,
+                "total_weight": total_weight,
+                "status": status,
+            }
+        )
+
+    identities_df = pd.DataFrame(identities)
+    failures = identities_df.loc[identities_df["status"] == "fail"]
+    if not failures.empty:
+        r = failures.iloc[0]
+        raise ValueError(
+            "headline_hicp: component weights fail the 1000 identity in "
+            f"{int(r['year'])}: sum={r['component_weight_sum']:.6f}."
+        )
+
+    starts: dict[str, dict[str, object]] = {}
+    all_series = list(dict.fromkeys(
+        HEADLINE_HICP_INDEX_OUTPUT_ORDER + HEADLINE_HICP_WEIGHT_OUTPUT_ORDER
+    ))
+    for series in all_series:
+        index_start = indices[series].first_valid_index() if series in indices.columns else None
+        index_end = indices[series].last_valid_index() if series in indices.columns else None
+        weight_start = weights[series].first_valid_index() if series in weights.columns else None
+        weight_end = weights[series].last_valid_index() if series in weights.columns else None
+        starts[series] = {
+            "index_start": index_start.date().isoformat() if index_start is not None else None,
+            "index_end": index_end.date().isoformat() if index_end is not None else None,
+            "weight_start": int(weight_start) if weight_start is not None else None,
+            "weight_end": int(weight_end) if weight_end is not None else None,
+        }
+
+    stats = {
+        "raw_rows": int(len(raw)),
+        "retained_rows": int(len(data)),
+        "columns": int(data.shape[1]),
+        "input_order": "mixed_index_and_weight_blocks",
+        "invalid_date_rows": 0,
+        "duplicate_date_rows": 0,
+        "duplicate_dates": 0,
+        "all_missing_rows_dropped": 0,
+        "error_markers_coerced_to_nan": 0,
+        "first_date": indices.index.min().date().isoformat(),
+        "last_date": indices.index.max().date().isoformat(),
+        "first_weight_year": int(weights.index.min()),
+        "last_weight_year": int(weights.index.max()),
+        "geo": EUROSTAT_HICP_GEO,
+        "index_unit": EUROSTAT_HICP_INDEX_UNIT,
+        "food_index_source": "Eurostat prc_hicp_minr / FOOD / I25 / EA",
+        "food_weight_source": "Eurostat prc_hicp_iw / FOOD_NP + FOOD_P",
+    }
+    audit = {"weight_identities": identities_df, "series_starts": starts}
+    return indices, weights, stats, audit
+
+
+def _build_headline_joint_weights(
+    headline_weights: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Build annual Energy/Food/NEIG/Services weights for the joint Headline BVAR.
+
+    The monthly Food index comes from the official Eurostat FOOD aggregate.
+    Its annual HICP aggregation weight is constructed from the official
+    subcomponent weights:
+
+        Food = Processed Food + Unprocessed Food.
+
+    Whenever all four component weights are published, their sum must equal
+    1000 within HEADLINE_WEIGHT_TOLERANCE_PER_THOUSAND.
+    """
+    required = [
+        "hicp_energy",
+        "hicp_unprocessed_food",
+        "hicp_processed_food",
+        "hicp_neig",
+        "hicp_services",
+    ]
+    missing = [c for c in required if c not in headline_weights.columns]
+    if missing:
+        raise KeyError(
+            f"headline_joint_weights: missing source weight columns {missing}."
+        )
+
+    src = headline_weights.copy().astype(float).sort_index()
+    food_complete = src[
+        ["hicp_unprocessed_food", "hicp_processed_food"]
+    ].notna().all(axis=1)
+    food = (
+        src["hicp_unprocessed_food"] + src["hicp_processed_food"]
+    ).where(food_complete)
+
+    joint = pd.DataFrame(
+        {
+            "hicp_energy": src["hicp_energy"],
+            "hicp_food": food,
+            "hicp_neig": src["hicp_neig"],
+            "hicp_services": src["hicp_services"],
+        },
+        index=src.index,
+    )
+    joint.index.name = "year"
+
+    rows = []
+    for year, row in joint.iterrows():
+        if row.notna().all():
+            component_sum = float(row.sum())
+            error = component_sum - 1000.0
+            status = (
+                "pass"
+                if abs(error) <= HEADLINE_WEIGHT_TOLERANCE_PER_THOUSAND
+                else "fail"
+            )
+        else:
+            component_sum, error, status = np.nan, np.nan, "not_testable"
+        rows.append(
+            {
+                "year": int(year),
+                "energy_weight": row["hicp_energy"],
+                "food_weight": row["hicp_food"],
+                "food_weight_source": (
+                    "hicp_processed_food + hicp_unprocessed_food"
+                ),
+                "neig_weight": row["hicp_neig"],
+                "services_weight": row["hicp_services"],
+                "component_weight_sum": component_sum,
+                "component_sum_minus_1000": error,
+                "status": status,
+            }
+        )
+
+    diagnostics = pd.DataFrame(rows)
+    failures = diagnostics.loc[diagnostics["status"] == "fail"]
+    if not failures.empty:
+        first = failures.iloc[0]
+        raise ValueError(
+            "headline_joint_weights: Energy+Food+NEIG+Services fail the "
+            f"1000 identity in {int(first['year'])}: "
+            f"sum={float(first['component_weight_sum']):.6f}."
+        )
+    return joint, diagnostics
+
+
+def _validate_headline_joint_panel(panel: pd.DataFrame) -> None:
+    """Validate the four positive HICP indices used by the joint BVAR."""
+    _validate_model_panel("headline_joint", panel, HEADLINE_JOINT_SPEC)
+    for column in HEADLINE_JOINT_SPEC["columns"]:
+        observed = panel[column].dropna()
+        if observed.empty:
+            raise ValueError(f"headline_joint: {column} has no observations.")
+        bad = observed <= 0
+        if bad.any():
+            first = bad[bad].index[0]
+            raise ValueError(
+                f"headline_joint: {column} must be strictly positive for "
+                f"log differences; first invalid observation is "
+                f"{pd.Timestamp(first).date()}."
+            )
+
+
+
 def _read_workbook_sources(
     raw_path: Path,
     *,
@@ -1284,7 +1880,7 @@ def _read_workbook_sources(
         xls = pd.ExcelFile(raw_path, engine="openpyxl")
     except ImportError as exc:
         raise ImportError(
-            "Reading the raw .xlsx workbook requires openpyxl. Install it with "
+            "Reading the raw Excel workbook (.xlsm/.xlsx) requires openpyxl. Install it with "
             "'python -m pip install openpyxl'."
         ) from exc
 
@@ -1297,6 +1893,9 @@ def _read_workbook_sources(
     hicp_sheet = _sheet_name(xls, "eurostat_hicp", required=False)
     if hicp_sheet is not None:
         resolved["eurostat_hicp"] = hicp_sheet
+    headline_hicp_sheet = _sheet_name(xls, "eurostat_headline_hicp", required=False)
+    if headline_hicp_sheet is not None:
+        resolved["headline_hicp"] = headline_hicp_sheet
 
     frames: dict[str, pd.DataFrame] = {}
     stats: dict[str, dict[str, object]] = {}
@@ -1338,6 +1937,20 @@ def _read_workbook_sources(
                 "error": str(exc),
                 "discovery_mode": bool(hicp_discovery),
             }
+
+    # Optional Headline HICP lineage. Failures are recorded, never allowed to
+    # invalidate the independent six-model Energy build.
+    if headline_hicp_sheet is not None:
+        try:
+            (
+                frames["headline_hicp_indices"],
+                frames["headline_hicp_weights"],
+                stats["headline_hicp"],
+                frames["headline_hicp_audit"],
+            ) = _read_headline_hicp_sheet(xls, headline_hicp_sheet)
+        except (ValueError, KeyError) as exc:
+            frames["headline_hicp_error"] = pd.DataFrame({"error": [str(exc)]})
+
 
     metadata_records: list[dict[str, object]] = []
     metadata_sheet = _sheet_name(xls, "metadata", required=False)
@@ -2053,8 +2666,14 @@ def build_model_datasets(
     max_tax_carry_months: int = DEFAULT_TAX_CARRY_ERROR_MONTHS,
     hicp_discovery: bool = False,
     require_hicp: bool = False,
+    require_headline: bool = False,
 ) -> dict[str, Path]:
-    """Read one Excel snapshot and write the six model-specific datasets."""
+    """Read one Excel snapshot; always build Energy and opportunistically build Headline inputs.
+
+    ``require_headline`` enforces only the current joint BVAR contract:
+    Energy/Food/NEIG/Services plus annual four-component weights.
+
+    """
     if weekly_commodity_shift_weeks not in (0, 1):
         raise ValueError("weekly_commodity_shift_weeks must be 0 or 1.")
     if max_tax_carry_months < 0:
@@ -2063,8 +2682,11 @@ def build_model_datasets(
     raw = Path(raw_path) if raw_path is not None else find_raw_workbook(raw_root)
     if not raw.is_file():
         raise FileNotFoundError(raw)
-    if raw.suffix.lower() != ".xlsx":
-        raise ValueError(f"The single raw input must be an .xlsx workbook: {raw}")
+    if raw.suffix.lower() not in SUPPORTED_WORKBOOK_SUFFIXES:
+        allowed = ", ".join(sorted(SUPPORTED_WORKBOOK_SUFFIXES))
+        raise ValueError(
+            f"The single raw input must be an Excel workbook ({allowed}): {raw}"
+        )
 
     snapshot_vintage = _parse_vintage_name(raw.parent.name)
     build_vintage = build_vintage or (
@@ -2090,6 +2712,9 @@ def build_model_datasets(
     hicp_available = "eurostat_hicp_indices" in frames and "eurostat_hicp_weights" in frames
     hicp_indices = frames.get("eurostat_hicp_indices")
     hicp_weights = frames.get("eurostat_hicp_weights")
+    headline_hicp_available = "headline_hicp_indices" in frames and "headline_hicp_weights" in frames
+    headline_indices = frames.get("headline_hicp_indices")
+    headline_weights = frames.get("headline_hicp_weights")
 
     # ------------------------------------------------------------------
     # Bloomberg: daily inputs -> EUR units -> weekly/monthly aggregation
@@ -2255,6 +2880,59 @@ def build_model_datasets(
     for name, panel in panels.items():
         _validate_model_panel(name, panel, MODEL_SPECS[name])
 
+    # ------------------------------------------------------------------
+    # Final Headline production input: one joint monthly BVAR only.
+    # ------------------------------------------------------------------
+    headline_joint_blockers: list[str] = []
+    headline_joint_panel: pd.DataFrame | None = None
+    headline_joint_weights: pd.DataFrame | None = None
+    headline_joint_weight_diagnostics = pd.DataFrame()
+
+    if not headline_hicp_available:
+        headline_joint_blockers.append(
+            "Eurostat Headline HICP VIEW unavailable or invalid"
+        )
+    else:
+        assert headline_indices is not None and headline_weights is not None
+        energy_target = headline_indices["hicp_energy"].rename("hicp_energy")
+        food_target = headline_indices["hicp_food"].rename("hicp_food")
+        neig_target = headline_indices["hicp_neig"].rename("hicp_neig")
+        services_target = headline_indices["hicp_services"].rename("hicp_services")
+
+        if not food_target.notna().any():
+            headline_joint_blockers.append(
+                "Eurostat FOOD aggregate HICP missing from Eurostat Headline HICP VIEW"
+            )
+        else:
+            headline_joint_panel = _regular_panel(
+                {
+                    "hicp_energy": energy_target,
+                    "hicp_food": food_target,
+                    "hicp_neig": neig_target,
+                    "hicp_services": services_target,
+                },
+                frequency="monthly",
+                target_columns=HEADLINE_JOINT_SPEC["target_columns"],
+            )
+            common_start = max(
+                headline_joint_panel[column].first_valid_index()
+                for column in HEADLINE_JOINT_SPEC["target_columns"]
+            )
+            headline_joint_panel = headline_joint_panel.loc[common_start:].copy()
+            _validate_headline_joint_panel(headline_joint_panel)
+            (
+                headline_joint_weights,
+                headline_joint_weight_diagnostics,
+            ) = _build_headline_joint_weights(headline_weights)
+
+    if require_headline and (
+        headline_joint_panel is None or headline_joint_weights is None
+    ):
+        raise ValueError(
+            "Joint Headline BVAR inputs are required but incomplete. "
+            f"Blockers: {headline_joint_blockers}"
+        )
+
     aggregation_coverage = _bind_coverage_to_panels(aggregation_coverage, panels)
 
     partial_period_inputs: list[dict[str, object]] = []
@@ -2287,6 +2965,19 @@ def build_model_datasets(
         outputs[name] = path
         diagnostic_rows.extend(_diagnostic_rows(name, panel, MODEL_SPECS[name]))
 
+    if headline_joint_panel is not None:
+        path = output_dir / HEADLINE_JOINT_SPEC["file"]
+        headline_joint_panel.to_csv(path, date_format="%Y-%m-%d")
+        outputs["headline_joint"] = path
+        diagnostic_rows.extend(
+            _diagnostic_rows(
+                "headline_joint",
+                headline_joint_panel,
+                HEADLINE_JOINT_SPEC,
+            )
+        )
+
+
     diagnostics_path = output_dir / "model_datasets_diagnostics.csv"
     sources_path = output_dir / "source_vintages.csv"  # kept for compatibility
     coverage_path = output_dir / "aggregation_coverage.csv"
@@ -2299,6 +2990,31 @@ def build_model_datasets(
         columns=["series", "panel_column", "panel_label_date", "frequency", "input_date", "input_value"],
     )
     partial_inputs_frame.to_csv(partial_inputs_path, index=False)
+
+    # Headline audit sidecars. They are written whenever their source exists,
+    # independently of whether all four model panels are ready.
+    headline_indices_path = output_dir / "headline_hicp_indices_monthly.csv"
+    headline_weights_path = output_dir / "headline_hicp_weights_annual.csv"
+    headline_weight_identity_path = output_dir / "headline_hicp_weight_identity_diagnostics.csv"
+    headline_joint_weights_path = output_dir / "headline_joint_weights_annual.csv"
+    headline_joint_weight_identity_path = output_dir / "headline_joint_weight_identity_diagnostics.csv"
+
+    if headline_hicp_available:
+        assert headline_indices is not None and headline_weights is not None
+        headline_indices.to_csv(headline_indices_path, date_format="%Y-%m-%d")
+        headline_weights.to_csv(headline_weights_path, index_label="year")
+        audit_obj = frames.get("headline_hicp_audit")
+        if isinstance(audit_obj, dict):
+            audit_obj["weight_identities"].to_csv(headline_weight_identity_path, index=False)
+    if headline_joint_weights is not None:
+        headline_joint_weights.to_csv(
+            headline_joint_weights_path,
+            index_label="year",
+        )
+        headline_joint_weight_diagnostics.to_csv(
+            headline_joint_weight_identity_path,
+            index=False,
+        )
 
     # ------------------------------------------------------------------
     # Optional HICP aggregation lineage. It never changes the six BVAR panels.
@@ -2363,6 +3079,29 @@ def build_model_datasets(
         )
     workbook_hash = _sha256(raw)
     snapshot_label = raw.parent.name if snapshot_vintage else "unversioned_workbook"
+
+    # Persist the exact source context required later by tax re-attribution and
+    # fitted/scenario materialisation.  These are parsed, numeric, dated copies
+    # of the workbook state used for THIS processed vintage; the living workbook
+    # may subsequently be refreshed without altering historical provenance.
+    source_context_paths: dict[str, Path] = {}
+    for source, filename in SOURCE_CONTEXT_FILES.items():
+        frame = frames[source].copy().sort_index()
+        path = output_dir / filename
+        frame.to_csv(path, index_label="date", date_format="%Y-%m-%d")
+        source_context_paths[source] = path
+
+    # Explicit overwrite is opt-in.  Once the new production contract has been
+    # successfully materialised, remove only outputs owned by the retired
+    # Headline decomposition branch; never touch arbitrary user files.
+    removed_deprecated_outputs: list[str] = []
+    if overwrite:
+        for filename in DEPRECATED_HEADLINE_DECOMPOSITION_OUTPUTS:
+            stale = output_dir / filename
+            if stale.is_file():
+                stale.unlink()
+                removed_deprecated_outputs.append(filename)
+
     source_table = pd.DataFrame([
         {
             "source": source,
@@ -2392,6 +3131,7 @@ def build_model_datasets(
             "world_bank",
             "eurostat",
             *(("eurostat_hicp",) if hicp_available else ()),
+            *(("headline_hicp",) if headline_hicp_available else ()),
         )
     ])
     source_table.to_csv(sources_path, index=False)
@@ -2401,6 +3141,10 @@ def build_model_datasets(
         "source_vintages": str(sources_path.resolve()),
         "aggregation_coverage": str(coverage_path.resolve()),
         "partial_period_inputs": str(partial_inputs_path.resolve()),
+        **{
+            f"source_context_{source}": str(path.resolve())
+            for source, path in source_context_paths.items()
+        },
     }
 
     if hicp_available:
@@ -2452,8 +3196,61 @@ def build_model_datasets(
             "source_sheet": sheets.get("eurostat_hicp"),
         }
 
+    headline_auxiliary_outputs: dict[str, str] = {}
+    for key, path in (
+        ("headline_hicp_indices_monthly", headline_indices_path),
+        ("headline_hicp_weights_annual", headline_weights_path),
+        ("headline_hicp_weight_identity_diagnostics", headline_weight_identity_path),
+        ("headline_joint_weights_annual", headline_joint_weights_path),
+        ("headline_joint_weight_identity_diagnostics", headline_joint_weight_identity_path),
+    ):
+        if path.exists():
+            headline_auxiliary_outputs[key] = str(path.resolve())
+    auxiliary_outputs.update(headline_auxiliary_outputs)
+
+    joint_ready = (
+        headline_joint_panel is not None
+        and headline_joint_weights is not None
+    )
+    headline_manifest_section = {
+        "production_model": "headline_joint",
+        "status": "complete" if joint_ready else "unavailable",
+        "source_sheet": sheets.get("headline_hicp"),
+        "joint_model": {
+            "ready": bool(joint_ready),
+            "spec": HEADLINE_JOINT_SPEC,
+            "food_index_source": {
+                "provider": "Eurostat",
+                "dataset": EUROSTAT_HICP_INDEX_DATASET,
+                "code": "FOOD",
+                "unit": EUROSTAT_HICP_INDEX_UNIT,
+                "geo": EUROSTAT_HICP_GEO,
+                "series": "hicp_food",
+            },
+            "food_weight_construction": (
+                "Eurostat FOOD_NP + FOOD_P annual item weights"
+            ),
+            "blockers": headline_joint_blockers,
+            "path": (
+                str(outputs["headline_joint"].resolve())
+                if "headline_joint" in outputs
+                else None
+            ),
+            "annual_weights_path": (
+                str(headline_joint_weights_path.resolve())
+                if headline_joint_weights_path.exists()
+                else None
+            ),
+        },
+        "headline_hicp_start_policy": (
+            "No forced common start. The joint BVAR model layer determines "
+            "the first jointly usable transformed observation."
+        ),
+        "files": headline_auxiliary_outputs,
+    }
+
     manifest = {
-        "project": "ECB energy STIP six-model dataset build",
+        "project": "ECB energy STIP six-model dataset build + final joint Headline-HICP BVAR input",
         "script_version": SCRIPT_VERSION,
         "built_at_utc": datetime.now(timezone.utc).isoformat(),
         "python_executable": sys.executable,
@@ -2461,20 +3258,54 @@ def build_model_datasets(
         "pandas_version": pd.__version__,
         "numpy_version": np.__version__,
         "build_vintage": build_vintage,
-        "input_architecture": "single_excel_workbook",
+        "input_architecture": "single_excel_workbook_xlsm_or_xlsx",
         "raw_workbook": str(raw.resolve()),
         "raw_workbook_sha256": workbook_hash,
         "raw_workbook_bytes": raw.stat().st_size,
         "snapshot_vintage": snapshot_label,
         "sheet_mapping": sheets,
+        "source_files": {
+            source: path.name
+            for source, path in source_context_paths.items()
+        },
+        "source_context_contract": {
+            "mode": "immutable_processed_vintage_sidecars",
+            "sources": sorted(source_context_paths),
+            "note": (
+                "Tax/HICP/fitted/scenario adapters must prefer these files over "
+                "the living Excel workbook. Legacy vintages without sidecars may "
+                "use the workbook only when its SHA256 matches the manifest."
+            ),
+        },
+        "deprecated_outputs_removed_on_overwrite": removed_deprecated_outputs,
         "ignored_live_sheet": "Bloomberg_Live",
         "workbook_requirement": (
-            "Bloomberg is the values-only snapshot consumed by Python. "
-            "Bloomberg_Live may contain formulas and is intentionally ignored."
+            "Production workbook may be .xlsm or .xlsx; .xlsm is preferred because "
+            "it preserves Config/VBA. Python never executes VBA, Power Query, Haver "
+            "or Bloomberg formulas. Refresh and save the workbook in Excel first. "
+            "Bloomberg_copy is the values-only snapshot consumed by Python; "
+            "Bloomberg_Live is intentionally ignored."
         ),
+        "workbook_freshness_contract": {
+            "haver": (
+                "Refresh the Haver block in Excel and save before the build. "
+                "Only H023HW51, H023HW52, H023HW54, H023HW55 and H025PP@G10 "
+                "are hard Energy requirements; total/car-fuels/liquid-fuels Haver "
+                "series are optional because the Eurostat HICP lineage owns them."
+            ),
+            "bloomberg": (
+                "Refresh Bloomberg_Live, copy values/number formats to Bloomberg_copy, "
+                "then save before the build."
+            ),
+            "power_query": (
+                "Apply Config and refresh Power Query, wait for completion, then save. "
+                "Python reads cached worksheet values and does not execute queries."
+            ),
+        },
         "source_read_statistics": read_stats,
         "metadata_sheet_records": metadata_records,
         "hicp_aggregation_inputs": hicp_manifest_section,
+        "headline_inputs": headline_manifest_section,
         "bloomberg_mapping": BLOOMBERG_TICKERS,
         "bloomberg_units": BLOOMBERG_UNITS,
         "refined_petroleum_policy": (
@@ -2536,6 +3367,22 @@ def build_model_datasets(
             }
             for name, spec in MODEL_SPECS.items()
         },
+        "headline_joint_model": (
+            None
+            if headline_joint_panel is None
+            else {
+                **HEADLINE_JOINT_SPEC,
+                "path": str(outputs["headline_joint"].resolve()),
+                "rows": int(len(headline_joint_panel)),
+                "first_date": headline_joint_panel.index.min().date().isoformat(),
+                "last_date": headline_joint_panel.index.max().date().isoformat(),
+                "annual_weights_path": (
+                    str(headline_joint_weights_path.resolve())
+                    if headline_joint_weights_path.exists()
+                    else None
+                ),
+            }
+        ),
         "auxiliary_outputs": auxiliary_outputs,
     }
 
@@ -2548,6 +3395,10 @@ def build_model_datasets(
         "source_vintages": _sha256(sources_path),
         "aggregation_coverage": _sha256(coverage_path),
         "partial_period_inputs": _sha256(partial_inputs_path),
+        **{
+            f"source_context_{source}": _sha256(path)
+            for source, path in source_context_paths.items()
+        },
     }
     if hicp_available:
         manifest["output_sha256"].update({
@@ -2559,6 +3410,8 @@ def build_model_datasets(
             "hicp_validation_failures": _sha256(hicp_validation_failures_path),
             "wob_hicp_mapping_diagnostics": _sha256(wob_hicp_mapping_path),
         })
+    for key, path_text in headline_auxiliary_outputs.items():
+        manifest["output_sha256"][key] = _sha256(Path(path_text))
     manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
 
     outputs.update({
@@ -2567,6 +3420,10 @@ def build_model_datasets(
         "aggregation_coverage": coverage_path,
         "partial_period_inputs": partial_inputs_path,
         "manifest": manifest_path,
+        **{
+            f"source_context_{source}": path
+            for source, path in source_context_paths.items()
+        },
     })
     if hicp_available:
         outputs.update({
@@ -2579,6 +3436,9 @@ def build_model_datasets(
             "wob_hicp_mapping_diagnostics": wob_hicp_mapping_path,
         })
 
+    for key, path_text in headline_auxiliary_outputs.items():
+        outputs[key] = Path(path_text)
+
     print(f"Builder:       {SCRIPT_VERSION}")
     print(f"Raw workbook:  {raw}")
     print(f"Build vintage: {build_vintage}")
@@ -2590,11 +3450,13 @@ def build_model_datasets(
         "world_bank",
         "eurostat",
         *(("eurostat_hicp",) if hicp_available else ()),
+        *(("headline_hicp",) if headline_hicp_available else ()),
     ):
         stat = read_stats[source]
         suffix = (
             f"; weights {stat['first_weight_year']} -> {stat['last_weight_year']}"
-            if source == "eurostat_hicp"
+            if source in {"eurostat_hicp", "headline_hicp"}
+            and stat.get("first_weight_year") is not None
             else ""
         )
         print(
@@ -2638,6 +3500,33 @@ def build_model_datasets(
         )
     else:
         print("\nHICP aggregation inputs: unavailable; six BVAR datasets remain valid and independent.")
+
+    print("\nHeadline joint production input:")
+    if headline_joint_panel is not None:
+        print(
+            f"  {HEADLINE_JOINT_SPEC['file']:30s} "
+            f"{headline_joint_panel.index.min().date()} -> "
+            f"{headline_joint_panel.index.max().date()} | "
+            f"{len(headline_joint_panel):,} rows | "
+            f"{headline_joint_panel.shape[1]} series"
+        )
+        if headline_joint_weights is not None:
+            complete_weights = headline_joint_weights.dropna(how="any")
+            if not complete_weights.empty:
+                print(
+                    f"  {headline_joint_weights_path.name:30s} "
+                    f"{int(complete_weights.index.min())} -> "
+                    f"{int(complete_weights.index.max())} | "
+                    f"{len(complete_weights):,} complete years"
+                )
+    else:
+        print("  not ready")
+    if headline_joint_blockers:
+        print("  blockers:")
+        for blocker in headline_joint_blockers:
+            print(f"    - {blocker}")
+
+
     print(f"\nOutput directory: {output_dir}")
     return outputs
 
@@ -2653,13 +3542,15 @@ def _parser() -> argparse.ArgumentParser:
         "--raw",
         type=Path,
         default=None,
-        help="Path to the single raw_energy_bvar.xlsx workbook. Default: auto-detect below --raw-root.",
+        help=("Path to the single production workbook (.xlsm preferred; .xlsx supported). "
+              "Default: auto-detect bvar_energy_raw_data*/raw_energy_bvar* below --raw-root."),
     )
     parser.add_argument(
         "--raw-root",
         type=Path,
         default=DEFAULT_RAW_ROOT,
-        help=f"Folder searched for raw_energy_bvar*.xlsx (default: {DEFAULT_RAW_ROOT}).",
+        help=(f"Folder searched for bvar_energy_raw_data*/raw_energy_bvar* .xlsm/.xlsx "
+              f"(default: {DEFAULT_RAW_ROOT})."),
     )
     parser.add_argument(
         "--output-root",
@@ -2702,6 +3593,14 @@ def _parser() -> argparse.ArgumentParser:
             "absence/errors never block the six BVAR datasets."
         ),
     )
+    parser.add_argument(
+        "--require-headline",
+        action="store_true",
+        help=(
+            "Require the current joint Headline BVAR input: HICP Energy/Food/"
+            "NEIG/Services plus complete annual four-component weights."
+        ),
+    )
     return parser
 
 
@@ -2717,6 +3616,7 @@ def main() -> None:
         max_tax_carry_months=args.max_tax_carry_months,
         hicp_discovery=args.hicp_discovery,
         require_hicp=args.require_hicp,
+        require_headline=args.require_headline,
     )
 
 

@@ -1,0 +1,35 @@
+/* Slice 6: keep Headline scenario controls visually aligned with Energy. */
+.h6-path-input {
+  width: 100%;
+  min-height: 84px;
+  resize: vertical;
+  box-sizing: border-box;
+  border: 1px solid var(--hairline, #D2D0D1);
+  border-radius: 4px;
+  background: var(--surface, #F7F6F7);
+  color: var(--ink, #040506);
+  font: inherit;
+  padding: 10px 12px;
+  line-height: 1.45;
+}
+
+.h6-actions {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  margin: 14px 0 16px 0;
+}
+
+.h6-secondary-button {
+  background: transparent !important;
+  color: var(--ink-soft, #3A3D40) !important;
+  border-color: var(--hairline, #D2D0D1) !important;
+}
+
+/* Plotly owns the graph internals; the surrounding panel owns title spacing. */
+#page-headline-scenarios .chart-panel .panel-heading,
+#page-headline-forecast .chart-panel .panel-heading,
+#page-headline-overview .chart-panel .panel-heading,
+#page-headline-contributions .chart-panel .panel-heading {
+  margin-bottom: 2px;
+}

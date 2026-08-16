@@ -1,0 +1,74 @@
+/* Inflation Dashboard — universal clean PNG export v1 */
+
+.inflation-png-button {
+    appearance: none;
+    -webkit-appearance: none;
+    border: 1px solid #D2D0D1;
+    border-radius: 7px;
+    background: rgba(255, 255, 255, 0.96);
+    color: #3A3D40;
+    font-family: Inter, "Segoe UI", Arial, sans-serif;
+    font-size: 10px;
+    font-weight: 700;
+    line-height: 1;
+    letter-spacing: 0.02em;
+    padding: 6px 8px;
+    cursor: pointer;
+    box-shadow: 0 1px 2px rgba(17, 24, 39, 0.05);
+    transition:
+        border-color 120ms ease,
+        color 120ms ease,
+        background-color 120ms ease,
+        opacity 120ms ease;
+}
+
+.inflation-png-button:hover {
+    border-color: #8D9095;
+    color: #111827;
+    background: #FFFFFF;
+}
+
+.inflation-png-button:focus-visible {
+    outline: 2px solid #009FE3;
+    outline-offset: 2px;
+}
+
+.inflation-png-button.inflation-png-busy {
+    opacity: 0.58;
+    cursor: progress;
+}
+
+.inflation-png-graph-button {
+    position: absolute;
+    top: 7px;
+    left: 8px;
+    z-index: 30;
+}
+
+.inflation-png-table-toolbar {
+    display: flex;
+    justify-content: flex-end;
+    align-items: center;
+    min-height: 28px;
+    margin: 2px 0 4px 0;
+    position: relative;
+    z-index: 5;
+}
+
+.inflation-export-hidden-plot {
+    position: fixed !important;
+    left: -20000px !important;
+    top: 0 !important;
+    width: 1050px !important;
+    visibility: hidden !important;
+    pointer-events: none !important;
+    z-index: -9999 !important;
+}
+
+/* Print/export controls never belong in printed browser pages. */
+@media print {
+    .inflation-png-button,
+    .inflation-png-table-toolbar {
+        display: none !important;
+    }
+}

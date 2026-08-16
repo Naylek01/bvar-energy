@@ -58,10 +58,19 @@ except ImportError:  # pragma: no cover - only for very old model modules.
     _hash_model_data = None
 
 
-FITTED_CACHE_VERSION = "energy-bvar-fitted-v4"
+FITTED_CACHE_VERSION = "energy-bvar-fitted-v8"
 FITTED_CACHE_BASENAME = "bvar_fitted_v3"
 FITTED_META_FILENAME = f"{FITTED_CACHE_BASENAME}_metadata.json"
-DEFAULT_START_DATE = pd.Timestamp("2017-01-01")
+# No dashboard-imposed display floor. Each component starts at the first
+# date its saved BVAR fit and required HICP/tax bridge are genuinely valid.
+DEFAULT_START_DATE = None
+# Car fuels is different: the maintained six-component/transport Laspeyres
+# reconstruction is defined from the post-2017 classification. December 2016
+# is therefore the PREVIOUS-DECEMBER LASPEYRES CHAIN-LINK anchor for the
+# car-fuels sub-aggregate. It is NOT the WOB/HICP proportional-rebase anchor
+# used by petrol, diesel or liquid fuels below.
+TRANSPORT_ANCHOR = pd.Timestamp("2016-12-01")
+TRANSPORT_FITTED_START = pd.Timestamp("2017-01-01")
 DEFAULT_MAX_DRAWS = 300
 DEFAULT_PAIRING_SEED = 2026
 QUANTILES = (0.05, 0.16, 0.50, 0.84, 0.95)
@@ -439,16 +448,37 @@ def _slice_object(obj: Mapping, dates: pd.DatetimeIndex) -> np.ndarray:
     return np.asarray(obj["paths"], dtype=float)[:, positions]
 
 
-def _common_monthly_dates(objects: Sequence[Mapping], start_date: pd.Timestamp) -> pd.DatetimeIndex:
+def _normalise_optional_start_date(
+    value: str | pd.Timestamp | None,
+) -> pd.Timestamp | None:
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    stamp = pd.Timestamp(value)
+    return stamp.to_period("M").to_timestamp(how="start")
+
+
+def _common_monthly_dates(
+    objects: Sequence[Mapping],
+    start_date: pd.Timestamp | None = None,
+) -> pd.DatetimeIndex:
+    """Natural common monthly overlap, with an optional explicit lower bound."""
     if not objects:
         raise FittedMaterialisationError("No component fitted paths were supplied.")
     starts = [pd.DatetimeIndex(obj["dates"]).min() for obj in objects]
     ends = [pd.DatetimeIndex(obj["dates"]).max() for obj in objects]
-    start = max([pd.Timestamp(start_date), *map(pd.Timestamp, starts)])
+    candidates = list(map(pd.Timestamp, starts))
+    if start_date is not None:
+        candidates.append(pd.Timestamp(start_date))
+    start = max(candidates)
     end = min(map(pd.Timestamp, ends))
     if end < start:
+        suffix = (
+            ""
+            if start_date is None
+            else f" after {pd.Timestamp(start_date).date()}"
+        )
         raise FittedMaterialisationError(
-            f"No common fitted monthly window after {pd.Timestamp(start_date).date()}."
+            f"No common fitted monthly window{suffix}."
         )
     dates = pd.date_range(
         start.to_period("M").to_timestamp(how="start"),
@@ -481,14 +511,18 @@ def _monthly_pretax_to_hicp(
     tax_context: Mapping,
     expand_function,
     reattribute_function,
-    start_date: pd.Timestamp,
+    start_date: pd.Timestamp | None = None,
 ) -> dict:
     dates = pd.DatetimeIndex(fitted["dates"], name="date")
-    mask = dates >= pd.Timestamp(start_date)
-    dates = dates[mask]
-    pre_tax = np.asarray(fitted["level_paths"], dtype=float)[:, mask]
+    pre_tax = np.asarray(fitted["level_paths"], dtype=float)
+    if start_date is not None:
+        mask = dates >= pd.Timestamp(start_date)
+        dates = dates[mask]
+        pre_tax = pre_tax[:, mask]
     if len(dates) == 0:
-        raise FittedMaterialisationError("No monthly fitted dates survive the display start date.")
+        raise FittedMaterialisationError(
+            "No monthly fitted dates survive the requested lower bound."
+        )
 
     vat = expand_function(tax_context["vat_percent"], dates).to_numpy(dtype=float)
     excise = expand_function(tax_context["excise"], dates).to_numpy(dtype=float)
@@ -539,33 +573,153 @@ def _monthly_mean_history(series: pd.Series) -> pd.Series:
     return out.sort_index()
 
 
+def _normalise_monthly_positive_history(series: pd.Series) -> pd.Series:
+    """Month-start, finite, strictly-positive observed history."""
+    out = series.astype(float).copy().sort_index()
+    out.index = (
+        pd.DatetimeIndex(out.index)
+        .to_period("M")
+        .to_timestamp(how="start")
+    )
+    if out.index.has_duplicates:
+        out = out.groupby(level=0).last()
+    out = out.where(np.isfinite(out) & (out > 0.0)).dropna()
+    out.index = pd.DatetimeIndex(out.index, name="date")
+    return out.sort_index()
+
+
+def _earliest_rebasable_fitted_month(
+    fitted_dates: Sequence[pd.Timestamp],
+    historical_monthly_price: pd.Series,
+    hicp_history: pd.Series,
+    *,
+    label: str,
+) -> tuple[pd.Timestamp, pd.Timestamp]:
+    """Return earliest fitted month with an honest prior WOB/HICP anchor.
+
+    ``rebase_price_paths_to_hicp_index`` requires a month ``a`` strictly before
+    the simulated path such that BOTH observed monthly WOB and HICP are
+    available. Removing the old 2017 dashboard floor exposed fitted BVAR dates
+    that precede the first such overlap. Those dates cannot be converted to a
+    HICP proxy and must not be labelled as fitted HICP observations.
+
+    The returned pair is ``(fitted_start_month, anchor_month)``. The anchor is
+    data-driven and component-specific.
+    """
+    dates = pd.DatetimeIndex(fitted_dates)
+    if dates.empty:
+        raise FittedMaterialisationError(
+            f"{label}: fitted weekly calendar is empty."
+        )
+
+    fitted_months = pd.DatetimeIndex(
+        sorted(
+            pd.DatetimeIndex(dates)
+            .to_period("M")
+            .to_timestamp(how="start")
+            .unique()
+        ),
+        name="date",
+    )
+
+    price = _normalise_monthly_positive_history(historical_monthly_price)
+    hicp = _normalise_monthly_positive_history(hicp_history)
+    common = price.index.intersection(hicp.index).sort_values()
+    if common.empty:
+        raise FittedMaterialisationError(
+            f"{label}: observed WOB and HICP histories have no common positive month."
+        )
+
+    for month in fitted_months:
+        prior = common[common < pd.Timestamp(month)]
+        if len(prior):
+            return pd.Timestamp(month), pd.Timestamp(prior.max())
+
+    raise FittedMaterialisationError(
+        f"{label}: no fitted month has a common observed WOB/HICP anchor "
+        "strictly before it."
+    )
+
+
 def _weekly_pretax_to_hicp(
     fitted: Mapping,
     *,
     context: Mapping,
     hicp_history: pd.Series,
-    start_date: pd.Timestamp,
+    start_date: pd.Timestamp | None = None,
     label: str,
 ) -> dict:
+    """Convert weekly fitted pre-tax WOB prices to an honest HICP proxy path.
+
+    Full-history means the earliest date that can actually be represented under
+    the production bridge. It does NOT mean forcing the BVAR fitted path before
+    a WOB/HICP proportional-rebase anchor exists.
+    """
     dates = pd.DatetimeIndex(fitted["dates"], name="date")
-    weekly_start = pd.Timestamp(start_date).to_period("M").to_timestamp(how="start")
-    mask = dates >= weekly_start
-    dates = dates[mask]
-    pre_tax = np.asarray(fitted["level_paths"], dtype=float)[:, mask]
-    if len(dates) == 0:
-        raise FittedMaterialisationError(f"{label}: no fitted weekly dates after display start.")
+    pre_tax = np.asarray(fitted["level_paths"], dtype=float)
+
+    if start_date is not None:
+        lower = pd.Timestamp(start_date).to_period("M").to_timestamp(how="start")
+        mask = dates >= lower
+        dates = dates[mask]
+        pre_tax = pre_tax[:, mask]
 
     data = context["data"]
+
+    # Taxes must already exist on/before every fitted weekly price date.
+    tax_starts = []
+    for tax_name in ("excise", "vat_percent"):
+        tax_series = data[tax_name].astype(float).dropna().sort_index()
+        if tax_series.empty:
+            raise FittedMaterialisationError(
+                f"{label}: {tax_name} contains no finite historical observations."
+            )
+        tax_index = (
+            pd.DatetimeIndex(tax_series.index)
+            .to_period("W-SUN")
+            .start_time
+        )
+        tax_starts.append(pd.Timestamp(tax_index.min()))
+
+    natural_tax_start = max(tax_starts)
+    mask = dates >= natural_tax_start
+    dates = dates[mask]
+    pre_tax = pre_tax[:, mask]
+    if len(dates) == 0:
+        raise FittedMaterialisationError(
+            f"{label}: no fitted weekly dates overlap the historical tax bridge."
+        )
+
+    historical_monthly_price = _monthly_mean_history(data["after_tax"])
+
+    # Critical full-history guard: find the EARLIEST fitted month for which
+    # rebase_price_paths_to_hicp_index has a genuine observed WOB/HICP month
+    # strictly before the simulated path.
+    fitted_start_month, expected_anchor = _earliest_rebasable_fitted_month(
+        dates,
+        historical_monthly_price,
+        hicp_history,
+        label=label,
+    )
+
+    fitted_month_index = (
+        dates.to_period("M").to_timestamp(how="start")
+    )
+    mask = fitted_month_index >= fitted_start_month
+    dates = dates[mask]
+    pre_tax = pre_tax[:, mask]
+
     excise = _carry_weekly_series(data["excise"], dates)
     vat = _carry_weekly_series(data["vat_percent"], dates)
     after_tax = (pre_tax + excise[None, :]) * (1.0 + vat[None, :] / 100.0)
 
-    # A one-step conditional fit can occasionally be economically inadmissible
-    # for an individual posterior coefficient draw.  Use the same positivity
-    # principle as the forecast aggregator and document the retained pool.
+    # Apply admissibility only on the economically representable fitted window;
+    # an earlier unanchorable BVAR month must not reject an otherwise valid draw.
     keep = np.all(np.isfinite(after_tax) & (after_tax > 0.0), axis=1)
     if not keep.any():
-        raise FittedMaterialisationError(f"{label}: all fitted after-tax price draws are invalid.")
+        raise FittedMaterialisationError(
+            f"{label}: all fitted after-tax price draws are invalid."
+        )
     after_tax = after_tax[keep]
 
     monthly, monthly_dates = weekly_paths_with_history_to_monthly_mean(
@@ -573,17 +727,50 @@ def _weekly_pretax_to_hicp(
         dates,
         data["after_tax"],
     )
-    monthly = _drop_bad_draws(monthly, label=f"{label} monthly after-tax")
-    historical_monthly_price = _monthly_mean_history(data["after_tax"])
+    if len(monthly_dates) == 0:
+        raise FittedMaterialisationError(
+            f"{label}: weekly-to-monthly conversion produced no complete month."
+        )
+    monthly = _drop_bad_draws(
+        monthly,
+        label=f"{label} monthly after-tax",
+    )
+
     rebased = rebase_price_paths_to_hicp_index(
         monthly,
         monthly_dates,
         historical_monthly_price,
         hicp_history,
     )
+    anchor_date = pd.Timestamp(rebased["anchor_date"])
+    if anchor_date != pd.Timestamp(expected_anchor):
+        raise FittedMaterialisationError(
+            f"{label}: dynamic anchor mismatch; expected "
+            f"{pd.Timestamp(expected_anchor).date()}, got {anchor_date.date()}."
+        )
+
+    # The production rebase helper can prepend OBSERVED WOB months between the
+    # anchor and simulated path. That is correct for forecasting continuity,
+    # but these are historical BVAR-FITTED overlays. Keep only months for which
+    # the fitted WOB path actually supplied the monthly price.
+    rebased_dates = pd.DatetimeIndex(rebased["dates"], name="date")
+    monthly_dates = pd.DatetimeIndex(monthly_dates, name="date")
+    positions = rebased_dates.get_indexer(monthly_dates)
+    if (positions < 0).any():
+        raise FittedMaterialisationError(
+            f"{label}: rebased HICP proxy does not contain every fitted month."
+        )
+    fitted_hicp = np.asarray(rebased["index_paths"], dtype=float)[:, positions]
+
     return {
-        "dates": pd.DatetimeIndex(rebased["dates"], name="date"),
-        "paths": _drop_bad_draws(rebased["index_paths"], label=f"{label} HICP proxy"),
+        "dates": monthly_dates,
+        "paths": _drop_bad_draws(
+            fitted_hicp,
+            label=f"{label} HICP proxy",
+        ),
+        "anchor_date": anchor_date,
+        "fitted_start_month": pd.Timestamp(monthly_dates.min()),
+        "bridge_method": rebased["method"],
     }
 
 
@@ -715,6 +902,7 @@ def _summary_frame(
         if len(x):
             q = np.quantile(x, QUANTILES)
             row = {
+                "posterior_mean": float(np.mean(x)),
                 "q05": float(q[0]),
                 "q16": float(q[1]),
                 "q50": float(q[2]),
@@ -723,7 +911,11 @@ def _summary_frame(
                 "n_draws": int(len(x)),
             }
         else:
-            row = {"q05": np.nan, "q16": np.nan, "q50": np.nan, "q84": np.nan, "q95": np.nan, "n_draws": 0}
+            row = {
+                "posterior_mean": np.nan,
+                "q05": np.nan, "q16": np.nan, "q50": np.nan,
+                "q84": np.nan, "q95": np.nan, "n_draws": 0,
+            }
         rows.append(
             {
                 "date": pd.Timestamp(date),
@@ -745,7 +937,7 @@ def validate_fitted_frame(frame: pd.DataFrame) -> dict:
     """
     required = {
         "date", "basis", "series", "metric",
-        "q05", "q16", "q50", "q84", "q95", "n_draws",
+        "posterior_mean", "q05", "q16", "q50", "q84", "q95", "n_draws",
     }
     missing = sorted(required.difference(frame.columns))
     if missing:
@@ -755,12 +947,24 @@ def validate_fitted_frame(frame: pd.DataFrame) -> dict:
     if frame.empty:
         raise FittedMaterialisationError("Fitted cache is empty.")
 
-    allowed_basis = {"component_bvar_fitted", "aggregate_bvar_fitted"}
+    allowed_basis = {"source_bvar_fitted", "component_bvar_fitted", "aggregate_bvar_fitted"}
     basis = set(frame["basis"].dropna().astype(str))
     if basis != allowed_basis:
         raise FittedMaterialisationError(
             f"Unexpected fitted basis contract {sorted(basis)}; "
             f"expected {sorted(allowed_basis)}."
+        )
+
+    source_rows = frame.loc[frame["basis"].astype(str) == "source_bvar_fitted"]
+    source_series = set(source_rows["series"].dropna().astype(str))
+    expected_source_series = {
+        "gas", "electricity", "heat_energy", "solid_fuels",
+        "petrol", "diesel", "liquid_fuels",
+    }
+    if source_series != expected_source_series:
+        raise FittedMaterialisationError(
+            "Source-BVAR fitted cache does not contain exactly the seven Energy "
+            f"models; got {sorted(source_series)}."
         )
 
     component_rows = frame.loc[frame["basis"].astype(str) == "component_bvar_fitted"]
@@ -791,6 +995,7 @@ def validate_fitted_frame(frame: pd.DataFrame) -> dict:
 
     qcols = ["q05", "q16", "q50", "q84", "q95"]
     numeric = frame[qcols].apply(pd.to_numeric, errors="coerce")
+    posterior_mean = pd.to_numeric(frame["posterior_mean"], errors="coerce")
     finite_rows = numeric.notna().all(axis=1)
     if not finite_rows.any():
         raise FittedMaterialisationError("Fitted cache contains no finite posterior summaries.")
@@ -798,11 +1003,11 @@ def validate_fitted_frame(frame: pd.DataFrame) -> dict:
     if np.any(np.diff(q, axis=1) < -1e-12):
         raise FittedMaterialisationError("Fitted posterior quantiles are not ordered.")
 
-    level = frame.loc[frame["metric"].astype(str) == "level", "q50"]
-    level = pd.to_numeric(level, errors="coerce").dropna()
-    if level.empty or (level <= 0.0).any():
+    level_mask = frame["metric"].astype(str) == "level"
+    level_mean = posterior_mean.loc[level_mask].dropna()
+    if level_mean.empty or (level_mean <= 0.0).any():
         raise FittedMaterialisationError(
-            "Fitted HICP level medians must be finite and strictly positive."
+            "Fitted HICP level posterior means must be finite and strictly positive."
         )
 
     # ``n_draws == 0`` is legitimate only for leading YoY dates for which a
@@ -824,6 +1029,14 @@ def validate_fitted_frame(frame: pd.DataFrame) -> dict:
         )
 
     positive_draws = draw_counts > 0
+    if (positive_draws & ~posterior_mean.notna()).any():
+        raise FittedMaterialisationError(
+            "Fitted cache has positive n_draws but missing posterior_mean."
+        )
+    if ((draw_counts == 0) & posterior_mean.notna()).any():
+        raise FittedMaterialisationError(
+            "Fitted cache has n_draws=0 but finite posterior_mean."
+        )
     if not positive_draws.any():
         raise FittedMaterialisationError(
             "Fitted cache contains no row with a positive posterior draw count."
@@ -865,9 +1078,10 @@ def validate_fitted_frame(frame: pd.DataFrame) -> dict:
             )
 
     # Every basis/series/metric block must use a complete, strictly increasing
-    # monthly calendar.  Different series are allowed to start later only if
-    # their YoY summary lacks the first twelve denominators; the level calendar
-    # itself is common by construction.
+    # monthly calendar. Component blocks may have different natural starts:
+    # that is the full-history display contract. The aggregate block is the
+    # natural common overlap required by Laspeyres aggregation.
+    calendars: dict[tuple[str, str, str], pd.DatetimeIndex] = {}
     for keys, block in frame.groupby(["basis", "series", "metric"], dropna=False):
         block_dates = pd.DatetimeIndex(pd.to_datetime(block["date"])).sort_values()
         if block_dates.has_duplicates:
@@ -878,25 +1092,92 @@ def validate_fitted_frame(frame: pd.DataFrame) -> dict:
                 raise FittedMaterialisationError(
                     f"Interior monthly date gap in fitted block {keys}."
                 )
+        calendars[tuple(map(str, keys))] = block_dates
 
-    level_blocks = frame.loc[frame["metric"].astype(str) == "level"]
-    calendars = {
-        tuple(pd.DatetimeIndex(pd.to_datetime(block["date"])).sort_values())
-        for _, block in level_blocks.groupby(["basis", "series"], dropna=False)
-    }
-    if len(calendars) != 1:
+    source_windows: dict[str, dict] = {}
+    for series in (
+        "gas", "electricity", "heat_energy", "solid_fuels",
+        "petrol", "diesel", "liquid_fuels",
+    ):
+        level_key = ("source_bvar_fitted", str(series), "level")
+        yoy_key = ("source_bvar_fitted", str(series), "yoy")
+        level_dates = calendars.get(level_key)
+        yoy_dates = calendars.get(yoy_key)
+        if level_dates is None or yoy_dates is None:
+            raise FittedMaterialisationError(
+                f"Missing fitted level/YoY calendar for source BVAR {series!r}."
+            )
+        if not level_dates.equals(yoy_dates):
+            raise FittedMaterialisationError(
+                f"Fitted level and YoY calendars differ for source BVAR {series!r}."
+            )
+        source_windows[str(series)] = {
+            "fit_start": pd.Timestamp(level_dates.min()),
+            "fit_end": pd.Timestamp(level_dates.max()),
+            "n_months": int(len(level_dates)),
+        }
+
+    component_windows: dict[str, dict] = {}
+    for series in MODEL_AGGREGATE_COMPONENTS:
+        level_key = ("component_bvar_fitted", str(series), "level")
+        yoy_key = ("component_bvar_fitted", str(series), "yoy")
+        level_dates = calendars.get(level_key)
+        yoy_dates = calendars.get(yoy_key)
+        if level_dates is None or yoy_dates is None:
+            raise FittedMaterialisationError(
+                f"Missing fitted level/YoY calendar for component {series!r}."
+            )
+        if not level_dates.equals(yoy_dates):
+            raise FittedMaterialisationError(
+                f"Fitted level and YoY calendars differ for {series!r}."
+            )
+        component_windows[str(series)] = {
+            "fit_start": pd.Timestamp(level_dates.min()),
+            "fit_end": pd.Timestamp(level_dates.max()),
+            "n_months": int(len(level_dates)),
+        }
+
+    aggregate_level_key = ("aggregate_bvar_fitted", "hicp_energy", "level")
+    aggregate_yoy_key = ("aggregate_bvar_fitted", "hicp_energy", "yoy")
+    aggregate_dates = calendars.get(aggregate_level_key)
+    aggregate_yoy_dates = calendars.get(aggregate_yoy_key)
+    if aggregate_dates is None or aggregate_yoy_dates is None:
         raise FittedMaterialisationError(
-            "Fitted level blocks do not share one common historical calendar."
+            "Missing fitted level/YoY calendar for HICP Energy aggregate."
+        )
+    if not aggregate_dates.equals(aggregate_yoy_dates):
+        raise FittedMaterialisationError(
+            "Aggregate fitted level and YoY calendars differ."
         )
 
-    common_calendar = next(iter(calendars))
+    # The aggregate must be a subset of every component calendar, but the
+    # components are intentionally allowed to extend further back.
+    for series, window in component_windows.items():
+        component_dates = calendars[
+            ("component_bvar_fitted", series, "level")
+        ]
+        if (component_dates.get_indexer(aggregate_dates) < 0).any():
+            raise FittedMaterialisationError(
+                f"Aggregate fitted calendar is not contained in component {series!r}."
+            )
+
     return {
         "basis": sorted(basis),
+        "source_bvars": [
+            "gas", "electricity", "heat_energy", "solid_fuels",
+            "petrol", "diesel", "liquid_fuels",
+        ],
+        "source_fit_windows": source_windows,
         "components": list(MODEL_AGGREGATE_COMPONENTS),
         "metrics": sorted(metrics),
-        "fit_start": pd.Timestamp(common_calendar[0]),
-        "fit_end": pd.Timestamp(common_calendar[-1]),
-        "n_months": int(len(common_calendar)),
+        # Backward-compatible aggregate aliases.
+        "fit_start": pd.Timestamp(aggregate_dates.min()),
+        "fit_end": pd.Timestamp(aggregate_dates.max()),
+        "n_months": int(len(aggregate_dates)),
+        "aggregate_fit_start": pd.Timestamp(aggregate_dates.min()),
+        "aggregate_fit_end": pd.Timestamp(aggregate_dates.max()),
+        "aggregate_n_months": int(len(aggregate_dates)),
+        "component_fit_windows": component_windows,
         "minimum_positive_summary_draws": int(draw_counts.loc[draw_counts > 0].min()),
         "leading_unavailable_yoy_rows": int(
             ((frame["metric"].astype(str) == "yoy") & (draw_counts == 0)).sum()
@@ -939,7 +1220,7 @@ def _cache_signature(
     *,
     max_draws: int,
     pairing_seed: int,
-    start_date: pd.Timestamp,
+    start_date: pd.Timestamp | None,
 ) -> dict:
     components = {}
     for key, directory in sorted(run_directories.items()):
@@ -957,7 +1238,12 @@ def _cache_signature(
         ),
         "max_draws": int(max_draws),
         "pairing_seed": int(pairing_seed),
-        "start_date": pd.Timestamp(start_date).date().isoformat(),
+        "start_date": (
+            None
+            if start_date is None
+            else pd.Timestamp(start_date).date().isoformat()
+        ),
+        "history_policy": "full_natural_valid_history",
         "components": components,
     }
 
@@ -972,7 +1258,7 @@ def build_energy_aggregate_fitted(
     project_root: str | Path,
     max_draws: int = DEFAULT_MAX_DRAWS,
     pairing_seed: int = DEFAULT_PAIRING_SEED,
-    start_date: str | pd.Timestamp = DEFAULT_START_DATE,
+    start_date: str | pd.Timestamp | None = DEFAULT_START_DATE,
     overwrite: bool = False,
     persist_cache: bool = True,
 ) -> tuple[pd.DataFrame, dict, bool]:
@@ -982,7 +1268,7 @@ def build_energy_aggregate_fitted(
     """
     aggregate_directory = Path(aggregate_directory)
     project_root = Path(project_root)
-    start_date = pd.Timestamp(start_date).to_period("M").to_timestamp(how="start")
+    start_date = _normalise_optional_start_date(start_date)
     aggregate_metadata = _aggregate_metadata(aggregate_directory)
     run_directories = _component_run_directories(aggregate_directory, aggregate_metadata)
     signature = _cache_signature(
@@ -1076,11 +1362,19 @@ def build_energy_aggregate_fitted(
     for name in ("heat_energy", "solid_fuels"):
         obj = fitted_raw[name]
         dates = pd.DatetimeIndex(obj["dates"], name="date")
-        mask = dates >= start_date
+        paths = np.asarray(obj["level_paths"], dtype=float)
+        if start_date is not None:
+            mask = dates >= start_date
+            dates = dates[mask]
+            paths = paths[:, mask]
+        if len(dates) == 0:
+            raise FittedMaterialisationError(
+                f"{name}: no fitted HICP dates survive the requested lower bound."
+            )
         components[name] = {
-            "dates": dates[mask],
+            "dates": dates,
             "paths": _drop_bad_draws(
-                np.asarray(obj["level_paths"], dtype=float)[:, mask],
+                paths,
                 label=f"{name} fitted HICP",
             ),
         }
@@ -1099,6 +1393,14 @@ def build_energy_aggregate_fitted(
             label=name,
         )
     components["liquid_fuels"] = weekly_components["liquid_fuels"]
+    weekly_bridge_audit = {
+        name: {
+            "anchor_date": pd.Timestamp(obj["anchor_date"]).isoformat(),
+            "fitted_start_month": pd.Timestamp(obj["fitted_start_month"]).isoformat(),
+            "bridge_method": str(obj["bridge_method"]),
+        }
+        for name, obj in weekly_components.items()
+    }
 
     # --- petrol + diesel + OBSERVED other-transport residual -> car fuels --
     #
@@ -1107,8 +1409,12 @@ def build_energy_aggregate_fitted(
     # convention (last published level held flat), an unpublished historical
     # residual month is never invented: the transport fitted window is trimmed
     # to the maximal published overlap.
+    transport_start = TRANSPORT_FITTED_START
+    if start_date is not None:
+        transport_start = max(transport_start, pd.Timestamp(start_date))
     transport_candidate_dates = _common_monthly_dates(
-        [weekly_components["petrol"], weekly_components["diesel"]], start_date
+        [weekly_components["petrol"], weekly_components["diesel"]],
+        transport_start,
     )
     petrol_candidate = _slice_object(
         weekly_components["petrol"], transport_candidate_dates
@@ -1142,7 +1448,7 @@ def build_energy_aggregate_fitted(
         [
             pd.Series(
                 [100.0],
-                index=pd.DatetimeIndex([pd.Timestamp("2016-12-01")], name="date"),
+                index=pd.DatetimeIndex([TRANSPORT_ANCHOR], name="date"),
             ),
             model_history["transport_energy"]["index"],
         ]
@@ -1185,9 +1491,56 @@ def build_energy_aggregate_fitted(
     )
     aggregate_levels = np.asarray(aggregate["level_paths"], dtype=float)
 
-    # Build compact long-form summaries.  The six displayed component curves
-    # use the exact paired marginal draws that feed the aggregate calculation.
+    # Build compact long-form summaries. Each displayed component keeps its
+    # FULL natural valid history. On the aggregate overlap we still use the
+    # exact draw indices selected by the maintained cross-model pairing, so the
+    # marginal fitted summaries remain tied to the draws feeding aggregation.
     frames: list[pd.DataFrame] = []
+
+    # Seven source BVAR fitted HICP targets. Petrol and Diesel are kept
+    # separate here; Car fuels below remains the six-component accounting
+    # aggregate used by HICP Energy and is therefore not counted as a BVAR.
+    source_objects = {
+        "gas": components["gas"],
+        "electricity": components["electricity"],
+        "heat_energy": components["heat_energy"],
+        "solid_fuels": components["solid_fuels"],
+        "petrol": weekly_components["petrol"],
+        "diesel": weekly_components["diesel"],
+        "liquid_fuels": weekly_components["liquid_fuels"],
+    }
+    source_history_map = {
+        "gas": indices["hicp_gas"],
+        "electricity": indices["hicp_electricity"],
+        "heat_energy": indices["hicp_heat_cooling_energy"],
+        "solid_fuels": indices["hicp_solid_fuels"],
+        "petrol": indices["hicp_petrol"],
+        "diesel": indices["hicp_diesel"],
+        "liquid_fuels": indices["hicp_liquid_fuels"],
+    }
+    source_fit_windows: dict[str, dict] = {}
+    for name, obj in source_objects.items():
+        source_dates = pd.DatetimeIndex(obj["dates"], name="date")
+        source_levels = np.asarray(obj["paths"], dtype=float)
+        source_yoy = _yoy_paths(source_levels, source_dates, source_history_map[name])
+        frames.append(
+            _summary_frame(
+                source_levels, source_dates, series=name, metric="level",
+                basis="source_bvar_fitted",
+            )
+        )
+        frames.append(
+            _summary_frame(
+                source_yoy, source_dates, series=name, metric="yoy",
+                basis="source_bvar_fitted",
+            )
+        )
+        source_fit_windows[name] = {
+            "fit_start": pd.Timestamp(source_dates.min()).isoformat(),
+            "fit_end": pd.Timestamp(source_dates.max()).isoformat(),
+            "n_months": int(len(source_dates)),
+        }
+
     component_history_map = {
         "car_fuels": model_history["component_history"]["car_fuels"],
         "liquid_fuels": indices["hicp_liquid_fuels"],
@@ -1196,13 +1549,22 @@ def build_energy_aggregate_fitted(
         "heat_energy": indices["hicp_heat_cooling_energy"],
         "solid_fuels": indices["hicp_solid_fuels"],
     }
+    component_fit_windows: dict[str, dict] = {}
     for name in ordered_components:
-        levels = paired[name]
-        yoy = _yoy_paths(levels, common_dates, component_history_map[name])
+        component_dates = pd.DatetimeIndex(components[name]["dates"], name="date")
+        component_paths = np.asarray(components[name]["paths"], dtype=float)
+        selected_indices = np.asarray(pairing_indices[name], dtype=int)
+        if selected_indices.size == 0 or selected_indices.max() >= len(component_paths):
+            raise FittedMaterialisationError(
+                f"{name}: aggregate pairing indices are incompatible with the "
+                "full component fitted draw pool."
+            )
+        levels = component_paths[selected_indices]
+        yoy = _yoy_paths(levels, component_dates, component_history_map[name])
         frames.append(
             _summary_frame(
                 levels,
-                common_dates,
+                component_dates,
                 series=name,
                 metric="level",
                 basis="component_bvar_fitted",
@@ -1211,12 +1573,17 @@ def build_energy_aggregate_fitted(
         frames.append(
             _summary_frame(
                 yoy,
-                common_dates,
+                component_dates,
                 series=name,
                 metric="yoy",
                 basis="component_bvar_fitted",
             )
         )
+        component_fit_windows[name] = {
+            "fit_start": pd.Timestamp(component_dates.min()).isoformat(),
+            "fit_end": pd.Timestamp(component_dates.max()).isoformat(),
+            "n_months": int(len(component_dates)),
+        }
 
     aggregate_yoy = _yoy_paths(
         aggregate_levels,
@@ -1257,8 +1624,17 @@ def build_energy_aggregate_fitted(
             "posterior one-step conditional fitted target levels; no in-sample "
             "innovation is added; tax/frequency/HICP adapters match aggregate forecasting"
         ),
+        "source_bvar_overlay_definition": (
+            "seven source Energy BVAR posterior one-step fitted HICP targets; "
+            "Petrol and Diesel remain separate source models; Car fuels is not "
+            "counted as a source BVAR"
+        ),
+        "source_bvar_fit_windows": source_fit_windows,
         "component_overlay_definition": (
-            "six HICP component posterior fitted summaries from the exact paired draws used by the aggregate; Car fuels combines fitted Petrol/Diesel with observed Other transport fuels"
+            "six HICP component posterior fitted summaries over each component's "
+            "full natural valid history; the same deterministic aggregate-pairing "
+            "draw indices are used on every component; Car fuels combines fitted "
+            "Petrol/Diesel with observed Other transport fuels"
         ),
         "aggregate_overlay_definition": (
             "draw-wise Laspeyres aggregation of the six fitted HICP component paths; "
@@ -1268,14 +1644,25 @@ def build_energy_aggregate_fitted(
         "cross_model_dependence": "independent posterior chains; deterministic random draw pairing",
         "pairing_seed": int(pairing_seed),
         "n_aggregate_fitted_draws": int(n_aggregate),
+        "history_policy": "full_natural_valid_history",
+        "requested_start_date": (
+            None if start_date is None else pd.Timestamp(start_date).isoformat()
+        ),
+        # Backward-compatible aggregate window aliases.
         "fit_start": pd.Timestamp(common_dates.min()).isoformat(),
         "fit_end": pd.Timestamp(common_dates.max()).isoformat(),
+        "aggregate_fit_start": pd.Timestamp(common_dates.min()).isoformat(),
+        "aggregate_fit_end": pd.Timestamp(common_dates.max()).isoformat(),
+        "component_fit_windows": component_fit_windows,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "source_signature": signature,
         "preparation_audit": preparation_audit,
+        "weekly_hicp_rebase_audit": weekly_bridge_audit,
         "car_fuels_residual_policy": {
             "component": "hicp_other_transport_fuels",
             "modelled": False,
+            "production_chain_link_anchor": TRANSPORT_ANCHOR.isoformat(),
+            "earliest_honest_fitted_month": TRANSPORT_FITTED_START.isoformat(),
             "historical_fitted_policy": (
                 "published observed HICP only; trim leading/trailing ragged edge; "
                 "hard-fail on any interior missing/non-positive month"
@@ -1307,7 +1694,7 @@ def load_energy_aggregate_fitted(
     project_root: str | Path,
     max_draws: int = DEFAULT_MAX_DRAWS,
     pairing_seed: int = DEFAULT_PAIRING_SEED,
-    start_date: str | pd.Timestamp = DEFAULT_START_DATE,
+    start_date: str | pd.Timestamp | None = DEFAULT_START_DATE,
     overwrite: bool = False,
     persist_cache: bool = True,
 ) -> tuple[pd.DataFrame, dict, bool]:

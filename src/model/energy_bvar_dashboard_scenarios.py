@@ -50,6 +50,8 @@ _INK = TOKENS["ink"]
 _MUTED = TOKENS["muted"]
 _NOW = TOKENS.get("warning", "#A66A00")
 
+SCENARIO_DISPLAY_LAYOUT_VERSION = "energy-tax-scenario-layout-v2"
+
 
 def _quantile_frame(paths: np.ndarray, dates, *, name: str) -> pd.DataFrame:
     values = np.asarray(paths, dtype=float)
@@ -206,6 +208,60 @@ def _append_anchor(block: pd.DataFrame, *, date, value) -> pd.DataFrame:
     return pd.concat([pd.DataFrame([anchor]), block], ignore_index=True).sort_values("date")
 
 
+
+def _finalise_scenario_layout(
+    fig: go.Figure,
+    *,
+    title: str,
+    y_title: str | None,
+    height: int,
+    uirevision: str,
+    bottom_margin: int,
+) -> go.Figure:
+    """Apply one non-overlapping title/legend contract to VAT/excise charts.
+
+    The figure title owns the top margin.  The legend is deliberately placed
+    below the plotting area so it can wrap without colliding with either the
+    title or Plotly's modebar.  This is presentation-only: traces, values,
+    intervals, dates and econometric objects are unchanged.
+    """
+    apply_theme(
+        fig,
+        uirevision=uirevision,
+        height=height,
+        y_title=y_title,
+    )
+    fig.update_layout(
+        title={
+            "text": str(title),
+            "x": 0.01,
+            "xanchor": "left",
+            "y": 0.985,
+            "yanchor": "top",
+            "font": {"size": 17, "color": _INK},
+        },
+        margin={
+            "l": 68,
+            "r": 28,
+            "t": 74,
+            "b": int(bottom_margin),
+        },
+        legend={
+            "orientation": "h",
+            "x": 0.0,
+            "xanchor": "left",
+            "y": -0.16,
+            "yanchor": "top",
+            "font": {"size": 10},
+            "bgcolor": "rgba(255,255,255,0)",
+            "borderwidth": 0,
+            "traceorder": "normal",
+        },
+        hovermode="x unified",
+        dragmode="pan",
+    )
+    return fig
+
 def scenario_main_figure(payload: Mapping | None, *, fan_mode: str = "68", uirevision: str = "tax-scenario") -> go.Figure:
     """Observed -> nowcast -> forecast, with baseline/scenario split only in forecast."""
     frames = scenario_frames(payload)
@@ -290,9 +346,14 @@ def scenario_main_figure(payload: Mapping | None, *, fan_mode: str = "68", uirev
     if not pd.isna(scenario_start) and (pd.isna(forecast_origin) or scenario_start != forecast_origin):
         fig.add_vline(x=scenario_start, line={"color": _SCEN, "width": 1, "dash": "dot"})
 
-    fig.update_layout(title="Tax assumption impact on HICP inflation")
-    apply_theme(fig, uirevision=uirevision, height=500, y_title="% y/y")
-    return fig
+    return _finalise_scenario_layout(
+        fig,
+        title="Tax assumption impact on HICP inflation",
+        y_title="% y/y",
+        height=520,
+        uirevision=uirevision,
+        bottom_margin=150,
+    )
 
 def scenario_impact_figure(payload: Mapping | None, *, metric: str, fan_mode: str = "68", uirevision: str = "tax-impact") -> go.Figure:
     frames = scenario_frames(payload)
@@ -323,9 +384,14 @@ def scenario_impact_figure(payload: Mapping | None, *, metric: str, fan_mode: st
         title, unit = "Price-level impact", "Scenario − baseline (%)"
     else:
         title, unit = "YoY inflation impact", "Scenario − baseline (pp)"
-    fig.update_layout(title=title)
-    apply_theme(fig, uirevision=uirevision, height=360, y_title=unit)
-    return fig
+    return _finalise_scenario_layout(
+        fig,
+        title=title,
+        y_title=unit,
+        height=390,
+        uirevision=uirevision,
+        bottom_margin=100,
+    )
 
 
 def scenario_tax_figure(payload: Mapping | None, *, uirevision: str = "tax-path") -> go.Figure:
@@ -386,9 +452,14 @@ def scenario_tax_figure(payload: Mapping | None, *, uirevision: str = "tax-path"
         fig.add_vline(x=start, line={"color": _SCEN, "width": 1, "dash": "dot"}, row="all", col=1)
     fig.update_yaxes(title_text="VAT (%)", row=1, col=1)
     fig.update_yaxes(title_text=f"Excise ({excise_unit})", row=2, col=1)
-    fig.update_layout(title="Tax assumptions", hovermode="x unified")
-    apply_theme(fig, uirevision=uirevision, height=610)
-    return fig
+    return _finalise_scenario_layout(
+        fig,
+        title="Tax assumptions",
+        y_title=None,
+        height=660,
+        uirevision=uirevision,
+        bottom_margin=150,
+    )
 
 
 def scenario_kpis(payload: Mapping | None) -> dict[str, Any]:

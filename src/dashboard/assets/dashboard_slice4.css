@@ -1,0 +1,46 @@
+/* Headline Dashboard slice 4 — structural + diagnostics */
+.headline-badge-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.headline-lock-badge,
+.headline-order-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 28px;
+  padding: 4px 9px;
+  border: 1px solid #d2d0d1;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.01em;
+  background: #fff;
+  color: #3a3d40;
+  white-space: nowrap;
+}
+
+.headline-lock-badge {
+  border-color: rgba(0, 159, 227, 0.38);
+  color: #006b9c;
+  background: rgba(0, 159, 227, 0.06);
+}
+
+.headline-method-note {
+  margin-top: 14px;
+  padding: 12px 14px;
+  border-left: 3px solid #009fe3;
+  background: rgba(0, 159, 227, 0.045);
+  color: #3a3d40;
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+@media (max-width: 900px) {
+  .headline-badge-row {
+    justify-content: flex-start;
+  }
+}

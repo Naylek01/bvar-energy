@@ -7,7 +7,7 @@ reconstruction into dashboard-ready diagnostics.
 
 The historical contribution identity is delegated to
 ``energy_bvar_aggregate.yoy_contributions_from_terms``.  Forecast contribution
-medians are read from ``display_v1.parquet``.  No chain-linking or posterior
+posterior means are read from ``display_v1.parquet``.  No chain-linking or posterior
 aggregation is reimplemented here.
 """
 from __future__ import annotations
@@ -159,7 +159,7 @@ def build_historical_contribution_frame(
 def _forecast_contribution_rows(frame: pd.DataFrame, basis: str = "baseline") -> pd.DataFrame:
     if frame.empty:
         return pd.DataFrame()
-    needed = {"record_type", "metric", "basis", "series", "date", "q50"}
+    needed = {"record_type", "metric", "basis", "series", "date", "value"}
     if not needed.issubset(frame.columns):
         return pd.DataFrame()
     out = frame.loc[
@@ -171,14 +171,14 @@ def _forecast_contribution_rows(frame: pd.DataFrame, basis: str = "baseline") ->
     if out.empty:
         return out
     out["date"] = pd.to_datetime(out["date"], errors="coerce")
-    out["q50"] = pd.to_numeric(out["q50"], errors="coerce")
-    return out.dropna(subset=["date", "q50"]).sort_values(["date", "series"])
+    out["value"] = pd.to_numeric(out["value"], errors="coerce")
+    return out.dropna(subset=["date", "value"]).sort_values(["date", "series"])
 
 
 def _aggregate_fan_rows(frame: pd.DataFrame) -> pd.DataFrame:
     if frame.empty:
         return pd.DataFrame()
-    needed = {"record_type", "metric", "series", "date", "q50"}
+    needed = {"record_type", "metric", "series", "date", "value"}
     if not needed.issubset(frame.columns):
         return pd.DataFrame()
     out = frame.loc[
@@ -193,8 +193,8 @@ def _aggregate_fan_rows(frame: pd.DataFrame) -> pd.DataFrame:
         if not baseline.empty:
             out = baseline
     out["date"] = pd.to_datetime(out["date"], errors="coerce")
-    out["q50"] = pd.to_numeric(out["q50"], errors="coerce")
-    return out.dropna(subset=["date", "q50"]).sort_values("date")
+    out["value"] = pd.to_numeric(out["value"], errors="coerce")
+    return out.dropna(subset=["date", "value"]).sort_values("date")
 
 
 def _history_before_model_path(
@@ -399,7 +399,7 @@ def aggregate_contribution_timeline_figure(
     forecast_origin: Any = None,
     uirevision: str = "aggregate-contribution-timeline",
 ) -> go.Figure:
-    """Historical exact contributions + saved posterior median model path."""
+    """Historical exact contributions + saved posterior-mean model path."""
     mode = str(display_mode or "bars").lower()
     if mode not in {"bars", "lines"}:
         raise ValueError("display_mode must be 'bars' or 'lines'.")
@@ -429,7 +429,7 @@ def aggregate_contribution_timeline_figure(
         h = history.loc[history["series"].astype(str).eq(name)].sort_values("date")
         f = forecast.loc[forecast["series"].astype(str).eq(name)].sort_values("date")
         x = pd.concat([h.get("date", pd.Series(dtype="datetime64[ns]")), f.get("date", pd.Series(dtype="datetime64[ns]"))], ignore_index=True)
-        y = pd.concat([h.get("value", pd.Series(dtype=float)), f.get("q50", pd.Series(dtype=float))], ignore_index=True)
+        y = pd.concat([h.get("value", pd.Series(dtype=float)), f.get("value", pd.Series(dtype=float))], ignore_index=True)
         valid = pd.DataFrame({"date": x, "value": pd.to_numeric(y, errors="coerce")}).dropna()
         if valid.empty:
             continue
@@ -463,7 +463,7 @@ def aggregate_contribution_timeline_figure(
                 )
             )
 
-    # Aggregate observed YoY history + aggregate posterior median path.
+    # Aggregate observed YoY history + aggregate posterior-mean path.
     aggregate_hist = pd.DataFrame()
     if not history.empty:
         aggregate_hist = (
@@ -479,7 +479,7 @@ def aggregate_contribution_timeline_figure(
             ignore_index=True,
         )
         agg_y = pd.concat(
-            [aggregate_hist.get("aggregate_yoy", pd.Series(dtype=float)), fan.get("q50", pd.Series(dtype=float))],
+            [aggregate_hist.get("aggregate_yoy", pd.Series(dtype=float)), fan.get("value", pd.Series(dtype=float))],
             ignore_index=True,
         )
         agg = pd.DataFrame({"date": agg_x, "value": pd.to_numeric(agg_y, errors="coerce")}).dropna()
@@ -519,7 +519,7 @@ def aggregate_notebook_median_contribution_figure(
     forecast_origin: Any = None,
     uirevision: str = "aggregate-notebook-median-contrib",
 ) -> go.Figure:
-    """Reproduce Notebook 10's forecast median-contribution line chart."""
+    """Plot saved forecast posterior-mean contributions (legacy function name)."""
     forecast = _forecast_contribution_rows(display_frame, basis="baseline")
     if forecast.empty:
         fig = go.Figure()
@@ -532,7 +532,7 @@ def aggregate_notebook_median_contribution_figure(
             y=0.5,
         )
         return tidy_aggregate_figure(
-            fig, title="Median component contributions to HICP Energy inflation"
+            fig, title="Posterior-mean component contributions to HICP Energy inflation"
         )
 
     fig = go.Figure()
@@ -541,11 +541,11 @@ def aggregate_notebook_median_contribution_figure(
         if block.empty:
             continue
         label = COMPONENT_LABELS[name]
-        text = _end_text(block["q50"], show_labels)
+        text = _end_text(block["value"], show_labels)
         fig.add_trace(
             go.Scatter(
                 x=block["date"],
-                y=block["q50"],
+                y=block["value"],
                 mode="lines+markers+text" if show_labels else "lines+markers",
                 text=text if show_labels else None,
                 textposition="middle right",
@@ -558,18 +558,18 @@ def aggregate_notebook_median_contribution_figure(
 
     fan = _aggregate_fan_rows(display_frame)
     if not fan.empty:
-        text = _end_text(fan["q50"], show_labels)
+        text = _end_text(fan["value"], show_labels)
         fig.add_trace(
             go.Scatter(
                 x=fan["date"],
-                y=fan["q50"],
+                y=fan["value"],
                 mode="lines+markers+text" if show_labels else "lines+markers",
                 text=text if show_labels else None,
                 textposition="top right",
-                name="HICP Energy YoY median",
+                name="HICP Energy YoY posterior mean",
                 line={"color": "#111827", "width": 2.4, "dash": "dash"},
                 marker={"size": 5},
-                hovertemplate="%{y:.2f}%<extra>HICP Energy YoY median</extra>",
+                hovertemplate="%{y:.2f}%<extra>HICP Energy YoY posterior mean</extra>",
             )
         )
 
@@ -577,7 +577,7 @@ def aggregate_notebook_median_contribution_figure(
     _add_forecast_origin(fig, forecast_origin)
     return tidy_aggregate_figure(
         fig,
-        title="Median component contributions to HICP Energy inflation",
+        title="Posterior-mean component contributions to HICP Energy inflation",
         y_title="percentage points",
         height=500,
         uirevision=uirevision,

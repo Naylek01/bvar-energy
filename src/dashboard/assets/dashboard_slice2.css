@@ -1,0 +1,60 @@
+/* Inflation Dashboard — Headline slice 2 shell additions.
+   Keep dashboard.css unchanged; Dash auto-loads this sidecar too. */
+
+.domain-switch {
+  display: flex;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+.domain-pill {
+  display: inline-flex;
+  align-items: center;
+  min-height: 30px;
+  padding: 0 10px;
+  border: 1px solid var(--border, var(--hairline, #e5e7eb));
+  border-radius: 8px;
+  background: var(--surface, #fff);
+  color: var(--text-soft, var(--ink-soft, #374151));
+  text-decoration: none;
+  font-size: 11px;
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+.domain-pill:hover {
+  border-color: var(--accent, var(--cyan, #009fe3));
+  color: var(--accent, var(--navy, #004b99));
+  background: var(--accent-soft, var(--surface-sunk, #f3f4f6));
+}
+
+.nav-section-label {
+  color: var(--muted, #6b7280);
+  font-size: 9px;
+  line-height: 1;
+  font-weight: 750;
+  letter-spacing: .10em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+@media (min-width: 861px) {
+  .nav-section-label {
+    display: none;
+  }
+}
+
+@media (max-width: 860px) {
+  .domain-switch {
+    order: 1;
+  }
+
+  .nav-section-label {
+    display: none;
+  }
+
+  .nav-stack-energy,
+  .nav-stack-headline {
+    flex-basis: 100%;
+  }
+}

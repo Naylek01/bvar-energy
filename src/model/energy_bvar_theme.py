@@ -32,6 +32,8 @@ __all__ = [
     "assert_tokens_match_css",
     "GRAPH_CONFIG",
     "graph_config",
+    "INFLATION_COLORS",
+    "apply_inflation_figure_style",
 ]
 
 
@@ -290,6 +292,69 @@ def assert_tokens_match_css(css_path: str | Path) -> dict[str, tuple[str, str]]:
         detail = "; ".join(f"{k}: python={a} css={b}" for k, (a, b) in mismatches.items())
         raise AssertionError(f"Theme tokens have drifted from {css_path}: {detail}")
     return mismatches
+
+
+
+# HEADLINE DELIVERY 5 — semantic visual contract
+INFLATION_COLORS: dict[str, str] = {
+    # Economic series: one stable semantic colour everywhere.
+    "headline": TOKENS["ink"],
+    "hicp_total": TOKENS["ink"],
+    "hicp_energy": TOKENS["cyan"],
+    "hicp_food": TOKENS["navy"],
+    "hicp_neig": TOKENS["positive"],
+    "hicp_services": TOKENS["warning"],
+    # Path/statistical roles.
+    "observed": TOKENS["ink"],
+    "nowcast": TOKENS["warning"],
+    "fitted": TOKENS["muted"],
+    "baseline": TOKENS["cyan"],
+    "conditional": TOKENS["navy"],
+    "impact": TOKENS["cyan_deep"],
+}
+
+
+def apply_inflation_figure_style(
+    figure: go.Figure,
+    *,
+    uirevision: str | None = None,
+    height: int | None = None,
+    y_title: str | None = None,
+) -> go.Figure:
+    """Headline/Inflation figure geometry layered on the shared SPX theme.
+
+    Visible chart titles live in the surrounding Dash panel, not inside Plotly.
+    This prevents title/legend collisions and makes Headline figures use the
+    same interaction grammar as Energy while keeping the semantic palette
+    explicit.
+    """
+    apply_theme(
+        figure,
+        uirevision=uirevision,
+        height=height,
+        y_title=y_title,
+    )
+    figure.update_layout(
+        title=None,
+        margin=dict(l=52, r=22, t=50, b=38),
+        hovermode="x unified",
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="left",
+            x=0,
+            bgcolor="rgba(0,0,0,0)",
+            borderwidth=0,
+            font=dict(size=11, color=TOKENS["ink_soft"]),
+        ),
+    )
+    figure.update_xaxes(
+        showspikes=True,
+        spikemode="across",
+        spikesnap="cursor",
+    )
+    return figure
 
 
 register_template()

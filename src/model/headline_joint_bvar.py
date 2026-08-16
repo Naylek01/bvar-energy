@@ -414,7 +414,6 @@ def run_headline_joint_bvar(
         exog=None,
         prior_config=prior_config,
         sampler_config=sampler_config,
-        active_lags=None,
         code_version=code_version,
     )
     result["headline_joint_context"] = {

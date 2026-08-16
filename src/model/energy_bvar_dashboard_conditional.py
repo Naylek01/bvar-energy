@@ -81,7 +81,7 @@ from energy_bvar_weekly_fuels import (
 )
 
 
-CONDITIONAL_CONTRACT_VERSION = "energy-conditional-observable-v2"
+CONDITIONAL_CONTRACT_VERSION = "energy-conditional-observable-v3"
 BASELINE_REPLAY_TOLERANCE = 1e-8
 AGGREGATE_REPLAY_TOLERANCE = 1e-8
 PAIRING_TOLERANCE = 1e-12
@@ -1312,12 +1312,15 @@ def _fan_rows(
     paths: np.ndarray,
     dates: Sequence[pd.Timestamp],
 ) -> list[dict[str, Any]]:
-    frame = summarise_draw_paths(np.asarray(paths, dtype=float), dates).reset_index()
+    values = np.asarray(paths, dtype=float)
+    frame = summarise_draw_paths(values, dates).reset_index()
+    means = np.nanmean(values, axis=0)
     rows: list[dict[str, Any]] = []
-    for _, row in frame.iterrows():
+    for i, (_, row) in enumerate(frame.iterrows()):
         rows.append(
             {
                 "date": pd.Timestamp(row["date"]).isoformat(),
+                "mean": float(means[i]),
                 "q05": float(row["q05"]),
                 "q16": float(row["q16"]),
                 "q50": float(row["q50"]),
@@ -1797,6 +1800,16 @@ def compute_conditional_scenario(
         ),
         "aggregate_history_yoy": _history_rows(
             aggregate_history_yoy
+        ),
+        # Exact draw-wise HICP Energy level summaries are retained for the
+        # Energy -> Headline bridge. Headline never imposes these raw levels:
+        # it uses them only to form month-to-month growth and then re-anchors
+        # that growth on the published Headline HICP Energy index.
+        "aggregate_baseline_level": _fan_rows(
+            baseline_energy["level_paths"], aggregate_dates
+        ),
+        "aggregate_scenario_level": _fan_rows(
+            scenario_energy["level_paths"], aggregate_dates
         ),
         "aggregate_baseline_yoy": _fan_rows(
             baseline_energy_yoy["yoy_paths"], aggregate_dates

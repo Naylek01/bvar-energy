@@ -111,8 +111,8 @@ def aggregate_metric_options(frame: pd.DataFrame) -> tuple[list[dict], str | Non
 def aggregate_kpis(frame: pd.DataFrame, metric: str = "yoy") -> dict[str, Any]:
     """Headline numbers for the four cards.
 
-    ``latest_observed`` comes from the published history, the two medians from
-    the predictive fan. Values are returned unformatted so the caller decides
+    ``latest_observed`` comes from the published history; the two predictive
+    summaries are posterior means computed draw-wise. Values are returned unformatted so the caller decides
     the presentation.
     """
     out: dict[str, Any] = {
@@ -137,9 +137,9 @@ def aggregate_kpis(frame: pd.DataFrame, metric: str = "yoy") -> dict[str, Any]:
     if future.empty:
         future = fan
     if not future.empty:
-        out["first_future"] = float(future["q50"].iloc[0])
+        out["first_future"] = float(future["value"].iloc[0])
         out["first_future_date"] = pd.Timestamp(future["date"].iloc[0])
-        out["terminal"] = float(future["q50"].iloc[-1])
+        out["terminal"] = float(future["value"].iloc[-1])
         out["terminal_date"] = pd.Timestamp(future["date"].iloc[-1])
 
     meta = frame.loc[frame["record_type"].astype(str) == "meta"]
@@ -184,7 +184,7 @@ def _append_anchor(block: pd.DataFrame, *, date, value) -> pd.DataFrame:
         return block
     anchor = {column: np.nan for column in block.columns}
     anchor["date"] = pd.Timestamp(date)
-    for column in ("q05", "q16", "q50", "q84", "q95"):
+    for column in ("value", "q05", "q16", "q50", "q84", "q95"):
         if column in block.columns:
             anchor[column] = float(value)
     return pd.concat([pd.DataFrame([anchor]), block], ignore_index=True).sort_values("date")
@@ -300,9 +300,9 @@ def aggregate_fan_figure(
             fig.add_trace(
                 go.Scatter(
                     x=block["date"],
-                    y=block["q50"],
+                    y=block["value"],
                     mode="lines",
-                    name=f"{label} BVAR fit",
+                    name=f"{label} BVAR fit · posterior mean",
                     line={
                         "color": COMPONENT_COLOURS.get(name, _MUTED),
                         "width": 1.25,
@@ -322,7 +322,7 @@ def aggregate_fan_figure(
             fig.add_trace(
                 go.Scatter(
                     x=reconstructed["date"],
-                    y=reconstructed["q50"],
+                    y=reconstructed["value"],
                     mode="lines",
                     name="BVAR model reconstruction",
                     line={"color": "#4b5563", "width": 2.0, "dash": "dot"},
@@ -361,16 +361,16 @@ def aggregate_fan_figure(
     now_line = _append_anchor(nowcast, date=anchor_date, value=anchor_value)
     if not now_line.empty:
         fig.add_trace(go.Scatter(
-            x=now_line["date"], y=now_line["q50"], mode="lines", name="Nowcast median",
+            x=now_line["date"], y=now_line["value"], mode="lines", name="Nowcast posterior mean",
             line={"color": _NOWCAST, "width": 2.2},
             hovertemplate="%{y:.2f}<extra>Nowcast</extra>",
         ))
         anchor_date = now_line["date"].iloc[-1]
-        anchor_value = now_line["q50"].iloc[-1]
+        anchor_value = now_line["value"].iloc[-1]
     fc_line = _append_anchor(forecast, date=anchor_date, value=anchor_value)
     if not fc_line.empty:
         fig.add_trace(go.Scatter(
-            x=fc_line["date"], y=fc_line["q50"], mode="lines", name="Forecast median",
+            x=fc_line["date"], y=fc_line["value"], mode="lines", name="Forecast posterior mean",
             line={"color": _ACCENT, "width": 2.4, "dash": "dash"},
             hovertemplate="%{y:.2f}<extra>Forecast</extra>",
         ))
@@ -405,12 +405,11 @@ def aggregate_contribution_figure(
     forecast_origin=None,
     last_observed=None,
 ) -> go.Figure:
-    """Median component contributions to aggregate YoY, as stacked bars.
+    """Posterior-mean component contributions to aggregate YoY, as stacked bars.
 
-    Contributions are summarised per draw and then plotted, so the stack does
-    not add exactly to the median aggregate rate: the median of a sum is not the
-    sum of medians. The aggregate median is overlaid as a line so the size of
-    that gap is visible rather than hidden.
+    Each component is averaged draw-wise before plotting. By linearity of
+    expectation, the displayed stack preserves the draw-wise additive identity
+    with the posterior-mean aggregate HICP Energy inflation path.
     """
     contrib = frame.loc[
         (frame["record_type"].astype(str) == "contribution")
@@ -429,7 +428,7 @@ def aggregate_contribution_figure(
         block = contrib.loc[contrib["series"].astype(str) == name].sort_values("date")
         fig.add_trace(
             go.Bar(
-                x=block["date"], y=block["q50"],
+                x=block["date"], y=block["value"],
                 name=COMPONENT_LABELS.get(name, name.replace("_", " ").capitalize()),
                 marker_color=COMPONENT_COLOURS.get(name, _MUTED),
                 hovertemplate="%{y:+.2f} pp<extra>" + COMPONENT_LABELS.get(name, name) + "</extra>",
@@ -444,9 +443,9 @@ def aggregate_contribution_figure(
     if not fan.empty:
         fig.add_trace(
             go.Scatter(
-                x=fan["date"], y=fan["q50"], mode="lines", name="HICP Energy (median)",
+                x=fan["date"], y=fan["value"], mode="lines", name="HICP Energy (posterior mean)",
                 line={"color": _INK, "width": 2},
-                hovertemplate="%{y:.2f}%<extra>Aggregate median</extra>",
+                hovertemplate="%{y:.2f}%<extra>Aggregate posterior mean</extra>",
             )
         )
 
@@ -474,6 +473,7 @@ def _quantile_frame(paths: np.ndarray, dates, *, name: str) -> pd.DataFrame:
         raise ValueError(f"{name}: expected draw x date paths, got {values.shape}.")
     q = np.nanquantile(values, (0.05, 0.16, 0.50, 0.84, 0.95), axis=0).T
     out = pd.DataFrame(q, index=dates, columns=("q05", "q16", "q50", "q84", "q95")).reset_index()
+    out["value"] = np.nanmean(values, axis=0)
     out["name"] = name
     return out
 
@@ -514,6 +514,7 @@ def aggregate_live_scenario_payload(outcome, scenario_meta: Mapping | None = Non
     for j, component in enumerate(components):
         q = np.nanquantile(delta_c[:, :, j], (0.05, 0.16, 0.50, 0.84, 0.95), axis=0).T
         block = pd.DataFrame(q, index=dates, columns=("q05", "q16", "q50", "q84", "q95")).reset_index()
+        block["value"] = np.nanmean(delta_c[:, :, j], axis=0)
         block["component"] = component
         rows.append(block)
     contrib = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
@@ -608,12 +609,12 @@ def aggregate_live_scenario_figure(
     anchor_value = hist["value"].iloc[-1] if not hist.empty else None
     now_line = _append_anchor(nowcast, date=anchor_date, value=anchor_value)
     if not now_line.empty:
-        fig.add_trace(go.Scatter(x=now_line["date"], y=now_line["q50"], mode="lines", name="Nowcast median", line={"color": _NOWCAST, "width": 2.2}))
-        anchor_date, anchor_value = now_line["date"].iloc[-1], now_line["q50"].iloc[-1]
+        fig.add_trace(go.Scatter(x=now_line["date"], y=now_line["value"], mode="lines", name="Nowcast posterior mean", line={"color": _NOWCAST, "width": 2.2}))
+        anchor_date, anchor_value = now_line["date"].iloc[-1], now_line["value"].iloc[-1]
     base_line = _append_anchor(base_fc, date=anchor_date, value=anchor_value)
     scen_line = _append_anchor(scen_fc, date=anchor_date, value=anchor_value)
-    fig.add_trace(go.Scatter(x=base_line["date"], y=base_line["q50"], mode="lines", name="Baseline forecast", line={"color": _ACCENT, "width": 2.2}))
-    fig.add_trace(go.Scatter(x=scen_line["date"], y=scen_line["q50"], mode="lines", name="Tax-scenario forecast", line={"color": _SCENARIO, "width": 2.2, "dash": "dash"}))
+    fig.add_trace(go.Scatter(x=base_line["date"], y=base_line["value"], mode="lines", name="Baseline forecast · posterior mean", line={"color": _ACCENT, "width": 2.2}))
+    fig.add_trace(go.Scatter(x=scen_line["date"], y=scen_line["value"], mode="lines", name="Tax-scenario forecast · posterior mean", line={"color": _SCENARIO, "width": 2.2, "dash": "dash"}))
     if not pd.isna(last_obs) and not nowcast.empty:
         fig.add_vline(x=last_obs, line={"color": _MUTED, "width": 1, "dash": "dash"})
     if not pd.isna(origin):
@@ -632,7 +633,7 @@ def aggregate_live_impact_figure(payload: Mapping | None, *, fan_mode: str = "68
         _band(fig, block, "q05", "q95", "90% posterior interval", 0.10, color=_SCENARIO)
     if fan_mode in {"68", "both"}:
         _band(fig, block, "q16", "q84", "68% posterior interval", 0.20, color=_SCENARIO)
-    fig.add_trace(go.Scatter(x=block["date"], y=block["q50"], mode="lines", name="Median impact", line={"color": _SCENARIO, "width": 2.3}))
+    fig.add_trace(go.Scatter(x=block["date"], y=block["value"], mode="lines", name="Posterior mean impact", line={"color": _SCENARIO, "width": 2.3}))
     fig.add_hline(y=0.0, line={"color": "#d1d5db", "width": 1})
     _add_scenario_start_lines(fig, payload)
     return _layout(fig, title="Combined tax-scenario impact on HICP Energy inflation", unit="percentage points", uirevision=uirevision, height=390)
@@ -648,7 +649,7 @@ def aggregate_live_contribution_impact_figure(payload: Mapping | None, *, uirevi
         if block.empty:
             continue
         fig.add_trace(go.Bar(
-            x=block["date"], y=block["q50"],
+            x=block["date"], y=block["value"],
             name=COMPONENT_LABELS.get(component, component),
             marker_color=COMPONENT_COLOURS.get(component, _MUTED),
             hovertemplate="%{y:+.3f} pp<extra>" + COMPONENT_LABELS.get(component, component) + "</extra>",
@@ -666,9 +667,9 @@ def aggregate_live_scenario_kpis(payload: Mapping | None) -> dict[str, Any]:
     if baseline.empty or scenario.empty or impact.empty:
         return {"baseline": None, "scenario": None, "impact": None, "low": None, "high": None, "date": None, "n_draws": None}
     return {
-        "baseline": float(baseline["q50"].iloc[-1]),
-        "scenario": float(scenario["q50"].iloc[-1]),
-        "impact": float(impact["q50"].iloc[-1]),
+        "baseline": float(baseline["value"].iloc[-1]),
+        "scenario": float(scenario["value"].iloc[-1]),
+        "impact": float(impact["value"].iloc[-1]),
         "low": float(impact["q16"].iloc[-1]),
         "high": float(impact["q84"].iloc[-1]),
         "date": pd.Timestamp(impact["date"].iloc[-1]),
