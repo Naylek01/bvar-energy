@@ -544,22 +544,16 @@ def _subset_forecast_draws(
     return out, indices
 
 
-# ENERGY_SCENARIO_TAX_CUTS_V1
 def component_tax_scenario_contract(
     model_id: str,
     forecast: Mapping,
     *,
     dataset_path: str | Path,
-    start_date=None,
 ) -> dict:
-    """Return exact tax controls for one saved component forecast.
+    """Return tax-control defaults/units for one saved component forecast.
 
-    ``start_date`` is optional.  When supplied, the baseline VAT/excise level
-    is evaluated at that exact model period (month-start or Monday week-start),
-    rather than always at the first future period.  The returned delta bounds
-    are UI-safe tax bounds: VAT stays in [0, 100] percentage points and an
-    excise *tax* can be cut to zero.  A negative final excise would instead be
-    a subsidy and is intentionally left to a separate explicit convention.
+    The contract is deliberately component-local.  No six-model aggregate is
+    required merely to vary VAT or excise for gas, electricity or a WOB fuel.
     """
     from energy_bvar_pipeline import model_spec, resolve_model_id
 
@@ -580,20 +574,14 @@ def component_tax_scenario_contract(
     dates = pd.DatetimeIndex(forecast["path_dates"], name="date")
     future_dates = pd.DatetimeIndex(forecast.get("future_dates", []), name="date")
     if len(future_dates) == 0:
-        raise ComponentHICPError(
-            f"{canonical}: the selected forecast has no future dates."
-        )
+        raise ComponentHICPError(f"{canonical}: the selected forecast has no future dates.")
 
     if spec.family == "gas":
         from energy_bvar_gas import expand_semester_series, load_gas_tax_context
         context = load_gas_tax_context(dataset)
         vat = expand_semester_series(context["vat_percent"], dates)
         excise = expand_semester_series(context["excise"], dates)
-        default_start = (
-            pd.Timestamp(future_dates[0])
-            .to_period("M")
-            .to_timestamp(how="start")
-        )
+        default_start = pd.Timestamp(future_dates[0]).to_period("M").to_timestamp(how="start")
         frequency = "monthly"
     elif spec.family == "electricity":
         from energy_bvar_electricity import (
@@ -603,17 +591,10 @@ def component_tax_scenario_contract(
         context = load_electricity_tax_context(dataset)
         vat = expand_semester_series(context["vat_percent"], dates)
         excise = expand_semester_series(context["excise"], dates)
-        default_start = (
-            pd.Timestamp(future_dates[0])
-            .to_period("M")
-            .to_timestamp(how="start")
-        )
+        default_start = pd.Timestamp(future_dates[0]).to_period("M").to_timestamp(how="start")
         frequency = "monthly"
     else:
-        from energy_bvar_weekly_fuels import (
-            load_weekly_tax_context,
-            reattribute_weekly_taxes,
-        )
+        from energy_bvar_weekly_fuels import load_weekly_tax_context, reattribute_weekly_taxes
         context = load_weekly_tax_context(dataset, model=str(spec.spec_key))
         taxed = reattribute_weekly_taxes(forecast, context)
         vat = pd.Series(
@@ -626,71 +607,24 @@ def component_tax_scenario_contract(
             index=dates,
             name="excise",
         )
-        default_start = (
-            pd.Timestamp(future_dates[0]).to_period("W-SUN").start_time
-        )
+        default_start = pd.Timestamp(future_dates[0]).to_period("W-SUN").start_time
         frequency = "weekly"
 
-    def _normalise(value) -> pd.Timestamp:
-        stamp = pd.Timestamp(value)
-        if pd.isna(stamp):
-            raise ComponentHICPError(f"{canonical}: invalid tax scenario start date.")
-        if stamp.tzinfo is not None:
-            stamp = stamp.tz_localize(None)
-        if frequency == "weekly":
-            return stamp.to_period("W-SUN").start_time.normalize()
-        return stamp.to_period("M").to_timestamp(how="start").normalize()
-
-    min_start = _normalise(future_dates[0])
-    max_start = _normalise(dates[-1])
-    selected_start = _normalise(
-        default_start if start_date is None else start_date
-    )
-    if selected_start < min_start or selected_start > max_start:
-        raise ComponentHICPError(
-            f"{canonical}: tax scenario start {selected_start.date()} lies outside "
-            f"the forecast window {min_start.date()} — {max_start.date()}."
-        )
-
-    positions = np.flatnonzero(dates >= selected_start)
-    if len(positions) == 0:
-        raise ComponentHICPError(
-            f"{canonical}: no model period is available on/after "
-            f"{selected_start.date()}."
-        )
-    start_pos = int(positions[0])
-    baseline_vat = float(vat.iloc[start_pos])
-    baseline_excise = float(excise.iloc[start_pos])
-    if not np.isfinite(baseline_vat) or not np.isfinite(baseline_excise):
-        raise ComponentHICPError(
-            f"{canonical}: baseline VAT/excise is unavailable at "
-            f"{selected_start.date()}."
-        )
-    if baseline_vat < 0.0 or baseline_vat > 100.0:
-        raise ComponentHICPError(
-            f"{canonical}: baseline VAT {baseline_vat:.6g}% is outside [0, 100]."
-        )
-
+    start_pos = int(np.searchsorted(dates.to_numpy(), np.datetime64(default_start), side="left"))
+    start_pos = min(max(start_pos, 0), len(dates) - 1)
     return {
         "supported": True,
         "model_id": canonical,
         "frequency": frequency,
-        "default_start": _normalise(default_start),
-        "selected_start": selected_start,
-        "min_start": min_start,
-        "max_start": max_start,
+        "default_start": default_start,
+        "min_start": pd.Timestamp(future_dates[0]),
+        "max_start": pd.Timestamp(dates[-1]),
         "vat_unit": "percentage points",
         "excise_unit": str(context.get("excise_unit", "source unit")),
-        "baseline_vat_at_start": baseline_vat,
-        "baseline_excise_at_start": baseline_excise,
-        "vat_delta_min": -baseline_vat,
-        "vat_delta_max": 100.0 - baseline_vat,
-        "excise_delta_min": -baseline_excise,
-        "tax_floor_policy": (
-            "VAT and excise tax levels may be reduced to zero; a negative final "
-            "excise is a subsidy and requires a separate explicit convention."
-        ),
+        "baseline_vat_at_start": float(vat.iloc[start_pos]),
+        "baseline_excise_at_start": float(excise.iloc[start_pos]),
     }
+
 
 def build_component_tax_scenario(
     model_id: str,

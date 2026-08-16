@@ -1,0 +1,24 @@
+{
+  "patch": "energy-scenario-tax-cuts-v1",
+  "created_at_utc": "20260816T185839Z",
+  "files": {
+    "src/dashboard/energy_bvar_dashboard.py": {
+      "existed": true
+    },
+    "src/model/energy_bvar_component_hicp.py": {
+      "existed": true
+    },
+    "src/model/energy_bvar_gas.py": {
+      "existed": true
+    },
+    "src/model/energy_bvar_electricity.py": {
+      "existed": true
+    },
+    "src/model/energy_bvar_weekly_fuels.py": {
+      "existed": true
+    },
+    "tests/test_energy_scenario_tax_cuts_v1.py": {
+      "existed": false
+    }
+  }
+}

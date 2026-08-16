@@ -79,8 +79,10 @@ from energy_bvar_weekly_fuels import (
     load_weekly_tax_context,
     reattribute_weekly_taxes,
 )
+from headline_bvar_conditional import energy_level_paths_headline_bridge
 
 
+# JOINT_ENERGY_TO_HEADLINE_CONTRACT_V1
 CONDITIONAL_CONTRACT_VERSION = "energy-conditional-observable-v3"
 BASELINE_REPLAY_TOLERANCE = 1e-8
 AGGREGATE_REPLAY_TOLERANCE = 1e-8
@@ -788,13 +790,18 @@ def _weekly_pair_hicp(
     model_id: str,
     processed_dir: Path,
     indices: pd.DataFrame,
+    tax_scenario: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     short = WEEKLY_MODEL_IDS[model_id]
     dataset = processed_dir / model_spec(model_id).dataset_file
     context = load_weekly_tax_context(dataset, model=short)
 
     baseline_taxed = reattribute_weekly_taxes(baseline_forecast, context)
-    scenario_taxed = reattribute_weekly_taxes(scenario_forecast, context)
+    scenario_taxed = reattribute_weekly_taxes(
+        scenario_forecast,
+        context,
+        tax_scenario=tax_scenario,
+    )
 
     baseline_pre = _tax_array(
         baseline_taxed, "pre_tax_level_paths", "pre_tax_paths"
@@ -899,21 +906,34 @@ def _monthly_pair_hicp(
     result: Mapping[str, Any],
     model_id: str,
     processed_dir: Path,
+    tax_scenario: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     dataset = processed_dir / model_spec(model_id).dataset_file
     if model_id == "gas":
         context = load_gas_tax_context(dataset)
         base = forecast_to_hicp_gas(baseline_forecast, result, context)
-        scen = forecast_to_hicp_gas(scenario_forecast, result, context)
+        scen = forecast_to_hicp_gas(
+            scenario_forecast,
+            result,
+            context,
+            tax_scenario=tax_scenario,
+        )
     elif model_id == "electricity":
         context = load_electricity_tax_context(dataset)
         base = forecast_to_hicp_electricity(
             baseline_forecast, result, context
         )
         scen = forecast_to_hicp_electricity(
-            scenario_forecast, result, context
+            scenario_forecast,
+            result,
+            context,
+            tax_scenario=tax_scenario,
         )
     elif model_id in {"heat_energy", "solid_fuels"}:
+        if tax_scenario:
+            raise ConditionalScenarioError(
+                f"{model_id}: no tax scenario is defined for this direct-HICP model."
+            )
         base = forecast_hicp_component(
             baseline_forecast, result, component=model_id
         )
@@ -1413,6 +1433,974 @@ def _nowcast_fan_rows(
     return _fan_rows(paths, dates)
 
 
+
+JOINT_ENERGY_SCENARIO_CONTRACT_VERSION = "energy-joint-scenario-v1"
+
+_TAX_KEY_TO_MODEL_ID = {
+    "gas": "gas",
+    "electricity": "electricity",
+    "petrol": "car_fuels_petrol",
+    "diesel": "car_fuels_diesel",
+    "liquid_fuels": "liquid_fuels",
+    "car_fuels_petrol": "car_fuels_petrol",
+    "car_fuels_diesel": "car_fuels_diesel",
+}
+
+
+def _normalise_joint_conditional_specs(
+    conditional_specs: Sequence[Mapping[str, Any]] | None,
+    *,
+    vintage: str,
+    aggregate_run_id: str,
+) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    for raw in list(conditional_specs or []):
+        spec = dict(raw or {})
+        model_id = str(spec.get("model_id") or "")
+        if not model_id:
+            raise ConditionalScenarioError(
+                "Joint Energy scenario contains a conditional item without model_id."
+            )
+        if model_id in out:
+            raise ConditionalScenarioError(
+                f"Joint Energy scenario contains more than one conditional item for {model_id}."
+            )
+        spec_vintage = str(spec.get("vintage") or vintage)
+        if spec_vintage != str(vintage):
+            raise ConditionalScenarioError(
+                f"{model_id}: scenario vintage {spec_vintage} != aggregate vintage {vintage}."
+            )
+        spec_aggregate = str(spec.get("aggregate_run_id") or aggregate_run_id)
+        if spec_aggregate != str(aggregate_run_id):
+            raise ConditionalScenarioError(
+                f"{model_id}: scenario aggregate {spec_aggregate} != selected aggregate {aggregate_run_id}."
+            )
+        condition_variable = str(spec.get("condition_variable") or "")
+        path_mode = str(spec.get("path_mode") or "")
+        if not condition_variable or not path_mode:
+            raise ConditionalScenarioError(
+                f"{model_id}: joint conditional recipe is incomplete."
+            )
+        try:
+            path_value = float(spec.get("path_value"))
+        except (TypeError, ValueError) as exc:
+            raise ConditionalScenarioError(
+                f"{model_id}: joint conditional path_value is invalid."
+            ) from exc
+        if not np.isfinite(path_value):
+            raise ConditionalScenarioError(
+                f"{model_id}: joint conditional path_value is non-finite."
+            )
+        out[model_id] = {
+            **spec,
+            "model_id": model_id,
+            "vintage": str(vintage),
+            "aggregate_run_id": str(aggregate_run_id),
+            "condition_variable": condition_variable,
+            "path_mode": path_mode,
+            "path_value": path_value,
+        }
+    return out
+
+
+def _normalise_joint_tax_scenarios(
+    tax_scenarios: Mapping[str, Mapping[str, Any]] | None,
+) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    for raw_key, raw in dict(tax_scenarios or {}).items():
+        model_id = _TAX_KEY_TO_MODEL_ID.get(str(raw_key))
+        if model_id is None:
+            raise ConditionalScenarioError(
+                f"Unsupported Energy tax scenario key {raw_key!r} in joint scenario."
+            )
+        if model_id in out:
+            raise ConditionalScenarioError(
+                f"Joint Energy tax scenario duplicates model {model_id}."
+            )
+        scenario = dict(raw or {})
+        if scenario:
+            out[model_id] = scenario
+    return out
+
+
+def _joint_pair_hicp_for_model(
+    *,
+    aggregate_metadata: Mapping[str, Any],
+    aggregate_arrays: Mapping[str, np.ndarray],
+    aggregate_dates: pd.DatetimeIndex,
+    component_names: list[str],
+    processed_dir: Path,
+    model_history: Mapping[str, Any],
+    indices: pd.DataFrame,
+    weights: pd.DataFrame,
+    project_root: str | Path,
+    model_id: str,
+    conditional_spec: Mapping[str, Any] | None,
+    tax_scenario: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    forecast_dir = _forecast_directory_for_model(aggregate_metadata, model_id)
+    saved_forecast = load_energy_bvar_forecast(forecast_dir)
+    run_dir = forecast_dir.parent.parent
+    result, result_info = _load_full_saved_result(
+        run_dir,
+        project_root=project_root,
+    )
+
+    panel = result_info["panel"]
+    target = str(panel.target)
+    pairing_audit: dict[str, Any] = {}
+    condition_meta: dict[str, Any] = {}
+
+    if conditional_spec:
+        condition_variable = str(conditional_spec["condition_variable"])
+        if condition_variable == target:
+            raise ConditionalScenarioError(
+                f"{model_id}: the joint scenario cannot condition the model target itself."
+            )
+        condition_path, last_condition, last_condition_date = _build_condition_path(
+            result,
+            saved_forecast,
+            variable=condition_variable,
+            path_mode=str(conditional_spec["path_mode"]),
+            path_value=float(conditional_spec["path_value"]),
+        )
+        forecast_seed = int(getattr(model_spec(model_id), "forecast_seed", 123))
+        baseline, scenario, pairing_audit = _paired_forecasts(
+            result,
+            saved_forecast,
+            condition_variable=condition_variable,
+            condition_path=condition_path,
+            forecast_seed=forecast_seed,
+        )
+        condition_meta = {
+            "condition_variable": condition_variable,
+            "path_mode": str(conditional_spec["path_mode"]),
+            "path_value": float(conditional_spec["path_value"]),
+            "last_condition_observed": float(last_condition),
+            "last_condition_observed_date": pd.Timestamp(
+                last_condition_date
+            ).isoformat(),
+            "scenario_start": pd.Timestamp(
+                pd.DatetimeIndex(baseline["future_dates"])[0]
+            ).isoformat(),
+            "scenario_end": pd.Timestamp(
+                pd.DatetimeIndex(baseline["future_dates"])[-1]
+            ).isoformat(),
+        }
+    else:
+        # Tax-only component in a joint package: use the exact saved forecast
+        # as both the baseline and the pre-tax scenario forecast. Only the tax
+        # bridge differs.
+        baseline = saved_forecast
+        scenario = saved_forecast
+
+    if model_id in WEEKLY_MODEL_IDS:
+        pair_hicp = _weekly_pair_hicp(
+            baseline,
+            scenario,
+            model_id=model_id,
+            processed_dir=processed_dir,
+            indices=indices,
+            tax_scenario=tax_scenario,
+        )
+    else:
+        pair_hicp = _monthly_pair_hicp(
+            baseline,
+            scenario,
+            result=result,
+            model_id=model_id,
+            processed_dir=processed_dir,
+            tax_scenario=tax_scenario,
+        )
+
+    mapped = _conditioned_component_for_aggregate(
+        model_id=model_id,
+        pair_hicp=pair_hicp,
+        aggregate_metadata=aggregate_metadata,
+        aggregate_arrays=aggregate_arrays,
+        aggregate_dates=aggregate_dates,
+        component_names=component_names,
+        processed_dir=processed_dir,
+        model_history=model_history,
+        indices=indices,
+        weights=weights,
+    )
+    return {
+        "model_id": model_id,
+        "result_info": result_info,
+        "pair_hicp": pair_hicp,
+        "mapped": mapped,
+        "condition_meta": condition_meta,
+        "pairing_audit": pairing_audit,
+        "tax_scenario_active": bool(tax_scenario),
+    }
+
+
+def _joint_car_fuels_for_aggregate(
+    *,
+    petrol_pair: Mapping[str, Any],
+    diesel_pair: Mapping[str, Any],
+    aggregate_arrays: Mapping[str, np.ndarray],
+    aggregate_dates: pd.DatetimeIndex,
+    component_names: list[str],
+    model_history: Mapping[str, Any],
+    indices: pd.DataFrame,
+    weights: pd.DataFrame,
+) -> dict[str, Any]:
+    """Rebuild Car fuels when petrol and/or diesel change simultaneously.
+
+    This is the exact two-leg analogue of the single-model mapping above. It
+    uses the saved transport and final aggregate pairing arrays, intersects
+    admissible original petrol/diesel draws, then chain-links the three
+    transport HICP subcomponents draw by draw.
+    """
+    stored_components = np.asarray(
+        aggregate_arrays["component_index_paths"], dtype=float
+    )
+    try:
+        component_col = component_names.index("car_fuels")
+    except ValueError as exc:
+        raise ConditionalScenarioError(
+            "Saved aggregate does not contain the car_fuels component."
+        ) from exc
+
+    saved_petrol = np.asarray(
+        aggregate_arrays[RETAINED_KEY["petrol"]], dtype=int
+    )
+    saved_diesel = np.asarray(
+        aggregate_arrays[RETAINED_KEY["diesel"]], dtype=int
+    )
+    petrol_lookup = _position_lookup(
+        petrol_pair["retained_original_draw_indices"]
+    )
+    diesel_lookup = _position_lookup(
+        diesel_pair["retained_original_draw_indices"]
+    )
+
+    final_car = np.asarray(
+        aggregate_arrays["final_car_fuels_pair_indices"], dtype=int
+    )
+    petrol_transport = np.asarray(
+        aggregate_arrays[TRANSPORT_PAIR_KEY["petrol"]], dtype=int
+    )
+    diesel_transport = np.asarray(
+        aggregate_arrays[TRANSPORT_PAIR_KEY["diesel"]], dtype=int
+    )
+    if final_car.max(initial=-1) >= len(petrol_transport):
+        raise ConditionalScenarioError(
+            "Saved final Car-fuels pairing points outside petrol transport pool."
+        )
+    if final_car.max(initial=-1) >= len(diesel_transport):
+        raise ConditionalScenarioError(
+            "Saved final Car-fuels pairing points outside diesel transport pool."
+        )
+
+    petrol_pool = petrol_transport[final_car]
+    diesel_pool = diesel_transport[final_car]
+    if petrol_pool.max(initial=-1) >= len(saved_petrol):
+        raise ConditionalScenarioError(
+            "Saved petrol transport pairing points outside retained pool."
+        )
+    if diesel_pool.max(initial=-1) >= len(saved_diesel):
+        raise ConditionalScenarioError(
+            "Saved diesel transport pairing points outside retained pool."
+        )
+
+    petrol_original = saved_petrol[petrol_pool]
+    diesel_original = saved_diesel[diesel_pool]
+    keep_mask = np.array(
+        [
+            int(p) in petrol_lookup and int(d) in diesel_lookup
+            for p, d in zip(petrol_original, diesel_original)
+        ],
+        dtype=bool,
+    )
+    keep = np.flatnonzero(keep_mask)
+    if len(keep) < 1:
+        raise ConditionalScenarioError(
+            "Joint petrol/diesel scenario leaves no admissible Car-fuels aggregate draw."
+        )
+
+    petrol_rows = np.array(
+        [petrol_lookup[int(x)] for x in petrol_original[keep]],
+        dtype=int,
+    )
+    diesel_rows = np.array(
+        [diesel_lookup[int(x)] for x in diesel_original[keep]],
+        dtype=int,
+    )
+    transport_dates = _common_monthly_dates(
+        petrol_pair["dates"],
+        diesel_pair["dates"],
+    )
+
+    petrol_base = _align_paths(
+        petrol_pair["baseline"],
+        petrol_pair["dates"],
+        transport_dates,
+    )[petrol_rows]
+    petrol_scenario = _align_paths(
+        petrol_pair["scenario"],
+        petrol_pair["dates"],
+        transport_dates,
+    )[petrol_rows]
+    diesel_base = _align_paths(
+        diesel_pair["baseline"],
+        diesel_pair["dates"],
+        transport_dates,
+    )[diesel_rows]
+    diesel_scenario = _align_paths(
+        diesel_pair["scenario"],
+        diesel_pair["dates"],
+        transport_dates,
+    )[diesel_rows]
+
+    other = carry_last_index_path(
+        indices["hicp_other_transport_fuels"],
+        transport_dates,
+        n_draws=len(keep),
+    )
+    base_transport = {
+        "hicp_petrol": petrol_base,
+        "hicp_diesel": diesel_base,
+        "hicp_other_transport_fuels": other,
+    }
+    scenario_transport = {
+        "hicp_petrol": petrol_scenario,
+        "hicp_diesel": diesel_scenario,
+        "hicp_other_transport_fuels": other,
+    }
+
+    transport_history_index = pd.concat(
+        [
+            pd.Series(
+                [100.0],
+                index=pd.DatetimeIndex([TRANSPORT_ANCHOR], name="date"),
+            ),
+            pd.Series(model_history["transport_energy"]["index"]),
+        ]
+    ).sort_index()
+    transport_history_index.name = "car_fuels"
+    transport_history = indices[list(TRANSPORT_COMPONENTS)]
+    transport_weights = weights[list(TRANSPORT_COMPONENTS)]
+
+    baseline_car = aggregate_component_draw_paths_laspeyres(
+        transport_history,
+        base_transport,
+        transport_dates,
+        transport_weights,
+        transport_history_index,
+        components=TRANSPORT_COMPONENTS,
+    )
+    scenario_car = aggregate_component_draw_paths_laspeyres(
+        transport_history,
+        scenario_transport,
+        transport_dates,
+        transport_weights,
+        transport_history_index,
+        components=TRANSPORT_COMPONENTS,
+    )
+    baseline_component = _align_paths(
+        baseline_car["level_paths"],
+        transport_dates,
+        aggregate_dates,
+    )
+    scenario_component = _align_paths(
+        scenario_car["level_paths"],
+        transport_dates,
+        aggregate_dates,
+    )
+    replay_error = _max_abs_difference(
+        baseline_component,
+        stored_components[keep, :, component_col],
+    )
+    if replay_error > AGGREGATE_REPLAY_TOLERANCE:
+        raise ConditionalScenarioError(
+            "Joint Car-fuels baseline reconstruction does not reproduce the "
+            f"saved aggregate component (max error={replay_error:.3e})."
+        )
+    return {
+        "keep": keep,
+        "affected_component": "car_fuels",
+        "baseline_component": stored_components[keep, :, component_col],
+        "scenario_component": scenario_component,
+        "component_replay_max_abs_error": replay_error,
+    }
+
+
+def _common_mapping_keep(
+    mappings: Sequence[Mapping[str, Any]],
+) -> np.ndarray:
+    common: set[int] | None = None
+    for mapping in mappings:
+        values = set(
+            int(x)
+            for x in np.asarray(mapping["keep"], dtype=int).tolist()
+        )
+        common = values if common is None else common.intersection(values)
+    out = np.array(sorted(common or []), dtype=int)
+    if len(out) < 1:
+        raise ConditionalScenarioError(
+            "The active Energy scenarios have no common admissible aggregate draw."
+        )
+    return out
+
+
+def _mapping_rows(
+    mapping: Mapping[str, Any],
+    common_keep: np.ndarray,
+) -> np.ndarray:
+    lookup = {
+        int(aggregate_pos): int(row)
+        for row, aggregate_pos in enumerate(
+            np.asarray(mapping["keep"], dtype=int)
+        )
+    }
+    try:
+        return np.array(
+            [lookup[int(pos)] for pos in common_keep],
+            dtype=int,
+        )
+    except KeyError as exc:
+        raise ConditionalScenarioError(
+            "Internal joint-scenario draw alignment failed."
+        ) from exc
+
+
+def compute_joint_energy_scenario(
+    aggregate_directory: str | Path,
+    *,
+    project_root: str | Path,
+    conditional_specs: Sequence[Mapping[str, Any]] | None = None,
+    tax_scenarios: Mapping[str, Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Apply all compatible Energy scenarios simultaneously, draw by draw.
+
+    Conditional observable paths and VAT/excise changes are combined at the
+    component HICP layer first. Petrol and diesel are recombined jointly into
+    Car fuels. The six final component paths are then aggregated once through
+    the production Laspeyres chain-linker. Marginal Headline effects are never
+    added together.
+    """
+    aggregate_directory = Path(aggregate_directory)
+    aggregate_meta = _aggregate_metadata(aggregate_directory)
+    arrays = _aggregate_arrays(aggregate_directory)
+    aggregate_dates = _aggregate_dates(aggregate_meta, arrays)
+    component_names = _aggregate_component_names(aggregate_meta, arrays)
+
+    vintage = str(
+        aggregate_meta.get("vintage")
+        or aggregate_directory.parent.name
+    )
+    aggregate_run_id = str(
+        aggregate_meta.get("aggregate_run_id")
+        or aggregate_directory.name
+    )
+    forecast_name = str(
+        aggregate_meta.get("forecast_name")
+        or "unconditional"
+    )
+
+    conditional_by_model = _normalise_joint_conditional_specs(
+        conditional_specs,
+        vintage=vintage,
+        aggregate_run_id=aggregate_run_id,
+    )
+    tax_by_model = _normalise_joint_tax_scenarios(tax_scenarios)
+    active_models = sorted(
+        set(conditional_by_model).union(tax_by_model)
+    )
+    if not active_models:
+        raise ConditionalScenarioError(
+            "No active Energy scenario is available for joint application."
+        )
+
+    processed_dir = (
+        Path(project_root)
+        / "data"
+        / "processed"
+        / vintage
+    )
+    model_history = historical_model_component_reconstruction(
+        processed_dir
+    )
+    inputs = load_aggregation_inputs(processed_dir)
+    indices = inputs["indices"]
+    weights = inputs["weights"]
+
+    per_model: dict[str, dict[str, Any]] = {}
+    for model_id in active_models:
+        if model_id in {
+            "car_fuels_petrol",
+            "car_fuels_diesel",
+        }:
+            continue
+        per_model[model_id] = _joint_pair_hicp_for_model(
+            aggregate_metadata=aggregate_meta,
+            aggregate_arrays=arrays,
+            aggregate_dates=aggregate_dates,
+            component_names=component_names,
+            processed_dir=processed_dir,
+            model_history=model_history,
+            indices=indices,
+            weights=weights,
+            project_root=project_root,
+            model_id=model_id,
+            conditional_spec=conditional_by_model.get(model_id),
+            tax_scenario=tax_by_model.get(model_id),
+        )
+
+    mappings: list[dict[str, Any]] = [
+        dict(item["mapped"])
+        for item in per_model.values()
+    ]
+
+    car_active = bool(
+        set(active_models).intersection(
+            {"car_fuels_petrol", "car_fuels_diesel"}
+        )
+    )
+    if car_active:
+        car_pairs: dict[str, dict[str, Any]] = {}
+        for model_id in (
+            "car_fuels_petrol",
+            "car_fuels_diesel",
+        ):
+            item = _joint_pair_hicp_for_model(
+                aggregate_metadata=aggregate_meta,
+                aggregate_arrays=arrays,
+                aggregate_dates=aggregate_dates,
+                component_names=component_names,
+                processed_dir=processed_dir,
+                model_history=model_history,
+                indices=indices,
+                weights=weights,
+                project_root=project_root,
+                model_id=model_id,
+                conditional_spec=conditional_by_model.get(model_id),
+                tax_scenario=tax_by_model.get(model_id),
+            )
+            car_pairs[model_id] = item
+        car_mapping = _joint_car_fuels_for_aggregate(
+            petrol_pair=car_pairs[
+                "car_fuels_petrol"
+            ]["pair_hicp"],
+            diesel_pair=car_pairs[
+                "car_fuels_diesel"
+            ]["pair_hicp"],
+            aggregate_arrays=arrays,
+            aggregate_dates=aggregate_dates,
+            component_names=component_names,
+            model_history=model_history,
+            indices=indices,
+            weights=weights,
+        )
+        mappings.append(car_mapping)
+        per_model.update(car_pairs)
+
+    affected_components = [
+        str(mapping["affected_component"])
+        for mapping in mappings
+    ]
+    if len(affected_components) != len(set(affected_components)):
+        raise ConditionalScenarioError(
+            "Joint Energy scenario produced duplicate final aggregate components; "
+            "this would double-apply a scenario."
+        )
+
+    common_keep = _common_mapping_keep(mappings)
+    stored_component_paths = np.asarray(
+        arrays["component_index_paths"],
+        dtype=float,
+    )
+    baseline_components = {
+        name: stored_component_paths[common_keep, :, j]
+        for j, name in enumerate(component_names)
+    }
+    scenario_components = dict(baseline_components)
+
+    for mapping in mappings:
+        rows = _mapping_rows(mapping, common_keep)
+        scenario_components[
+            str(mapping["affected_component"])
+        ] = np.asarray(
+            mapping["scenario_component"],
+            dtype=float,
+        )[rows]
+
+    baseline_energy = aggregate_draw_paths_laspeyres(
+        model_history["component_history"],
+        baseline_components,
+        aggregate_dates,
+        weights,
+        indices["hicp_energy"],
+    )
+    aggregate_history_yoy = (
+        100.0
+        * (
+            indices["hicp_energy"].astype(float)
+            / indices["hicp_energy"].astype(float).shift(12)
+            - 1.0
+        )
+    )
+    aggregate_forecast_origin = _aggregate_forecast_origin(
+        aggregate_meta
+    )
+    if aggregate_forecast_origin is None:
+        aggregate_forecast_origin = pd.Timestamp(
+            aggregate_dates[0]
+        ).to_period("M").to_timestamp(how="start")
+
+    scenario_energy = aggregate_draw_paths_laspeyres(
+        model_history["component_history"],
+        scenario_components,
+        aggregate_dates,
+        weights,
+        indices["hicp_energy"],
+    )
+    baseline_yoy = draw_yoy_and_contributions(
+        baseline_energy,
+        model_history["energy"],
+    )
+    scenario_yoy = draw_yoy_and_contributions(
+        scenario_energy,
+        model_history["energy"],
+    )
+
+    baseline_level_replay = _max_abs_difference(
+        baseline_energy["level_paths"],
+        np.asarray(arrays["baseline_level_paths"], dtype=float)[
+            common_keep
+        ],
+    )
+    baseline_yoy_replay = _max_abs_difference(
+        baseline_yoy["yoy_paths"],
+        np.asarray(arrays["baseline_yoy_paths"], dtype=float)[
+            common_keep
+        ],
+    )
+    if baseline_level_replay > AGGREGATE_REPLAY_TOLERANCE:
+        raise ConditionalScenarioError(
+            "Joint scenario baseline does not reproduce saved HICP Energy "
+            f"levels (max error={baseline_level_replay:.3e})."
+        )
+    if baseline_yoy_replay > AGGREGATE_REPLAY_TOLERANCE:
+        raise ConditionalScenarioError(
+            "Joint scenario baseline does not reproduce saved HICP Energy "
+            f"YoY (max error={baseline_yoy_replay:.3e})."
+        )
+
+    additivity = np.asarray(
+        scenario_yoy["additivity_error"],
+        dtype=float,
+    )
+    finite = np.isfinite(additivity)
+    max_additivity = (
+        float(np.max(np.abs(additivity[finite])))
+        if finite.any()
+        else 0.0
+    )
+    if max_additivity > 1e-10:
+        raise ConditionalScenarioError(
+            "Joint Energy scenario contributions are not additive to numerical "
+            f"precision (max error={max_additivity:.3e})."
+        )
+
+    conditional_signature = [
+        {
+            "model_id": model_id,
+            "condition_variable": spec["condition_variable"],
+            "path_mode": spec["path_mode"],
+            "path_value": float(spec["path_value"]),
+        }
+        for model_id, spec in sorted(
+            conditional_by_model.items()
+        )
+    ]
+    tax_signature = []
+    scenario_starts: dict[str, str] = {}
+    for model_id, scenario in sorted(tax_by_model.items()):
+        start = scenario.get("start_date")
+        if start is not None:
+            scenario_starts[
+                f"Tax · {model_id.replace('_', ' ')}"
+            ] = pd.Timestamp(start).isoformat()
+        tax_signature.append(
+            {
+                "model_id": model_id,
+                "start_date": (
+                    None
+                    if start is None
+                    else pd.Timestamp(start).isoformat()
+                ),
+                "vat_changed": "vat_percent" in scenario,
+                "excise_changed": "excise" in scenario,
+            }
+        )
+    for model_id, item in sorted(per_model.items()):
+        start = (
+            item.get("condition_meta", {})
+            or {}
+        ).get("scenario_start")
+        if start:
+            scenario_starts[
+                "Conditional · "
+                + model_id.replace("_", " ")
+            ] = str(start)
+
+    source_labels = []
+    for item in conditional_signature:
+        source_labels.append(
+            "Conditional · "
+            + str(item["model_id"]).replace("_", " ")
+        )
+    for item in tax_signature:
+        source_labels.append(
+            "Tax · "
+            + str(item["model_id"]).replace("_", " ")
+        )
+
+    headline_bridge = energy_level_paths_headline_bridge(
+        dates=aggregate_dates,
+        baseline_level_paths=np.asarray(
+            baseline_energy["level_paths"],
+            dtype=float,
+        ),
+        scenario_level_paths=np.asarray(
+            scenario_energy["level_paths"],
+            dtype=float,
+        ),
+        vintage=vintage,
+        aggregate_run_id=aggregate_run_id,
+        forecast_name=forecast_name,
+        scenario_active=True,
+        lineage={
+            "source_kind": "joint_energy_scenario",
+            "source_label": (
+                "Joint Energy · "
+                + " + ".join(source_labels)
+            ),
+            "scenario_signature": {
+                "conditional": conditional_signature,
+                "tax": tax_signature,
+            },
+            "scenario_components": active_models,
+            "scenario_starts": scenario_starts,
+            "joint_contract": (
+                JOINT_ENERGY_SCENARIO_CONTRACT_VERSION
+            ),
+            "cross_model_dependence": (
+                aggregate_meta.get(
+                    "cross_model_dependence",
+                    "independent draw pairing",
+                )
+            ),
+        },
+    )
+
+    aggregate_impact_yoy = (
+        np.asarray(
+            scenario_yoy["yoy_paths"],
+            dtype=float,
+        )
+        - np.asarray(
+            baseline_yoy["yoy_paths"],
+            dtype=float,
+        )
+    )
+    contribution_names = list(
+        scenario_yoy.get("components")
+        or baseline_yoy.get("components")
+        or component_names
+    )
+    baseline_contributions = np.asarray(
+        baseline_yoy["contribution_paths"],
+        dtype=float,
+    )
+    scenario_contributions = np.asarray(
+        scenario_yoy["contribution_paths"],
+        dtype=float,
+    )
+    if (
+        baseline_contributions.shape
+        != scenario_contributions.shape
+    ):
+        raise ConditionalScenarioError(
+            "Joint scenario baseline/scenario contribution shapes differ."
+        )
+    if (
+        baseline_contributions.ndim != 3
+        or baseline_contributions.shape[2] != len(
+            contribution_names
+        )
+    ):
+        raise ConditionalScenarioError(
+            "Joint scenario contribution array is incompatible "
+            "with component names."
+        )
+    contribution_impact = (
+        scenario_contributions
+        - baseline_contributions
+    )
+    contribution_payload = {
+        str(name): _fan_rows(
+            contribution_impact[:, :, j],
+            aggregate_dates,
+        )
+        for j, name in enumerate(contribution_names)
+    }
+
+    return {
+        "ok": True,
+        "contract_version": (
+            JOINT_ENERGY_SCENARIO_CONTRACT_VERSION
+        ),
+        "meta": {
+            "vintage": vintage,
+            "aggregate_run_id": aggregate_run_id,
+            "forecast_name": forecast_name,
+            "scenario_count": int(
+                len(conditional_signature)
+                + len(tax_signature)
+            ),
+            "conditional_count": int(
+                len(conditional_signature)
+            ),
+            "tax_count": int(len(tax_signature)),
+            "active_models": active_models,
+            "affected_components": affected_components,
+            "aggregate_forecast_origin": pd.Timestamp(
+                aggregate_forecast_origin
+            ).isoformat(),
+            "n_aggregate_draws_original": int(
+                stored_component_paths.shape[0]
+            ),
+            "n_aggregate_draws_paired": int(
+                len(common_keep)
+            ),
+            "baseline_level_replay_max_abs_error": float(
+                baseline_level_replay
+            ),
+            "baseline_yoy_replay_max_abs_error": float(
+                baseline_yoy_replay
+            ),
+            "maximum_drawwise_contribution_additivity_error": float(
+                max_additivity
+            ),
+            "conditional_signature": conditional_signature,
+            "tax_signature": tax_signature,
+            "scenario_starts": scenario_starts,
+            "joint_effect_interpretation": (
+                "all active Energy scenarios are applied to component HICP "
+                "paths first and HICP Energy is then aggregated once draw by draw"
+            ),
+            "marginal_effects_summed": False,
+        },
+        "headline_bridge": headline_bridge,
+        "aggregate_history_yoy": _history_rows(
+            aggregate_history_yoy
+        ),
+        "aggregate_baseline_level": _fan_rows(
+            baseline_energy["level_paths"],
+            aggregate_dates,
+        ),
+        "aggregate_scenario_level": _fan_rows(
+            scenario_energy["level_paths"],
+            aggregate_dates,
+        ),
+        "aggregate_baseline_yoy": _fan_rows(
+            baseline_yoy["yoy_paths"],
+            aggregate_dates,
+        ),
+        "aggregate_scenario_yoy": _fan_rows(
+            scenario_yoy["yoy_paths"],
+            aggregate_dates,
+        ),
+        "aggregate_impact_yoy": _fan_rows(
+            aggregate_impact_yoy,
+            aggregate_dates,
+        ),
+        "aggregate_contribution_impact_yoy": (
+            contribution_payload
+        ),
+    }
+
+
+
+def joint_energy_contribution_impact_figure(
+    payload: Mapping[str, Any] | None,
+    *,
+    uirevision: str = "joint-energy-contribution-impact",
+) -> go.Figure:
+    """Posterior-median component contribution impact for a joint Energy package."""
+    blocks = dict(
+        (payload or {}).get(
+            "aggregate_contribution_impact_yoy"
+        )
+        or {}
+    )
+    if not blocks:
+        return empty_conditional_figure(
+            "Build the joint Energy scenario to display contribution impacts."
+        )
+
+    labels = {
+        "car_fuels": "Car fuels",
+        "liquid_fuels": "Liquid fuels",
+        "gas": "Gas",
+        "electricity": "Electricity",
+        "heat_energy": "Heat energy",
+        "solid_fuels": "Solid fuels",
+    }
+    fig = go.Figure()
+    found = False
+    for name, rows in blocks.items():
+        frame = pd.DataFrame(list(rows or []))
+        if frame.empty or "q50" not in frame:
+            continue
+        frame["date"] = pd.to_datetime(frame["date"])
+        values = pd.to_numeric(
+            frame["q50"],
+            errors="coerce",
+        )
+        if not values.notna().any():
+            continue
+        found = True
+        fig.add_trace(
+            go.Bar(
+                x=frame["date"],
+                y=values,
+                name=labels.get(
+                    str(name),
+                    str(name).replace("_", " ").title(),
+                ),
+                hovertemplate=(
+                    "%{x|%Y-%m}<br>%{y:+.3f} pp"
+                    "<extra>%{fullData.name}</extra>"
+                ),
+            )
+        )
+    if not found:
+        return empty_conditional_figure(
+            "Joint Energy contribution impacts are unavailable."
+        )
+
+    fig.update_layout(barmode="relative")
+    fig.add_hline(
+        y=0.0,
+        line={"color": "#d1d5db", "width": 1},
+    )
+    return _layout(
+        fig,
+        title=(
+            "HICP Energy — component contribution impact "
+            "of the joint scenario"
+        ),
+        y_title="percentage points",
+        uirevision=uirevision,
+        height=430,
+    )
+
 def compute_conditional_scenario(
     aggregate_directory: str | Path,
     *,
@@ -1696,19 +2684,52 @@ def compute_conditional_scenario(
         else f"{condition_target_level:.6g} {units.get(condition_variable, '')}".strip()
     )
 
+    aggregate_run_id = str(
+        aggregate_meta.get("aggregate_run_id") or aggregate_directory.name
+    )
+    forecast_name = str(
+        aggregate_meta.get("forecast_name")
+        or saved_forecast.get("forecast_name")
+        or "unconditional"
+    )
+    headline_bridge = energy_level_paths_headline_bridge(
+        dates=aggregate_dates,
+        baseline_level_paths=np.asarray(baseline_energy["level_paths"], dtype=float),
+        scenario_level_paths=np.asarray(scenario_energy["level_paths"], dtype=float),
+        vintage=str(result_info["vintage"]),
+        aggregate_run_id=aggregate_run_id,
+        forecast_name=forecast_name,
+        scenario_active=True,
+        lineage={
+            "source_kind": "conditional_observable",
+            "source_label": (
+                f"Conditional · {getattr(panel.spec, 'label', model_id)} · "
+                f"{condition_variable.replace('_', ' ')} {condition_description}"
+            ),
+            "scenario_signature": {
+                "model_id": str(model_id),
+                "condition_variable": str(condition_variable),
+                "path_mode": str(path_mode),
+                "path_value": float(path_value),
+            },
+            "scenario_components": [str(model_id)],
+            "scenario_starts": {
+                str(getattr(panel.spec, "label", model_id)): pd.Timestamp(future_dates[0]).isoformat()
+            },
+            "model_id": str(model_id),
+            "model_label": str(getattr(panel.spec, "label", model_id)),
+            "condition_variable": str(condition_variable),
+            "condition_description": condition_description,
+        },
+    )
+
     return {
         "ok": True,
         "contract_version": CONDITIONAL_CONTRACT_VERSION,
         "meta": {
-            "aggregate_run_id": str(
-                aggregate_meta.get("aggregate_run_id") or aggregate_directory.name
-            ),
+            "aggregate_run_id": aggregate_run_id,
             "vintage": str(result_info["vintage"]),
-            "forecast_name": str(
-                aggregate_meta.get("forecast_name")
-                or saved_forecast.get("forecast_name")
-                or "unconditional"
-            ),
+            "forecast_name": forecast_name,
             "model_id": str(model_id),
             "model_label": str(getattr(panel.spec, "label", model_id)),
             "run_id": str(result_info["run_id"]),
@@ -1769,6 +2790,7 @@ def compute_conditional_scenario(
             "component_terminal_yoy_impact": component_terminal,
             "aggregate_terminal_yoy_impact": aggregate_terminal,
         },
+        "headline_bridge": headline_bridge,
         "condition_history": _history_rows(condition_history),
         "condition_baseline_nowcast": condition_baseline_nowcast,
         "condition_scenario_nowcast": condition_scenario_nowcast,
@@ -2733,6 +3755,8 @@ __all__ = [
     "conditional_aggregate_contract",
     "conditional_component_contract",
     "compute_conditional_scenario",
+    "compute_joint_energy_scenario",
+    "joint_energy_contribution_impact_figure",
     "empty_conditional_set",
     "conditional_set_payload",
     "conditional_set_components",

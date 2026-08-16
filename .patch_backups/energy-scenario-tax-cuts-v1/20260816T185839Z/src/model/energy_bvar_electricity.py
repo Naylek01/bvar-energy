@@ -1,4 +1,9 @@
-"""Gas-specific adapter for the generic energy BVAR engine."""
+"""Electricity-specific adapter for the generic energy BVAR engine.
+
+The monthly electricity model contains absolute changes in wholesale natural
+ gas and pre-tax consumer electricity prices, plus eleven calendar-month
+ seasonal dummies. January is the omitted reference month by default.
+"""
 
 from __future__ import annotations
 
@@ -9,27 +14,48 @@ from typing import Iterable, Mapping, Sequence
 import numpy as np
 import pandas as pd
 
-from energy_bvar_model import load_energy_panel
+from energy_bvar_model import (
+    load_energy_panel,
+    monthly_seasonal_dummies,
+)
 from energy_bvar_source_context import load_manifest_source_frame, read_processed_manifest
 
-GAS_COLUMN_ALIASES = {
+
+ELECTRICITY_COLUMN_ALIASES = {
     "natural_gas_eur_mwh": "natural_gas_wholesale",
     "natural_gas": "natural_gas_wholesale",
-    "gas_pre_tax_price": "gas_pre_tax",
+    "electricity_pre_tax_price": "electricity_pre_tax",
 }
 
 
-def load_gas_panel(
+def load_electricity_panel(
     path: str | Path,
-    variables: Sequence[str] = ("natural_gas_wholesale", "gas_pre_tax"),
+    variables: Sequence[str] = (
+        "natural_gas_wholesale",
+        "electricity_pre_tax",
+    ),
 ) -> pd.DataFrame:
-    """Load the processed monthly gas panel without filling missing values."""
+    """Load the processed monthly electricity panel without filling missing data."""
     return load_energy_panel(
         path,
         variables=variables,
-        aliases=GAS_COLUMN_ALIASES,
+        aliases=ELECTRICITY_COLUMN_ALIASES,
         frequency="monthly",
     )
+
+
+def make_electricity_seasonal_dummies(
+    index: Sequence[pd.Timestamp] | pd.DatetimeIndex,
+    *,
+    reference_month: int = 1,
+) -> pd.DataFrame:
+    """Create the eleven seasonal dummies used by the electricity BVAR."""
+    return monthly_seasonal_dummies(
+        index,
+        reference_month=reference_month,
+        prefix="month",
+    )
+
 
 # -----------------------------------------------------------------------------
 # Tax re-attribution and HICP reconstruction
@@ -43,47 +69,50 @@ def _find_column(frame: pd.DataFrame, candidates: Iterable[str], label: str) -> 
     raise KeyError(f"Could not find {label}; tried {list(candidates)}.")
 
 
-def load_gas_tax_context(
-    gas_dataset_path: str | Path,
+def load_electricity_tax_context(
+    electricity_dataset_path: str | Path,
     manifest_path: str | Path | None = None,
 ) -> dict:
-    """Recover gamma, VAT, unit-consistent excise and HICP gas.
+    """Recover gamma, VAT, excise and HICP electricity for the same vintage.
 
-    Both processed-vintage layouts are supported: legacy manifests with one
-    CSV per source and the v9 single-workbook manifest with ``raw_workbook``
-    and ``sheet_mapping``. Notebook calls therefore stay unchanged.
+    Supports both the legacy per-source CSV manifests and the v9
+    single-workbook manifest without changing notebook calls.
     """
-    gas_dataset_path = Path(gas_dataset_path)
+    electricity_dataset_path = Path(electricity_dataset_path)
     manifest, resolved_manifest_path = read_processed_manifest(
-        gas_dataset_path, manifest_path
+        electricity_dataset_path, manifest_path
     )
-    pre_tax_info = manifest["construction"]["pre_tax"]["gas"]
+    pre_tax_info = manifest["construction"]["pre_tax"]["electricity"]
     gamma = float(pre_tax_info["gamma"])
     price_unit_multiplier = float(pre_tax_info.get("price_unit_multiplier", 1.0))
-    output_price_unit = str(pre_tax_info.get("output_price_unit", "source unit"))
+    output_price_unit = str(pre_tax_info.get("output_price_unit", "EUR/kWh"))
     if not np.isfinite(gamma) or gamma <= 0:
-        raise ValueError("Invalid gas gamma in the processed manifest.")
+        raise ValueError("Invalid electricity gamma in the processed manifest.")
     if not np.isfinite(price_unit_multiplier) or price_unit_multiplier <= 0:
-        raise ValueError("Invalid pre-tax price unit multiplier in manifest.")
+        raise ValueError("Invalid electricity price-unit multiplier in the manifest.")
 
     haver, haver_source = load_manifest_source_frame(
-        gas_dataset_path,
+        electricity_dataset_path,
         "haver",
         manifest_path=resolved_manifest_path,
-        haver_ticker_map={"H023HW52@EUDATA": "hicp_gas"},
+        haver_ticker_map={"H023HW51@EUDATA": "hicp_electricity"},
     )
     eurostat, eurostat_source = load_manifest_source_frame(
-        gas_dataset_path,
+        electricity_dataset_path,
         "eurostat",
         manifest_path=resolved_manifest_path,
     )
-    hicp_col = _find_column(haver, ["hicp_gas"], "HICP gas")
-    vat_col = _find_column(eurostat, ["estat_gas_household_vat"], "gas VAT")
-    exc_col = _find_column(eurostat, ["estat_gas_household_exc"], "gas excise")
+    hicp_col = _find_column(haver, ["hicp_electricity"], "HICP electricity")
+    vat_col = _find_column(
+        eurostat, ["estat_electricity_household_vat"], "electricity VAT"
+    )
+    exc_col = _find_column(
+        eurostat, ["estat_electricity_household_exc"], "electricity excise"
+    )
 
     return {
         "gamma": gamma,
-        "hicp_gas": haver[hicp_col].astype(float).rename("hicp_gas"),
+        "hicp_electricity": haver[hicp_col].astype(float).rename("hicp_electricity"),
         "vat_percent": eurostat[vat_col].astype(float).rename("vat_percent"),
         "excise": (
             price_unit_multiplier * eurostat[exc_col].astype(float)
@@ -107,7 +136,7 @@ def expand_semester_series(
     monthly_index: pd.DatetimeIndex,
     carry_forward_edge: bool = True,
 ) -> pd.Series:
-    """Assign each semiannual observation to exactly six months, then extend only the edge."""
+    """Assign each semiannual value to six months and extend only the final edge."""
     sparse = sparse.dropna().copy().sort_index()
     sparse.index = sparse.index.to_period("M").to_timestamp(how="start")
     out = pd.Series(np.nan, index=monthly_index, dtype=float, name=sparse.name)
@@ -115,52 +144,80 @@ def expand_semester_series(
         valid = pd.date_range(date, periods=6, freq="MS")
         out.loc[out.index.intersection(valid)] = float(value)
     if carry_forward_edge and len(sparse):
-        last_date = sparse.index[-1] + pd.DateOffset(months=5)
-        out.loc[out.index > last_date] = float(sparse.iloc[-1])
+        last_covered_month = sparse.index[-1] + pd.DateOffset(months=5)
+        out.loc[out.index > last_covered_month] = float(sparse.iloc[-1])
     return out
 
 
-def construct_pre_tax_price(
+def construct_pre_tax_electricity(
     hicp_index: pd.Series,
     vat_percent: pd.Series,
     excise: pd.Series,
     gamma: float,
 ) -> pd.Series:
-    """Construct the pre-tax price with gamma and excise in the same unit."""
-    index = hicp_index.index
+    """Construct pre-tax electricity in the unit used to estimate gamma."""
+    index = pd.DatetimeIndex(hicp_index.index)
     vat = expand_semester_series(vat_percent, index)
     exc = expand_semester_series(excise, index)
-    return (gamma * hicp_index / (1.0 + vat / 100.0) - exc).rename("gas_pre_tax")
+    return (
+        gamma * hicp_index / (1.0 + vat / 100.0) - exc
+    ).rename("electricity_pre_tax")
 
 
-def reattribute_gas_taxes(
+def reattribute_electricity_taxes(
     pre_tax: pd.Series | np.ndarray,
     gamma: float,
     vat_percent: pd.Series | np.ndarray | float,
     excise: pd.Series | np.ndarray | float,
 ):
-    """Invert the pre-tax construction exactly: HICP=(pre-tax+EXC)(1+VAT)/gamma."""
+    """Invert the pre-tax construction exactly."""
     if gamma <= 0:
         raise ValueError("gamma must be positive.")
-    return (np.asarray(pre_tax) + np.asarray(excise)) * (1.0 + np.asarray(vat_percent) / 100.0) / gamma
+    return (
+        (np.asarray(pre_tax) + np.asarray(excise))
+        * (1.0 + np.asarray(vat_percent) / 100.0)
+        / gamma
+    )
 
 
-def validate_tax_round_trip(context: Mapping, tolerance: float = 1e-10) -> pd.Series:
-    hicp = context["hicp_gas"].dropna()
+def validate_electricity_tax_round_trip(
+    context: Mapping,
+    tolerance: float = 1e-10,
+) -> pd.Series:
+    hicp = context["hicp_electricity"].dropna()
     common_index = pd.date_range(hicp.index.min(), hicp.index.max(), freq="MS")
     hicp = hicp.reindex(common_index)
     vat = expand_semester_series(context["vat_percent"], common_index)
     exc = expand_semester_series(context["excise"], common_index)
-    pre_tax = construct_pre_tax_price(hicp, context["vat_percent"], context["excise"], context["gamma"])
+    pre_tax = construct_pre_tax_electricity(
+        hicp,
+        context["vat_percent"],
+        context["excise"],
+        context["gamma"],
+    )
     rebuilt = pd.Series(
-        reattribute_gas_taxes(pre_tax, context["gamma"], vat, exc),
+        reattribute_electricity_taxes(
+            pre_tax,
+            context["gamma"],
+            vat,
+            exc,
+        ),
         index=common_index,
     )
     error = (rebuilt - hicp).abs().dropna()
     maximum = float(error.max()) if len(error) else np.nan
     if np.isfinite(maximum) and maximum > tolerance:
-        raise AssertionError(f"Tax round-trip error {maximum:.3e} exceeds {tolerance:.3e}.")
-    return pd.Series({"observations": len(error), "maximum_absolute_error": maximum, "tolerance": tolerance})
+        raise AssertionError(
+            f"Electricity tax round-trip error {maximum:.3e} exceeds "
+            f"{tolerance:.3e}."
+        )
+    return pd.Series(
+        {
+            "observations": len(error),
+            "maximum_absolute_error": maximum,
+            "tolerance": tolerance,
+        }
+    )
 
 
 def _normalise_tax_period_start(value, frequency: str) -> pd.Timestamp:
@@ -201,19 +258,17 @@ def _tax_scenario_values(
     return values
 
 
-# ENERGY_SCENARIO_TAX_CUTS_V1
 def _validate_vat_percent(values: np.ndarray) -> None:
-    """Validate a VAT *level* expressed in percentage points.
-
-    Any finite value in [0, 100] is legitimate.  In particular, low positive
-    rates below 1% are valid scenario outcomes after a tax cut; unit mistakes
-    are prevented in the dashboard by showing baseline + delta -> final VAT.
-    """
     values = np.asarray(values, dtype=float)
-    if not np.all(np.isfinite(values)):
-        raise ValueError("VAT must contain only finite percentage-point levels.")
     if np.any((values < 0.0) | (values > 100.0)):
-        raise ValueError("VAT level must lie between 0 and 100 percentage points.")
+        raise ValueError("VAT must be supplied in percentage points between 0 and 100.")
+    suspicious = (values > 0.0) & (values < 1.0)
+    if suspicious.any():
+        raise ValueError(
+            "VAT is expressed in percentage points: use 22.0 for 22%, not 0.22. "
+            "Values strictly between 0 and 1 are rejected to catch unit mistakes."
+        )
+
 
 def _apply_monthly_tax_scenario(
     baseline_vat: pd.Series,
@@ -360,15 +415,15 @@ def _historical_monthly_tax_path(
     )
 
 
-def forecast_to_hicp_gas(
+def forecast_to_hicp_electricity(
     forecast: Mapping,
     result: Mapping,
     tax_context: Mapping,
-    target_variable: str = "gas_pre_tax",
+    target_variable: str = "electricity_pre_tax",
     *,
     tax_scenario: Mapping | None = None,
 ) -> dict:
-    """Map pre-tax gas paths to HICP under baseline and optional tax scenarios.
+    """Map pre-tax electricity paths to HICP under baseline and optional tax scenarios.
 
     The baseline follows the paper's constant-edge tax assumption. A scenario
     must carry an explicit ``start_date``; before that date its realised tax path
@@ -387,13 +442,13 @@ def forecast_to_hicp_gas(
     )
 
     pre_tax_paths = np.asarray(forecast["level_paths"], dtype=float)[:, :, target_index]
-    baseline_hicp_paths = reattribute_gas_taxes(
+    baseline_hicp_paths = reattribute_electricity_taxes(
         pre_tax_paths,
         tax_context["gamma"],
         baseline_vat.to_numpy()[None, :],
         baseline_excise.to_numpy()[None, :],
     )
-    hicp_paths = reattribute_gas_taxes(
+    hicp_paths = reattribute_electricity_taxes(
         pre_tax_paths,
         tax_context["gamma"],
         vat.to_numpy()[None, :],
@@ -401,7 +456,7 @@ def forecast_to_hicp_gas(
     )
 
     balanced_end = pd.Timestamp(result["prep"]["balanced_end"])
-    actual_hicp = tax_context["hicp_gas"].copy().sort_index()
+    actual_hicp = tax_context["hicp_electricity"].copy().sort_index()
     hicp_history = actual_hicp.loc[actual_hicp.index <= balanced_end]
     baseline_hicp_yoy = _monthly_yoy_paths(baseline_hicp_paths, dates, hicp_history)
     hicp_yoy = _monthly_yoy_paths(hicp_paths, dates, hicp_history)
@@ -455,16 +510,12 @@ def forecast_to_hicp_gas(
         ),
     }
 
-def gas_series_construction_table(gas_dataset_path: str | Path) -> pd.DataFrame:
-    """Describe how the two processed gas-model level series were built.
-
-    The table uses the processed-vintage manifest when it is available and
-    falls back to the documented pipeline conventions otherwise. It separates
-    source construction from the absolute-difference transformation applied by
-    the estimation notebook.
-    """
-    gas_dataset_path = Path(gas_dataset_path)
-    manifest_path = gas_dataset_path.parent / "manifest.json"
+def electricity_series_construction_table(
+    electricity_dataset_path: str | Path,
+) -> pd.DataFrame:
+    """Summarise the processed electricity-model inputs and their units."""
+    electricity_dataset_path = Path(electricity_dataset_path)
+    manifest_path = electricity_dataset_path.parent / "manifest.json"
     manifest: dict = {}
     if manifest_path.exists():
         try:
@@ -474,64 +525,52 @@ def gas_series_construction_table(gas_dataset_path: str | Path) -> pd.DataFrame:
 
     construction = manifest.get("construction", {})
     natural = construction.get("natural_gas", {})
-    pre_tax = construction.get("pre_tax", {}).get("gas", {})
+    pre_tax = construction.get("pre_tax", {}).get("electricity", {})
 
     natural_method = natural.get(
         "method",
-        "Bloomberg TTF monthly mean in EUR/MWh; earlier months follow the "
-        "World Bank Natural gas, Europe proxy converted to EUR and chain-linked "
-        "to the TTF level at the junction, without an estimated splice window.",
+        "Bloomberg TTF monthly mean in EUR/MWh; earlier observations are "
+        "chain-linked to the World Bank European natural-gas proxy.",
     )
-    natural_note = natural.get(
-        "proxy_note",
-        "The World Bank series is a project proxy for the historical border-gas "
-        "series used in the paper.",
-    )
-    if natural.get("anchor_date"):
-        natural_note += f" TTF anchor month: {natural['anchor_date']}."
-
     pre_tax_formula = pre_tax.get(
         "formula",
-        "pre_tax_EUR_MWh = gamma_EUR_MWh * HICP_gas / "
-        "(1 + VAT/100) - EXC_EUR_MWh",
+        "pre_tax = gamma * HICP_electricity / (1 + VAT/100) - EXC",
     )
+    pre_tax_unit = str(pre_tax.get("output_price_unit", "EUR/kWh"))
     pre_tax_note = pre_tax.get(
         "tax_edge_assumption",
-        "Each semiannual VAT and excise observation is used for six months; "
-        "after the final published semester the last tax values are held constant.",
+        "Semiannual VAT and excise observations are held for six months and "
+        "the final published values are carried through the edge.",
     )
     if pre_tax.get("gamma") is not None:
         pre_tax_note += f" Estimated gamma: {float(pre_tax['gamma']):.6g}."
-    pre_tax_unit = str(pre_tax.get("output_price_unit", "EUR/MWh"))
 
-    table = pd.DataFrame(
+    return pd.DataFrame(
         {
-            "series_type": ["chain-linked backcast", "constructed pre-tax price"],
+            "series_type": ["chain-linked wholesale price", "constructed pre-tax price"],
             "model_unit": ["EUR/MWh", pre_tax_unit],
             "source_inputs": [
                 "Bloomberg TTF; World Bank Natural gas, Europe; EUR/USD",
-                "Haver HICP gas; Eurostat after-tax price, VAT and excise",
+                "Haver HICP electricity; Eurostat after-tax price, VAT and excise",
             ],
-            "level_construction": [natural_method, pre_tax_formula],
-            "important_note": [natural_note, pre_tax_note],
-            "notebook_transformation": [
-                "ordinary absolute first difference: P_t - P_{t-1}",
-                "ordinary absolute first difference: P_t - P_{t-1}",
+            "construction": [natural_method, pre_tax_formula],
+            "note": [
+                "Wholesale natural gas is the upstream explanatory variable.",
+                pre_tax_note,
             ],
         },
-        index=["natural_gas_wholesale", "gas_pre_tax"],
+        index=["natural_gas_wholesale", "electricity_pre_tax"],
     )
-    table.index.name = "model series"
-    return table
 
 
 __all__ = [
-    "load_gas_panel",
-    "gas_series_construction_table",
-    "load_gas_tax_context",
+    "load_electricity_panel",
+    "make_electricity_seasonal_dummies",
+    "load_electricity_tax_context",
     "expand_semester_series",
-    "construct_pre_tax_price",
-    "reattribute_gas_taxes",
-    "validate_tax_round_trip",
-    "forecast_to_hicp_gas",
+    "construct_pre_tax_electricity",
+    "reattribute_electricity_taxes",
+    "validate_electricity_tax_round_trip",
+    "forecast_to_hicp_electricity",
+    "electricity_series_construction_table",
 ]

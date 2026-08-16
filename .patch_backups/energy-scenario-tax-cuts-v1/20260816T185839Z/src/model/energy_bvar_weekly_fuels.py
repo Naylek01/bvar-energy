@@ -482,17 +482,17 @@ def _weekly_tax_scenario_values(
     return values
 
 
-# ENERGY_SCENARIO_TAX_CUTS_V1
 def _validate_weekly_vat_percent(values: np.ndarray) -> None:
-    """Validate a weekly VAT *level* expressed in percentage points.
-
-    Low positive rates below 1% are valid scenario outcomes after a tax cut.
-    """
     values = np.asarray(values, dtype=float)
-    if not np.all(np.isfinite(values)):
-        raise ValueError("VAT must contain only finite percentage-point levels.")
     if np.any((values < 0.0) | (values > 100.0)):
-        raise ValueError("VAT level must lie between 0 and 100 percentage points.")
+        raise ValueError("VAT must be supplied in percentage points between 0 and 100.")
+    suspicious = (values > 0.0) & (values < 1.0)
+    if suspicious.any():
+        raise ValueError(
+            "VAT is expressed in percentage points: use 22.0 for 22%, not 0.22. "
+            "Values strictly between 0 and 1 are rejected to catch unit mistakes."
+        )
+
 
 def _apply_weekly_tax_scenario(
     baseline_vat: np.ndarray,

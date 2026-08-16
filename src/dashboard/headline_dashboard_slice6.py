@@ -26,6 +26,13 @@ from energy_bvar_theme import (
     graph_config,
 )
 from inflation_chart_contract import short_horizon_labels, apply_short_horizon_axis
+from energy_bvar_dashboard_conditional import (
+    compute_conditional_scenario,
+)
+from energy_bvar_dashboard_scenarios import (
+    scenario_set_summary,
+    scenario_set_to_tax_scenarios,
+)
 from inflation_table_contract import (
     PAIRED_EFFECT_COLUMNS,
     paired_blocks_records,
@@ -43,6 +50,9 @@ from headline_bvar_conditional import (
     run_saved_headline_conditional,
 )
 
+# HEADLINE_CONSUMES_PREBUILT_JOINT_ENERGY_V1
+# HEADLINE_JOINT_ENERGY_PACKAGE_V1
+# HEADLINE_ENERGY_LEGACY_BRIDGE_AUTO_REFRESH_V4
 HORIZONS = (3, 6, 12)
 COMPONENTS = ("hicp_energy", "hicp_food", "hicp_neig", "hicp_services")
 SERIES_LABELS = {
@@ -82,17 +92,22 @@ def _q(block: dict | None, key: str = "mean") -> np.ndarray:
     return np.asarray(block.get(key, []), dtype=float)
 
 
-def _fan(fig: go.Figure, dates, block: dict, *, name: str, color: str, bands=("68",)) -> str | None:
-    """Plot one posterior fan, returning an explicit diagnostic on failure.
-
-    Conditional computation is always 12 months. The UI horizon (3/6/12)
-    is only a display slice, so posterior summaries are sliced before
-    validating them against ``dates``.
-    """
-    n = len(dates)
+def _fan(
+    fig: go.Figure,
+    dates,
+    block: dict,
+    *,
+    name: str,
+    color: str,
+    bands=("68",),
+    anchor_value: float | None = None,
+) -> str | None:
+    """Plot one posterior fan on deterministic +1m/+2m/... categories."""
+    idx = pd.DatetimeIndex(pd.to_datetime(list(dates)))
+    n = len(idx)
     if n < 1:
         return f"{name}: no display dates"
-
+    labels = short_horizon_labels(idx)
     quantiles = {
         key: np.asarray(block.get(key, []), dtype=float)[:n]
         for key in ("q05", "q16", "q50", "q84", "q95")
@@ -100,32 +115,25 @@ def _fan(fig: go.Figure, dates, block: dict, *, name: str, color: str, bands=("6
     }
     mean = _q(block, "mean")[:n]
     q50 = quantiles.get("q50", np.asarray([], dtype=float))
-
     if not quantiles:
         return f"{name}: no posterior quantiles"
-    if len(q50) != n:
-        return f"{name}: q50 length={len(q50)} but display dates={n}"
-    if len(mean) != n:
-        return f"{name}: mean length={len(mean)} but display dates={n}"
+    if len(q50) != n or len(mean) != n:
+        return f"{name}: posterior summary length does not match display horizon"
     if not np.isfinite(mean).all():
         return f"{name}: posterior mean contains non-finite values"
-
     required = {"q16", "q50", "q84"}
     if "90" in bands:
         required |= {"q05", "q95"}
     missing = sorted(required.difference(quantiles))
     if missing:
         return f"{name}: missing quantiles {missing}"
-
     for key in required:
         values = np.asarray(quantiles[key], dtype=float)
-        if len(values) != n:
-            return f"{name}: {key} length={len(values)} but display dates={n}"
-        if not np.isfinite(values).all():
-            return f"{name}: {key} contains non-finite values"
+        if len(values) != n or not np.isfinite(values).all():
+            return f"{name}: invalid {key} values"
 
     for trace in fan_traces(
-        dates,
+        labels,
         quantiles,
         bands=bands,
         color=color,
@@ -133,40 +141,89 @@ def _fan(fig: go.Figure, dates, block: dict, *, name: str, color: str, bands=("6
         show_median=False,
     ):
         fig.add_trace(trace)
+
+    line_x = list(labels)
+    line_y = mean.tolist()
+    custom = [pd.Timestamp(x).strftime("%Y-%m") for x in idx]
+    if anchor_value is not None and np.isfinite(float(anchor_value)):
+        line_x = ["Actual"] + line_x
+        line_y = [float(anchor_value)] + line_y
+        custom = ["Latest observed"] + custom
     fig.add_trace(
         go.Scatter(
-            x=dates,
-            y=mean,
-            mode="lines",
+            x=line_x,
+            y=line_y,
+            customdata=custom,
+            mode="lines+markers",
             name=f"{name} · posterior mean",
             line=dict(color=color, width=2.2),
-            hovertemplate="%{y:.2f}<extra>Posterior mean</extra>",
+            marker=dict(size=5),
+            hovertemplate="%{x} · %{customdata}<br>%{y:.2f}%<extra>" + name + "</extra>",
         )
     )
     return None
+
+def _scenario_dates(payload: dict | None, horizon: int) -> pd.DatetimeIndex:
+    return pd.DatetimeIndex(pd.to_datetime((payload or {}).get("dates") or []))[: int(horizon)]
+
+
+def _calendar_hover(dates: pd.DatetimeIndex) -> list[str]:
+    return [pd.Timestamp(x).strftime("%Y-%m") for x in dates]
+
+
+def _symmetric_zero_axis(fig: go.Figure, *arrays, minimum: float = 0.01) -> None:
+    finite = []
+    for array in arrays:
+        values = np.asarray(array, dtype=float).ravel()
+        values = values[np.isfinite(values)]
+        if len(values):
+            finite.append(values)
+    maximum = max((float(np.max(np.abs(x))) for x in finite), default=0.0)
+    half = max(float(minimum), 1.15 * maximum)
+    fig.update_yaxes(range=[-half, half], zeroline=False)
+
+
+def _observed_anchor(payload: dict | None) -> tuple[str | None, float | None]:
+    meta = dict((payload or {}).get("meta") or {})
+    raw_value = meta.get("headline_observed_anchor_yoy")
+    raw_date = meta.get("headline_observed_anchor_date")
+    try:
+        value = float(raw_value)
+    except (TypeError, ValueError):
+        return None, None
+    if not np.isfinite(value):
+        return None, None
+    return (None if raw_date is None else str(raw_date)), value
 
 
 def headline_scenario_main_figure(payload: dict | None, horizon: int = 3) -> go.Figure:
     if not payload:
         return _empty("Run a Headline conditional scenario.", 500)
-    dates = pd.DatetimeIndex(pd.to_datetime(payload.get("dates") or []))[: int(horizon)]
+    dates = _scenario_dates(payload, horizon)
     block = (((payload.get("fans") or {}).get("hicp_total") or {}).get("yoy") or {})
     base = block.get("baseline") or {}
     cond = block.get("conditional") or {}
     if not len(dates):
         return _empty("Conditional scenario has no future dates.", 500)
 
+    anchor_date, anchor_value = _observed_anchor(payload)
     fig = go.Figure()
+    if anchor_value is not None:
+        fig.add_trace(go.Scatter(
+            x=["Actual"], y=[anchor_value], mode="markers",
+            name="Latest observed", marker=dict(size=8, color=INFLATION_COLORS["observed"]),
+            customdata=[anchor_date or "Latest observed"],
+            hovertemplate="Actual · %{customdata}<br>%{y:.2f}%<extra>Latest observed</extra>",
+        ))
     errors = [
-        _fan(fig, dates, base, name="Baseline", color=INFLATION_COLORS["baseline"], bands=("68",)),
-        _fan(fig, dates, cond, name="Conditional", color=INFLATION_COLORS["conditional"], bands=("68",)),
+        _fan(fig, dates, base, name="Baseline", color=INFLATION_COLORS["baseline"], bands=("68",), anchor_value=anchor_value),
+        _fan(fig, dates, cond, name="Conditional", color=INFLATION_COLORS["conditional"], bands=("68",), anchor_value=anchor_value),
     ]
     errors = [error for error in errors if error]
     if errors:
-        return _empty(
-            "Baseline vs conditional display unavailable: " + " | ".join(errors),
-            500,
-        )
+        return _empty("Baseline vs conditional display unavailable: " + " | ".join(errors), 500)
+    labels = short_horizon_labels(dates)
+    apply_short_horizon_axis(fig, (["Actual"] if anchor_value is not None else []) + labels)
     return _layout(
         fig,
         f"h6-main::{payload.get('meta', {}).get('scenario_id')}::{horizon}",
@@ -174,117 +231,92 @@ def headline_scenario_main_figure(payload: dict | None, horizon: int = 3) -> go.
         500,
     )
 
-
 def headline_scenario_impact_figure(payload: dict | None, horizon: int = 3) -> go.Figure:
     if not payload:
         return _empty("Run a Headline conditional scenario.")
-    dates = pd.DatetimeIndex(pd.to_datetime(payload.get("dates") or []))[: int(horizon)]
+    dates = _scenario_dates(payload, horizon)
     block = payload.get("headline_yoy_impact") or {}
     n = len(dates)
     if n < 1:
         return _empty("Headline impact is unavailable: no display dates.")
-
     q16 = _q(block, "q16")[:n]
     q50 = _q(block, "q50")[:n]
     mean = _q(block, "mean")[:n]
     q84 = _q(block, "q84")[:n]
-
-    lengths = {
-        "q16": len(q16),
-        "q50": len(q50),
-        "mean": len(mean),
-        "q84": len(q84),
-    }
-    bad_lengths = {key: value for key, value in lengths.items() if value != n}
-    if bad_lengths:
-        return _empty(
-            f"Headline impact is unavailable: display dates={n}, lengths={bad_lengths}."
-        )
-    if not all(np.isfinite(values).all() for values in (q16, q50, mean, q84)):
+    if any(len(x) != n for x in (q16, q50, mean, q84)):
+        return _empty("Headline impact is unavailable: posterior summary length mismatch.")
+    if not all(np.isfinite(x).all() for x in (q16, q50, mean, q84)):
         return _empty("Headline impact is unavailable: posterior summaries contain non-finite values.")
-
+    labels = short_horizon_labels(dates)
     fig = go.Figure()
     for trace in fan_traces(
-        dates,
-        {"q16": q16, "q50": q50, "q84": q84},
-        bands=("68",),
-        color=INFLATION_COLORS["impact"],
-        name="Impact",
-        show_median=False,
+        labels, {"q16": q16, "q50": q50, "q84": q84}, bands=("68",),
+        color=INFLATION_COLORS["impact"], name="Impact", show_median=False,
     ):
         fig.add_trace(trace)
     fig.add_trace(go.Scatter(
-        x=dates, y=mean, mode="lines+markers", name="Posterior mean impact",
-        line=dict(color=INFLATION_COLORS["impact"], width=2), marker=dict(size=5),
+        x=labels, y=mean, customdata=_calendar_hover(dates), mode="lines+markers",
+        name="Posterior mean impact", line=dict(color=INFLATION_COLORS["impact"], width=2), marker=dict(size=5),
+        hovertemplate="%{x} · %{customdata}<br>%{y:+.3f} pp<extra>Posterior mean impact</extra>",
     ))
     fig.add_hline(y=0, line_width=1, line_color=TOKENS["hairline"])
-    return _layout(
-        fig,
-        f"h6-impact::{payload.get('meta', {}).get('scenario_id')}::{horizon}",
-        "percentage points",
-        420,
-    )
-
+    apply_short_horizon_axis(fig, labels)
+    _symmetric_zero_axis(fig, q16, q84, mean)
+    return _layout(fig, f"h6-impact::{payload.get('meta', {}).get('scenario_id')}::{horizon}", "percentage points", 420)
 
 def component_transmission_figure(payload: dict | None, horizon: int = 3) -> go.Figure:
     if not payload:
         return _empty("Run a Headline conditional scenario.")
-    dates = pd.DatetimeIndex(pd.to_datetime(payload.get("dates") or []))[: int(horizon)]
+    dates = _scenario_dates(payload, horizon)
+    labels = short_horizon_labels(dates) if len(dates) else []
     blocks = payload.get("component_yoy_impact") or {}
     fig = go.Figure()
-    found = False
-    for j, name in enumerate(COMPONENTS):
+    plotted = []
+    for name in COMPONENTS:
         values = _q(blocks.get(name) or {})[: len(dates)]
-        if len(values) != len(dates):
+        if len(values) != len(dates) or not np.isfinite(values).all():
             continue
-        found = True
+        plotted.append(values)
         fig.add_trace(go.Scatter(
-            x=dates, y=values, mode="lines+markers",
+            x=labels, y=values, customdata=_calendar_hover(dates), mode="lines+markers",
             name=SERIES_LABELS[name], line=dict(color=INFLATION_COLORS[name], width=2), marker=dict(size=5),
+            hovertemplate="%{x} · %{customdata}<br>%{y:+.3f} pp<extra>" + SERIES_LABELS[name] + "</extra>",
         ))
-    if not found:
+    if not plotted:
         return _empty("Component transmission is unavailable.")
     fig.add_hline(y=0, line_width=1, line_color=TOKENS["hairline"])
-    return _layout(
-        fig,
-        f"h6-components::{payload.get('meta', {}).get('scenario_id')}::{horizon}",
-        "pp vs baseline",
-        430,
-    )
-
+    apply_short_horizon_axis(fig, labels)
+    _symmetric_zero_axis(fig, *plotted)
+    return _layout(fig, f"h6-components::{payload.get('meta', {}).get('scenario_id')}::{horizon}", "pp vs baseline", 430)
 
 def contribution_impact_figure(payload: dict | None, horizon: int = 3) -> go.Figure:
     if not payload:
         return _empty("Run a Headline conditional scenario.")
-    dates = pd.DatetimeIndex(pd.to_datetime(payload.get("dates") or []))[: int(horizon)]
+    dates = _scenario_dates(payload, horizon)
     blocks = payload.get("contribution_yoy_impact") or {}
-    labels = short_horizon_labels(dates)
+    labels = short_horizon_labels(dates) if len(dates) else []
     fig = go.Figure()
-    found = False
-    for j, name in enumerate(COMPONENTS):
+    plotted = []
+    for name in COMPONENTS:
         values = np.asarray((blocks.get(name) or {}).get("mean", []), dtype=float)[: len(dates)]
-        if len(values) != len(dates):
+        if len(values) != len(dates) or not np.isfinite(values).all():
             continue
-        found = True
+        plotted.append(values)
         fig.add_trace(go.Bar(
-            x=labels,
-            y=values,
-            name=SERIES_LABELS[name],
+            x=labels, y=values, customdata=_calendar_hover(dates), name=SERIES_LABELS[name],
             marker_color=INFLATION_COLORS[name],
-            hovertemplate="%{y:+.2f} pp<extra>" + SERIES_LABELS[name] + "</extra>",
+            hovertemplate="%{x} · %{customdata}<br>%{y:+.3f} pp<extra>" + SERIES_LABELS[name] + "</extra>",
         ))
-    if not found:
+    if not plotted:
         return _empty("Contribution impact is unavailable.")
+    matrix = np.vstack(plotted)
+    positive = np.maximum(matrix, 0.0).sum(axis=0)
+    negative = np.minimum(matrix, 0.0).sum(axis=0)
     fig.update_layout(barmode="relative")
     fig.add_hline(y=0, line_width=1, line_color=TOKENS["hairline"])
     apply_short_horizon_axis(fig, labels)
-    return _layout(
-        fig,
-        f"h6-contrib::{payload.get('meta', {}).get('scenario_id')}::{horizon}",
-        "pp contribution impact · posterior mean",
-        430,
-    )
-
+    _symmetric_zero_axis(fig, positive, negative)
+    return _layout(fig, f"h6-contrib::{payload.get('meta', {}).get('scenario_id')}::{horizon}", "pp contribution impact · posterior mean", 430)
 
 def overlay_headline_conditional_forecast(
     fig: go.Figure,
@@ -352,9 +384,9 @@ def headline_scenarios_page() -> html.Div:
             ),
             html.Div(
                 [
-                    html.Label("Horizon", className="selector-label"),
+                    html.Label("Condition horizon", className="selector-label"),
                     dcc.Dropdown(
-                        id="h6-horizon",
+                        id="h6-condition-horizon",
                         options=[{"label": f"{x} months", "value": x} for x in HORIZONS],
                         value=3,
                         clearable=False,
@@ -364,17 +396,11 @@ def headline_scenarios_page() -> html.Div:
             ),
             html.Div(
                 [
-                    html.Label("Energy path", className="selector-label"),
+                    html.Label("Display horizon", className="selector-label"),
                     dcc.Dropdown(
-                        id="h6-energy-stat",
-                        options=[
-                            {
-                                "label": ("Posterior mean" if x == "mean" else x.upper()),
-                                "value": x,
-                            }
-                            for x in CONDITION_STATISTICS
-                        ],
-                        value="mean",
+                        id="h6-display-horizon",
+                        options=[{"label": f"{x} months", "value": x} for x in HORIZONS],
+                        value=6,
                         clearable=False,
                     ),
                 ],
@@ -393,7 +419,7 @@ def headline_scenarios_page() -> html.Div:
                         [
                             html.H2("Headline scenarios", className="page-title"),
                             html.P(
-                                "Condition the saved Headline BVAR directly, or propagate the live HICP Energy scenario into Headline.",
+                                "Apply a live Energy scenario to the saved Headline BVAR, or enter a manual component path. Conditioning and display horizons are independent.",
                                 className="page-subtitle",
                             ),
                         ]
@@ -414,8 +440,12 @@ def headline_scenarios_page() -> html.Div:
             ),
             html.Div(
                 [
-                    _panel_heading("Key scenario results", "Headline conditional effect by horizon", "Posterior means and paired uncertainty. M+1 / M+2 / M+3 are prioritised; M+6 / M+12 appear only when the selected condition horizon reaches them."),
-                    readable_table("h6-summary-table", PAIRED_EFFECT_COLUMNS, page_size=7),
+                    _panel_heading(
+                        "Key scenario results",
+                        "Headline conditional effect by display horizon",
+                        "The condition can end before the display horizon; later months then evolve endogenously inside the locked 12-month BVAR forecast.",
+                    ),
+                    readable_table("h6-summary-table", PAIRED_EFFECT_COLUMNS, page_size=12),
                 ],
                 className="panel table-panel",
             ),
@@ -425,22 +455,87 @@ def headline_scenarios_page() -> html.Div:
                         [
                             _panel_heading(
                                 "Energy → Headline bridge",
-                                "Linked scenario",
-                                "Hard same-vintage guard. Energy growth is transferred only when the Energy scenario and Headline posterior use the same processed vintage.",
+                                "Active Energy scenario",
+                                "Energy scenarios are detected automatically. Application to Headline remains an explicit Run action, with a hard same-vintage guard.",
+                            ),
+                            html.Label("Energy application", className="selector-label"),
+                            dcc.RadioItems(
+                                id="h6-energy-application-mode",
+                                options=[
+                                    {
+                                        "label": "Selected scenario only",
+                                        "value": "selected",
+                                    },
+                                    {
+                                        "label": "All active scenarios jointly",
+                                        "value": "joint",
+                                    },
+                                ],
+                                value="selected",
+                                inline=True,
+                                className="h6-inline-radio",
+                            ),
+                            html.Div(
+                                id="h6-joint-scenario-summary",
+                                className="placeholder-text",
+                            ),
+                            html.Label(
+                                "Selected Energy scenario · individual mode",
+                                className="selector-label",
+                            ),
+                            dcc.Dropdown(
+                                id="h6-energy-scenario-select",
+                                options=[],
+                                value=None,
+                                placeholder="No compatible active Energy scenario",
+                                clearable=False,
+                            ),
+                            html.Div(
+                                [
+                                    html.Div(
+                                        [
+                                            html.Label("Energy conditioning path", className="selector-label"),
+                                            dcc.Dropdown(
+                                                id="h6-energy-path-kind",
+                                                options=[
+                                                    {"label": "Posterior mean", "value": "mean"},
+                                                    {"label": "Pointwise percentile", "value": "percentile"},
+                                                ],
+                                                value="mean",
+                                                clearable=False,
+                                            ),
+                                        ],
+                                        className="selector-block",
+                                    ),
+                                    html.Div(
+                                        [
+                                            html.Label("Percentile (P01–P99)", className="selector-label"),
+                                            dcc.Input(
+                                                id="h6-energy-percentile",
+                                                type="number",
+                                                min=1,
+                                                max=99,
+                                                step=1,
+                                                value=50,
+                                                debounce=True,
+                                                style={"width": "100%"},
+                                            ),
+                                        ],
+                                        className="selector-block",
+                                    ),
+                                ],
+                                className="selectors-grid",
                             ),
                             html.P(
-                                "The selected Energy posterior summary (mean / q16 / q50 / q84) is converted to month-to-month HICP Energy growth and re-anchored on the latest observed Headline Energy index. Raw Energy index levels are never imposed on Headline.",
+                                "The conditioning statistic is selected after the Energy scenario package is constructed. In joint mode, all active Energy scenarios are first applied simultaneously and HICP Energy is aggregated draw by draw; only then is the posterior mean or requested pointwise percentile P01–P99 transferred to Headline. A percentile path need not correspond to one single Energy draw through time.",
                                 className="placeholder-text",
                             ),
                             html.Div(
-                                "Checking the active Energy scenario…",
+                                "Checking active Energy scenarios…",
                                 id="h6-bridge-readiness",
                                 className="selection-banner",
                             ),
-                            html.Div(
-                                id="h6-bridge-details",
-                                className="placeholder-text",
-                            ),
+                            html.Div(id="h6-bridge-details", className="placeholder-text"),
                             dcc.Link("Open Energy scenarios →", href="/scenarios", className="refresh-button"),
                         ],
                         className="panel",
@@ -450,7 +545,7 @@ def headline_scenarios_page() -> html.Div:
                             _panel_heading(
                                 "Manual conditioning",
                                 "Alternative component path",
-                                "Enter exactly H future values. The BVAR is still solved over 12 months; months after H remain latent and respond endogenously.",
+                                "Enter exactly the number of values in the Condition horizon. The BVAR is still solved over 12 months; later months remain latent and respond endogenously.",
                             ),
                             html.Div(
                                 [
@@ -487,7 +582,7 @@ def headline_scenarios_page() -> html.Div:
                             html.Label("Future values", className="selector-label"),
                             dcc.Textarea(
                                 id="h6-manual-values",
-                                placeholder="Example for 3 months: 2.5, 2.2, 2.0",
+                                placeholder="Example for a 3-month condition: 2.5, 2.2, 2.0",
                                 className="h6-path-input",
                             ),
                         ],
@@ -505,10 +600,10 @@ def headline_scenarios_page() -> html.Div:
             ),
             html.Div(
                 [
-                    _panel_heading("Baseline vs conditional", "Headline HICP — year-on-year"),
+                    _panel_heading("Baseline vs conditional", "Headline HICP — year-on-year", "Latest observed Headline is shown as the common anchor; future months use +1m / +2m / … labels."),
                     dcc.Loading(dcc.Graph(id="h6-main", config=graph_config("headline_scenario_main")), type="circle"),
                     html.P(
-                        "For linked Energy scenarios, the conditioning path is fixed at the selected Energy posterior summary (mean / q16 / q50 / q84). Energy-path uncertainty itself is not propagated into the Headline conditional fan, so a narrower conditional band must not be interpreted as an economic reduction in uncertainty.",
+                        "The Headline conditional fan is conditional on the selected deterministic Energy path. Energy-path uncertainty is not integrated out; a narrower band must not be interpreted as a reduction in economic uncertainty.",
                         className="placeholder-text",
                     ),
                 ],
@@ -538,7 +633,7 @@ def headline_scenarios_page() -> html.Div:
                     _panel_heading(
                         "Exact additive decomposition",
                         "Change in component contributions",
-                        "Posterior means are shown; quantile bands elsewhere remain quantile intervals.",
+                        "Posterior means are shown. Impact axes are symmetric around zero to preserve sign and scale.",
                     ),
                     dcc.Loading(dcc.Graph(id="h6-contributions", config=graph_config("headline_scenario_contributions")), type="circle"),
                 ],
@@ -547,7 +642,6 @@ def headline_scenarios_page() -> html.Div:
         ],
         className="page-body headline-page",
     )
-
 
 def _headline_identity(store: dict | None) -> dict[str, str]:
     meta = dict((store or {}).get("meta") or {})
@@ -564,164 +658,554 @@ def _headline_identity(store: dict | None) -> dict[str, str]:
     }
 
 
+
+def _energy_statistic(path_kind: str | None, percentile) -> str:
+    if str(path_kind or "mean") == "mean":
+        return "mean"
+    try:
+        value = int(percentile)
+    except (TypeError, ValueError) as exc:
+        raise HeadlineConditionalError("Energy percentile must be an integer from 1 to 99.") from exc
+    if value < 1 or value > 99:
+        raise HeadlineConditionalError("Energy percentile must lie in P01..P99.")
+    return f"p{value:02d}"
+
+
+def _conditional_payloads(store: dict | None) -> list[tuple[str, dict]]:
+    rows = []
+    for model_id, item in dict((store or {}).get("items") or {}).items():
+        payload = dict((item or {}).get("payload") or {})
+        if payload:
+            rows.append((str(model_id), payload))
+    return rows
+
+
+def _conditional_refresh_spec(
+    payload: dict | None,
+    headline_vintage: str | None,
+) -> tuple[dict | None, str | None]:
+    """Return the saved-scenario recipe needed to rebuild a stale bridge.
+
+    Legacy conditional-store payloads retain the exact aggregate/model/path
+    recipe. That is enough to replay the persisted Energy posterior and
+    materialise the current Headline bridge without running Gibbs again.
+    """
+    meta = dict((payload or {}).get("meta") or {})
+    vintage = str(meta.get("vintage") or "")
+    if not vintage:
+        return None, "Energy scenario vintage is missing"
+    if headline_vintage and vintage != str(headline_vintage):
+        return None, f"vintage {vintage} ≠ Headline {headline_vintage}"
+
+    required = {
+        "aggregate_run_id": meta.get("aggregate_run_id"),
+        "model_id": meta.get("model_id"),
+        "condition_variable": meta.get("condition_variable"),
+        "path_mode": meta.get("path_mode"),
+        "path_value": meta.get("path_value"),
+    }
+    missing = [key for key, value in required.items() if value in (None, "")]
+    if missing:
+        return None, "legacy scenario metadata missing " + ", ".join(missing)
+    try:
+        path_value = float(required["path_value"])
+    except (TypeError, ValueError):
+        return None, "legacy scenario path_value is invalid"
+    if not np.isfinite(path_value):
+        return None, "legacy scenario path_value is non-finite"
+
+    return {
+        "vintage": vintage,
+        "aggregate_run_id": str(required["aggregate_run_id"]),
+        "model_id": str(required["model_id"]),
+        "condition_variable": str(required["condition_variable"]),
+        "path_mode": str(required["path_mode"]),
+        "path_value": path_value,
+    }, None
+
+
+def _candidate_record(
+    candidate_id: str,
+    label: str,
+    payload: dict,
+    headline_vintage: str,
+    *,
+    allow_conditional_refresh: bool = False,
+) -> dict:
+    bridge = dict((payload or {}).get("headline_bridge") or {})
+    bridge_vintage = str(bridge.get("vintage") or "")
+    contract_ok = (
+        str(bridge.get("contract") or "") == ENERGY_BRIDGE_CONTRACT_VERSION
+    )
+    active = bool(bridge.get("scenario_active", False))
+    same = bool(headline_vintage) and bridge_vintage == str(headline_vintage)
+
+    refresh_spec = None
+    refresh_reason = None
+    if allow_conditional_refresh and (not contract_ok or not bridge):
+        refresh_spec, refresh_reason = _conditional_refresh_spec(
+            payload,
+            headline_vintage,
+        )
+
+    refreshable = refresh_spec is not None
+    enabled = (contract_ok and active and same) or refreshable
+    reason = None
+    refresh_on_apply = False
+
+    if refreshable:
+        refresh_on_apply = True
+    elif not bridge:
+        reason = (
+            refresh_reason
+            or "Headline bridge cannot be reconstructed from this scenario"
+        )
+    elif not contract_ok:
+        reason = (
+            refresh_reason
+            or "stale bridge cannot be reconstructed automatically"
+        )
+    elif not active:
+        reason = "scenario is not active"
+    elif headline_vintage and not same:
+        reason = (
+            f"vintage {bridge_vintage or 'missing'} ≠ "
+            f"Headline {headline_vintage}"
+        )
+
+    if enabled and refresh_on_apply:
+        shown = label + " · bridge refreshes automatically on Apply"
+    else:
+        shown = label + ("" if enabled else f" · BLOCKED: {reason}")
+
+    return {
+        "id": candidate_id,
+        "label": shown,
+        "payload": payload,
+        "bridge": bridge,
+        "enabled": enabled,
+        "reason": reason,
+        "refresh_on_apply": refresh_on_apply,
+        "refresh_spec": refresh_spec,
+    }
+
+
+def _energy_scenario_candidates(
+    conditional_store: dict | None,
+    aggregate_store: dict | None,
+    headline_store: dict | None,
+) -> list[dict]:
+    headline_vintage = _headline_identity(headline_store).get("vintage", "")
+    out = []
+
+    for model_id, payload in _conditional_payloads(conditional_store):
+        meta = dict(payload.get("meta") or {})
+        bridge = dict(payload.get("headline_bridge") or {})
+        label = str(
+            bridge.get("source_label")
+            or (
+                f"Conditional · {meta.get('model_label') or model_id} · "
+                f"{meta.get('condition_description') or meta.get('condition_variable') or ''}"
+            )
+        ).strip(" ·")
+        out.append(
+            _candidate_record(
+                f"conditional::{model_id}",
+                label,
+                payload,
+                headline_vintage,
+                allow_conditional_refresh=True,
+            )
+        )
+
+    aggregate_bridge = dict(
+        (aggregate_store or {}).get("headline_bridge") or {}
+    )
+    if aggregate_store and (
+        aggregate_bridge or bool((aggregate_store or {}).get("meta"))
+    ):
+        components = list(
+            aggregate_bridge.get("scenario_components") or []
+        )
+        component_text = (
+            ", ".join(str(x).replace("_", " ") for x in components)
+            or "active tax set"
+        )
+        label = str(
+            aggregate_bridge.get("source_label")
+            or f"Tax scenario set · {component_text}"
+        )
+        out.append(
+            _candidate_record(
+                "tax::aggregate",
+                label,
+                dict(aggregate_store or {}),
+                headline_vintage,
+            )
+        )
+    return out
+
+
+def _selected_energy_scenario_record(
+    conditional_store: dict | None,
+    aggregate_store: dict | None,
+    headline_store: dict | None,
+    selected_id: str | None,
+) -> dict | None:
+    for row in _energy_scenario_candidates(
+        conditional_store,
+        aggregate_store,
+        headline_store,
+    ):
+        if str(row["id"]) == str(selected_id) and row["enabled"]:
+            return dict(row)
+    return None
+
+
+def _selected_energy_scenario_payload(
+    conditional_store: dict | None,
+    aggregate_store: dict | None,
+    headline_store: dict | None,
+    selected_id: str | None,
+) -> dict | None:
+    row = _selected_energy_scenario_record(
+        conditional_store,
+        aggregate_store,
+        headline_store,
+        selected_id,
+    )
+    return None if row is None else dict(row["payload"])
+
+
+def _ensure_current_energy_bridge(
+    row: dict,
+    *,
+    results_root: Path,
+    project_root: str | Path | None,
+) -> tuple[dict, bool]:
+    """Materialise a missing/stale conditional bridge from saved results.
+
+    Returns ``(payload, rebuilt)``. ``compute_conditional_scenario`` reloads
+    and replays persisted posterior draws; it does not run the Gibbs sampler.
+    """
+    payload = dict(row.get("payload") or {})
+    bridge = dict(payload.get("headline_bridge") or {})
+    if (
+        str(bridge.get("contract") or "")
+        == ENERGY_BRIDGE_CONTRACT_VERSION
+    ):
+        return payload, False
+
+    if not bool(row.get("refresh_on_apply")):
+        raise HeadlineConditionalError(
+            str(
+                row.get("reason")
+                or "Selected Energy bridge is not usable."
+            )
+        )
+
+    spec = dict(row.get("refresh_spec") or {})
+    if not spec:
+        raise HeadlineConditionalError(
+            "Selected legacy Energy scenario has no reconstructible "
+            "bridge recipe."
+        )
+
+    aggregate_dir = (
+        Path(results_root)
+        / "hicp_energy_aggregate"
+        / str(spec["vintage"])
+        / str(spec["aggregate_run_id"])
+    )
+    if not aggregate_dir.is_dir():
+        raise HeadlineConditionalError(
+            "Cannot rebuild the Headline bridge because the saved Energy "
+            f"aggregate is missing: {aggregate_dir}"
+        )
+
+    root = (
+        Path(project_root).resolve()
+        if project_root is not None
+        else Path(results_root).resolve().parent
+    )
+    fresh = compute_conditional_scenario(
+        aggregate_dir,
+        project_root=root,
+        model_id=str(spec["model_id"]),
+        condition_variable=str(spec["condition_variable"]),
+        path_mode=str(spec["path_mode"]),
+        path_value=float(spec["path_value"]),
+    )
+
+    new_bridge = dict((fresh or {}).get("headline_bridge") or {})
+    if (
+        str(new_bridge.get("contract") or "")
+        != ENERGY_BRIDGE_CONTRACT_VERSION
+    ):
+        raise HeadlineConditionalError(
+            "Automatic Energy bridge refresh completed without the "
+            f"current {ENERGY_BRIDGE_CONTRACT_VERSION} contract."
+        )
+    return dict(fresh), True
+
+
 def _bridge_readiness_state(
     headline_store: dict | None,
-    energy_store: dict | None,
+    energy_payload: dict | None,
     *,
     source: str | None,
     horizon: int | None,
     statistic: str | None,
 ) -> dict[str, object]:
-    """Cheap UI precheck; the hard bridge guards remain model-owned."""
+    """Cheap UI precheck; model-owned hard guards still run on explicit Run."""
     if str(source or "energy") != "energy":
-        return {
-            "ready": True,
-            "level": "info",
-            "title": "Manual conditioning mode",
-            "detail": "The Energy → Headline bridge is not required for this run.",
-        }
-
+        return {"ready": True, "level": "info", "title": "Manual conditioning mode", "detail": "The Energy → Headline bridge is not required for this run."}
     headline = _headline_identity(headline_store)
-    if (
-        headline["model_id"] != "headline_joint"
-        or not headline["vintage"]
-        or not headline["run_id"]
-    ):
-        return {
-            "ready": False,
-            "level": "wait",
-            "title": "Waiting for a Headline run",
-            "detail": "Select a complete Headline HICP saved run before using the linked Energy scenario.",
-        }
-
-    if not energy_store:
-        return {
-            "ready": False,
-            "level": "wait",
-            "title": "No active Energy scenario",
-            "detail": (
-                "Open Energy scenarios, configure and propagate a scenario, then return here. "
-                "The live scenario stays in dashboard memory while the app remains open."
-            ),
-        }
-
-    bridge = dict((energy_store or {}).get("headline_bridge") or {})
-    if not bridge:
-        return {
-            "ready": False,
-            "level": "error",
-            "title": "Energy scenario has no Headline bridge",
-            "detail": (
-                "The live Energy payload predates the current Headline bridge contract. "
-                "Recompute the Energy scenario with the current dashboard."
-            ),
-        }
-
+    if headline["model_id"] != "headline_joint" or not headline["vintage"] or not headline["run_id"]:
+        return {"ready": False, "level": "wait", "title": "Waiting for a Headline run", "detail": "Select a complete Headline HICP run first."}
+    if not energy_payload:
+        return {"ready": False, "level": "wait", "title": "Select an active Energy scenario", "detail": "Active Energy scenarios are listed above. If a conditional scenario says BLOCKED/stale, update it once on the Energy Scenarios page."}
+    bridge = dict((energy_payload or {}).get("headline_bridge") or {})
     if str(bridge.get("contract") or "") != ENERGY_BRIDGE_CONTRACT_VERSION:
-        return {
-            "ready": False,
-            "level": "error",
-            "title": "Stale Energy bridge contract",
-            "detail": (
-                f"Expected {ENERGY_BRIDGE_CONTRACT_VERSION}; "
-                f"received {bridge.get('contract') or 'missing'}. Recompute the Energy scenario."
-            ),
-        }
-
+        return {"ready": False, "level": "error", "title": "Stale Energy bridge contract", "detail": f"Expected {ENERGY_BRIDGE_CONTRACT_VERSION}. Recompute the selected Energy scenario."}
     if not bool(bridge.get("scenario_active", False)):
-        return {
-            "ready": False,
-            "level": "wait",
-            "title": "Energy aggregate has no active scenario",
-            "detail": "Configure at least one Energy scenario component and propagate it before running Headline.",
-        }
-
+        return {"ready": False, "level": "wait", "title": "Energy scenario is inactive", "detail": "Activate/recompute the scenario before applying it to Headline."}
     energy_vintage = str(bridge.get("vintage") or "")
     if energy_vintage != headline["vintage"]:
-        return {
-            "ready": False,
-            "level": "error",
-            "title": "Vintage mismatch",
-            "detail": (
-                f"Headline={headline['vintage']} · Energy={energy_vintage or 'missing'}. "
-                "The bridge is intentionally blocked until both use the same processed vintage."
-            ),
-        }
-
+        return {"ready": False, "level": "error", "title": "Vintage mismatch", "detail": f"Headline={headline['vintage']} · Energy={energy_vintage or 'missing'}. Cross-vintage conditioning is blocked."}
     stat = str(statistic or "mean")
-    values = ((bridge.get("scenario_level") or {}).get(stat))
+    values = dict(bridge.get("scenario_level") or {}).get(stat)
     dates = list(bridge.get("dates") or [])
     if values is None:
-        return {
-            "ready": False,
-            "level": "error",
-            "title": f"Energy path {stat} is missing",
-            "detail": "Recompute the Energy scenario with the current bridge contract.",
-        }
-
+        return {"ready": False, "level": "error", "title": f"Energy path {stat.upper()} is missing", "detail": "Recompute the Energy scenario with the current bridge contract."}
     try:
         path = np.asarray(values, dtype=float)
         idx = pd.DatetimeIndex(pd.to_datetime(dates))
     except Exception as exc:
-        return {
-            "ready": False,
-            "level": "error",
-            "title": "Energy bridge path is unreadable",
-            "detail": str(exc),
-        }
-
-    if path.ndim != 1 or len(path) != len(idx) or len(path) < 2:
-        return {
-            "ready": False,
-            "level": "error",
-            "title": "Energy bridge path is incomplete",
-            "detail": (
-                f"dates={len(idx)} · {stat} values={len(path)}. "
-                "At least two aligned monthly levels are required to form month-to-month growth."
-            ),
-        }
-    if not np.isfinite(path).all():
-        return {
-            "ready": False,
-            "level": "error",
-            "title": "Energy bridge contains non-finite levels",
-            "detail": f"The selected {stat} path contains NaN/inf.",
-        }
-
+        return {"ready": False, "level": "error", "title": "Energy bridge path is unreadable", "detail": str(exc)}
+    if path.ndim != 1 or len(path) != len(idx) or len(path) < 2 or not np.isfinite(path).all():
+        return {"ready": False, "level": "error", "title": "Energy bridge path is incomplete", "detail": f"dates={len(idx)} · values={len(path)}. Aligned finite monthly levels are required."}
     monthly = idx.to_period("M")
-    if monthly.has_duplicates:
-        return {
-            "ready": False,
-            "level": "error",
-            "title": "Energy bridge contains duplicate months",
-            "detail": "Recompute the Energy scenario before conditioning Headline.",
-        }
-    if not monthly.is_monotonic_increasing:
-        return {
-            "ready": False,
-            "level": "error",
-            "title": "Energy bridge calendar is not ordered",
-            "detail": "Recompute the Energy scenario before conditioning Headline.",
-        }
-
+    if monthly.has_duplicates or not monthly.is_monotonic_increasing:
+        return {"ready": False, "level": "error", "title": "Energy bridge calendar is invalid", "detail": "Recompute the Energy scenario."}
     components = list(bridge.get("scenario_components") or [])
     aggregate_run_id = str(bridge.get("aggregate_run_id") or "")
     n_draws = bridge.get("n_draws")
-    H = int(horizon or 3)
-
-    component_text = ", ".join(map(str, components)) if components else "active aggregate scenario"
+    source_label = str(bridge.get("source_label") or bridge.get("source_kind") or "Energy scenario")
+    component_text = ", ".join(map(str, components)) if components else "aggregate scenario"
     draw_text = "—" if n_draws is None else f"{int(n_draws):,}"
+    path_text = "posterior mean" if stat == "mean" else f"pointwise {stat.upper()}"
+    H = int(horizon or 3)
     return {
         "ready": True,
         "level": "ready",
         "title": f"Bridge ready · vintage {headline['vintage']}",
         "detail": (
-            f"Energy aggregate {aggregate_run_id[:12] or '—'} · {component_text} · "
-            f"{draw_text} Energy aggregate draws · path={stat} · condition H={H}m. "
-            "On Run, exact target-calendar coverage, the historical ratio diagnostic, "
-            "same-vintage guard and bit-identical Headline baseline are revalidated."
+            f"{source_label} · Energy aggregate {aggregate_run_id[:12] or '—'} · {component_text} · "
+            f"{draw_text} Energy draws · {path_text} · condition H={H}m. "
+            "The percentile is computed directly from Energy draws month by month; same-vintage, calendar coverage, ratio diagnostics and baseline identity are revalidated on Run."
         ),
     }
+
+def _joint_energy_recipe(
+    conditional_store: dict | None,
+    tax_store: dict | None,
+    aggregate_store: dict | None,
+    headline_store: dict | None,
+) -> dict[str, object]:
+    """Resolve all active Energy scenarios into one same-vintage package."""
+    headline_vintage = _headline_identity(
+        headline_store
+    ).get("vintage", "")
+    if not headline_vintage:
+        raise HeadlineConditionalError(
+            "No Headline vintage is loaded."
+        )
+
+    conditional_specs = []
+    labels = []
+    aggregate_ids = set()
+    for model_id, payload in _conditional_payloads(
+        conditional_store
+    ):
+        spec, reason = _conditional_refresh_spec(
+            payload,
+            headline_vintage,
+        )
+        if spec is None:
+            raise HeadlineConditionalError(
+                f"Conditional {model_id}: {reason or 'scenario recipe is unavailable'}."
+            )
+        conditional_specs.append(spec)
+        aggregate_ids.add(str(spec["aggregate_run_id"]))
+        meta = dict((payload or {}).get("meta") or {})
+        labels.append(
+            "Conditional · "
+            + str(meta.get("model_label") or model_id)
+            + " · "
+            + str(
+                meta.get("condition_description")
+                or meta.get("condition_variable")
+                or ""
+            )
+        )
+
+    tax_scenarios = scenario_set_to_tax_scenarios(
+        tax_store
+    )
+    tax_rows = scenario_set_summary(tax_store)
+    if tax_scenarios:
+        tax_vintage = str(
+            (tax_store or {}).get("vintage") or ""
+        )
+        if (
+            tax_vintage
+            and tax_vintage != str(headline_vintage)
+        ):
+            raise HeadlineConditionalError(
+                f"Tax scenario vintage {tax_vintage} ≠ Headline {headline_vintage}."
+            )
+        aggregate_meta = dict(
+            (aggregate_store or {}).get("meta") or {}
+        )
+        tax_aggregate_id = str(
+            aggregate_meta.get("aggregate_run_id") or ""
+        )
+        if tax_aggregate_id:
+            aggregate_ids.add(tax_aggregate_id)
+        elif not aggregate_ids:
+            raise HeadlineConditionalError(
+                "Active tax scenarios require the live HICP Energy aggregate "
+                "for the same vintage."
+            )
+        for row in tax_rows:
+            vat = float(row.get("vat_delta_pp", 0.0) or 0.0)
+            exc = float(row.get("excise_delta", 0.0) or 0.0)
+            if abs(vat) < 1e-15 and abs(exc) < 1e-15:
+                continue
+            labels.append(
+                "Tax · "
+                + str(row.get("label") or row.get("model_id"))
+                + f" · VAT {vat:+.2f} pp"
+                + (
+                    ""
+                    if abs(exc) < 1e-15
+                    else (
+                        f", excise {exc:+.3f} "
+                        + str(row.get("excise_unit") or "")
+                    )
+                )
+            )
+
+    count = len(conditional_specs) + len(tax_scenarios)
+    if count < 1:
+        raise HeadlineConditionalError(
+            "No active Energy scenario is available for joint application."
+        )
+    if len(aggregate_ids) != 1:
+        raise HeadlineConditionalError(
+            "All active Energy scenarios must refer to one common HICP Energy "
+            "aggregate run. Active aggregate ids: "
+            + ", ".join(sorted(aggregate_ids))
+        )
+    aggregate_run_id = next(iter(aggregate_ids))
+    return {
+        "vintage": str(headline_vintage),
+        "aggregate_run_id": aggregate_run_id,
+        "conditional_specs": conditional_specs,
+        "tax_scenarios": tax_scenarios,
+        "labels": labels,
+        "scenario_count": int(count),
+    }
+
+
+def _joint_summary_children(recipe: dict[str, object] | None):
+    if not recipe:
+        return html.Span(
+            "Joint mode uses every compatible active Energy scenario."
+        )
+    labels = list(recipe.get("labels") or [])
+    return html.Div(
+        [
+            html.Strong(
+                f"{int(recipe.get('scenario_count') or 0)} active Energy scenario"
+                + (
+                    "s"
+                    if int(recipe.get("scenario_count") or 0) != 1
+                    else ""
+                )
+                + " in joint package"
+            ),
+            html.Ul(
+                [html.Li(str(label)) for label in labels],
+                style={
+                    "margin": "6px 0 0 18px",
+                    "padding": "0",
+                },
+            ),
+            html.Div(
+                "No marginal Headline effects are added. The component scenarios "
+                "are combined first and HICP Energy is chain-linked once, draw by draw.",
+                style={"marginTop": "6px"},
+            ),
+        ]
+    )
+
+
+def _bridge_readiness_for_record(
+    headline_store: dict | None,
+    row: dict | None,
+    *,
+    source: str | None,
+    horizon: int | None,
+    statistic: str | None,
+) -> dict[str, object]:
+    if str(source or "energy") != "energy":
+        return _bridge_readiness_state(
+            headline_store,
+            None,
+            source=source,
+            horizon=horizon,
+            statistic=statistic,
+        )
+
+    if row and bool(row.get("refresh_on_apply")):
+        headline = _headline_identity(headline_store)
+        spec = dict(row.get("refresh_spec") or {})
+        H = int(horizon or 3)
+        stat = str(statistic or "mean")
+        path_text = (
+            "posterior mean"
+            if stat == "mean"
+            else f"pointwise {stat.upper()}"
+        )
+        base_label = str(
+            row.get("label") or "Energy conditional scenario"
+        ).split(" · bridge refreshes")[0]
+        return {
+            "ready": True,
+            "level": "ready",
+            "title": (
+                "Legacy Energy scenario ready · vintage "
+                f"{headline.get('vintage') or '—'}"
+            ),
+            "detail": (
+                f"{base_label} · Energy aggregate "
+                f"{str(spec.get('aggregate_run_id') or '')[:12] or '—'} · "
+                f"{path_text} · condition H={H}m. The current Headline "
+                "bridge will be rebuilt automatically from the saved Energy "
+                "posterior when you click Run; Gibbs is not re-estimated."
+            ),
+        }
+
+    payload = None if row is None else dict(row.get("payload") or {})
+    return _bridge_readiness_state(
+        headline_store,
+        payload,
+        source=source,
+        horizon=horizon,
+        statistic=statistic,
+    )
 
 
 def _bridge_status_children(state: dict[str, object]):
@@ -783,8 +1267,117 @@ def register_headline_slice6_callbacks(
     project_root=None,
     store_id="data-store",
     energy_scenario_store_id="agg-scenario-store",
+    energy_conditional_store_id="conditional-store",
+    energy_tax_store_id="scenario-store",
+    energy_joint_store_id="joint-energy-scenario-store",
 ):
     results_root = Path(results_root).resolve()
+
+    @app.callback(
+        Output("h6-energy-scenario-select", "options"),
+        Output("h6-energy-scenario-select", "value"),
+        Input(energy_conditional_store_id, "data"),
+        Input(energy_scenario_store_id, "data"),
+        Input(store_id, "data"),
+        State("h6-energy-scenario-select", "value"),
+    )
+    def energy_scenario_options(conditional_store, aggregate_store, headline_store, current):
+        rows = _energy_scenario_candidates(conditional_store, aggregate_store, headline_store)
+        options = [
+            {"label": row["label"], "value": row["id"], "disabled": not row["enabled"]}
+            for row in rows
+        ]
+        enabled = [row["id"] for row in rows if row["enabled"]]
+        value = current if current in enabled else (enabled[0] if enabled else None)
+        return options, value
+
+    @app.callback(
+        Output("h6-energy-scenario-select", "disabled"),
+        Output("h6-joint-scenario-summary", "children"),
+        Input("h6-energy-application-mode", "value"),
+        Input(energy_conditional_store_id, "data"),
+        Input(energy_tax_store_id, "data"),
+        Input(energy_scenario_store_id, "data"),
+        Input(energy_joint_store_id, "data"),
+        Input(store_id, "data"),
+    )
+    def energy_application_mode_ui(
+        mode,
+        conditional_store,
+        tax_store,
+        aggregate_store,
+        joint_store,
+        headline_store,
+    ):
+        joint = str(mode or "selected") == "joint"
+        if not joint:
+            return False, html.Span(
+                "Individual mode applies only the scenario selected below."
+            )
+        payload = dict(joint_store or {})
+        meta = dict(payload.get("meta") or {})
+        headline_vintage = str(
+            _headline_identity(headline_store).get("vintage") or ""
+        )
+        joint_vintage = str(meta.get("vintage") or "")
+        if (
+            payload.get("ok")
+            and headline_vintage
+            and joint_vintage == headline_vintage
+        ):
+            labels = list(
+                meta.get("dashboard_active_labels")
+                or []
+            )
+            return True, html.Div(
+                [
+                    html.Strong(
+                        f"Joint Energy scenario ready · "
+                        f"{int(meta.get('scenario_count', 0))} assumptions · "
+                        f"vintage {joint_vintage}"
+                    ),
+                    html.Ul(
+                        [
+                            html.Li(
+                                f"{item.get('kind', 'Scenario')} · "
+                                f"{item.get('component', '')} · "
+                                f"{item.get('detail', '')}"
+                            )
+                            for item in labels
+                        ],
+                        style={
+                            "margin": "6px 0 0 18px",
+                            "padding": "0",
+                        },
+                    ),
+                    html.Div(
+                        "This is the joint HICP Energy distribution already built "
+                        "in Energy → Scenarios; Headline will only select its mean "
+                        "or requested Pxx conditioning path.",
+                        style={"marginTop": "6px"},
+                    ),
+                ]
+            )
+        return True, html.Div(
+            [
+                html.Strong("Joint Energy scenario not built for this vintage. "),
+                dcc.Link(
+                    "Open Energy scenarios →",
+                    href="/scenarios",
+                ),
+                html.Span(
+                    " Build / refresh the Joint Energy scenario there first."
+                ),
+            ],
+            style={"color": "#991b1b"},
+        )
+
+    @app.callback(
+        Output("h6-energy-percentile", "disabled"),
+        Input("h6-energy-path-kind", "value"),
+    )
+    def percentile_enabled(path_kind):
+        return str(path_kind or "mean") == "mean"
 
     @app.callback(
         Output("h6-bridge-readiness", "children"),
@@ -792,32 +1385,100 @@ def register_headline_slice6_callbacks(
         Output("h6-bridge-details", "children"),
         Output("h6-run", "disabled"),
         Input(store_id, "data"),
+        Input(energy_conditional_store_id, "data"),
+        Input(energy_tax_store_id, "data"),
         Input(energy_scenario_store_id, "data"),
+        Input(energy_joint_store_id, "data"),
+        Input("h6-energy-scenario-select", "value"),
+        Input("h6-energy-application-mode", "value"),
         Input("h6-source", "value"),
-        Input("h6-horizon", "value"),
-        Input("h6-energy-stat", "value"),
+        Input("h6-condition-horizon", "value"),
+        Input("h6-energy-path-kind", "value"),
+        Input("h6-energy-percentile", "value"),
     )
-    def bridge_readiness(headline_store, energy_store, source, H, energy_stat):
-        state = _bridge_readiness_state(
-            headline_store,
-            energy_store,
-            source=source,
-            horizon=H,
-            statistic=energy_stat,
-        )
+    def bridge_readiness(
+        headline_store,
+        conditional_store,
+        tax_store,
+        aggregate_store,
+        joint_store,
+        selected_id,
+        application_mode,
+        source,
+        H,
+        path_kind,
+        percentile,
+    ):
+        try:
+            statistic = _energy_statistic(path_kind, percentile)
+        except Exception as exc:
+            state = {
+                "ready": False,
+                "level": "error",
+                "title": "Invalid Energy percentile",
+                "detail": str(exc),
+            }
+        else:
+            if (
+                str(source or "energy") == "energy"
+                and str(application_mode or "selected") == "joint"
+            ):
+                payload = dict(joint_store or {})
+                meta = dict(payload.get("meta") or {})
+                if not payload.get("ok"):
+                    state = {
+                        "ready": False,
+                        "level": "error",
+                        "title": "Joint Energy scenario not built",
+                        "detail": (
+                            "Open Energy → Scenarios and build / refresh the "
+                            "Joint Energy scenario first."
+                        ),
+                    }
+                else:
+                    state = _bridge_readiness_state(
+                        headline_store,
+                        payload,
+                        source=source,
+                        horizon=H,
+                        statistic=statistic,
+                    )
+                    if state.get("ready"):
+                        state["title"] = (
+                            "JOINT READY · "
+                            f"{int(meta.get('scenario_count', 0))} assumptions · "
+                            f"vintage {meta.get('vintage', '—')}"
+                        )
+                        state["detail"] = (
+                            str(state.get("detail") or "")
+                            + " · Source: pre-built Joint Energy scenario from "
+                            "Energy → Scenarios; Headline does not rebuild Energy."
+                        )
+            else:
+                row = _selected_energy_scenario_record(
+                    conditional_store,
+                    aggregate_store,
+                    headline_store,
+                    selected_id,
+                )
+                state = _bridge_readiness_for_record(
+                    headline_store,
+                    row,
+                    source=source,
+                    horizon=H,
+                    statistic=statistic,
+                )
         level = str(state.get("level") or "info")
         css = "banner-error" if level == "error" else "selection-banner"
         detail = (
             ""
             if level in {"error", "wait"}
-            else "The linked scenario uses the active in-memory Energy aggregate scenario; it never invents or auto-selects a tax scenario."
+            else (
+                "Detection is automatic; the selected or joint Energy package "
+                "is applied to Headline only when you click Run conditional forecast."
+            )
         )
-        return (
-            _bridge_status_children(state),
-            css,
-            detail,
-            not bool(state.get("ready", False)),
-        )
+        return _bridge_status_children(state), css, detail, not bool(state.get("ready", False))
 
     @app.callback(
         Output("h6-headline-scenario-store", "data"),
@@ -825,42 +1486,133 @@ def register_headline_slice6_callbacks(
         Input("h6-run", "n_clicks"),
         Input("h6-clear", "n_clicks"),
         State(store_id, "data"),
+        State(energy_conditional_store_id, "data"),
+        State(energy_tax_store_id, "data"),
         State(energy_scenario_store_id, "data"),
+        State(energy_joint_store_id, "data"),
+        State("h6-energy-scenario-select", "value"),
+        State("h6-energy-application-mode", "value"),
         State("h6-source", "value"),
-        State("h6-horizon", "value"),
-        State("h6-energy-stat", "value"),
+        State("h6-condition-horizon", "value"),
+        State("h6-energy-path-kind", "value"),
+        State("h6-energy-percentile", "value"),
         State("h6-manual-variable", "value"),
         State("h6-manual-metric", "value"),
         State("h6-manual-values", "value"),
         prevent_initial_call=True,
     )
     def run_or_clear(
-        run_clicks, clear_clicks, headline_store, energy_store, source, H,
-        energy_stat, manual_variable, manual_metric, manual_values,
+        run_clicks,
+        clear_clicks,
+        headline_store,
+        conditional_store,
+        tax_store,
+        aggregate_store,
+        joint_store,
+        selected_id,
+        application_mode,
+        source,
+        H,
+        path_kind,
+        percentile,
+        manual_variable,
+        manual_metric,
+        manual_values,
     ):
         from dash import ctx
-
         if ctx.triggered_id == "h6-clear":
             return None, "Conditional scenario cleared."
         if ctx.triggered_id != "h6-run" or not run_clicks:
             raise PreventUpdate
-
         try:
             H = int(H or 3)
             run_dir = _run_directory(results_root, headline_store)
             posterior = load_saved_headline_posterior(run_dir, project_root=project_root)
             target = future_dates_for_saved(posterior, H)
-
             if source == "energy":
-                values, lineage = energy_bridge_condition(
-                    energy_store or {},
-                    posterior=posterior,
-                    target_dates=target,
-                    statistic=energy_stat or "mean",
-                    project_root=project_root,
+                statistic = _energy_statistic(
+                    path_kind,
+                    percentile,
                 )
+                if str(application_mode or "selected") == "joint":
+                    energy_payload = dict(joint_store or {})
+                    if not energy_payload.get("ok"):
+                        raise HeadlineConditionalError(
+                            "Build / refresh the Joint Energy scenario in "
+                            "Energy → Scenarios before applying it to Headline."
+                        )
+                    values, lineage = energy_bridge_condition(
+                        energy_payload,
+                        posterior=posterior,
+                        target_dates=target,
+                        statistic=statistic,
+                        project_root=project_root,
+                    )
+                    joint_meta = dict(
+                        energy_payload.get("meta") or {}
+                    )
+                    lineage.update(
+                        {
+                            "source_type": "joint_energy_scenario",
+                            "energy_application_mode": "joint",
+                            "energy_joint_scenario_count": int(
+                                joint_meta.get("scenario_count", 0)
+                            ),
+                            "energy_joint_scenario_labels": list(
+                                joint_meta.get(
+                                    "dashboard_active_labels"
+                                )
+                                or []
+                            ),
+                            "energy_joint_contract": energy_payload.get(
+                                "contract_version"
+                            ),
+                            "energy_marginal_effects_summed": False,
+                            "energy_joint_source": (
+                                "prebuilt_energy_scenarios_workspace"
+                            ),
+                            "energy_headline_bridge_rebuilt_on_apply": False,
+                        }
+                    )
+                else:
+                    energy_row = _selected_energy_scenario_record(
+                        conditional_store,
+                        aggregate_store,
+                        headline_store,
+                        selected_id,
+                    )
+                    if energy_row is None:
+                        raise HeadlineConditionalError(
+                            "Select a compatible active Energy scenario."
+                        )
+                    energy_payload, bridge_rebuilt = _ensure_current_energy_bridge(
+                        energy_row,
+                        results_root=results_root,
+                        project_root=project_root,
+                    )
+                    values, lineage = energy_bridge_condition(
+                        energy_payload,
+                        posterior=posterior,
+                        target_dates=target,
+                        statistic=statistic,
+                        project_root=project_root,
+                    )
+                    lineage.update(
+                        {
+                            "energy_application_mode": "selected",
+                            "energy_scenario_selection_id": str(
+                                selected_id
+                            ),
+                            "energy_headline_bridge_rebuilt_on_apply": bool(
+                                bridge_rebuilt
+                            ),
+                        }
+                    )
                 conditions = {"hicp_energy": values}
-                lineage.update({"condition_metric": "level", "condition_variable": "hicp_energy"})
+                lineage.update({
+                    "condition_metric": "level",
+                    "condition_variable": "hicp_energy",
+                })
             else:
                 _, values = manual_condition_levels(
                     posterior,
@@ -878,6 +1630,15 @@ def register_headline_slice6_callbacks(
                     "energy_path_uncertainty_propagated": False,
                 }
 
+            official = pd.Series(posterior.inputs.official_total).astype(float).sort_index()
+            observed_yoy = 100.0 * (official / official.shift(12) - 1.0)
+            observed_yoy = observed_yoy.replace([np.inf, -np.inf], np.nan).dropna()
+            if not observed_yoy.empty:
+                lineage.update({
+                    "headline_observed_anchor_date": pd.Timestamp(observed_yoy.index[-1]).isoformat(),
+                    "headline_observed_anchor_yoy": float(observed_yoy.iloc[-1]),
+                })
+
             payload = run_saved_headline_conditional(
                 run_dir,
                 native_level_conditions=conditions,
@@ -887,23 +1648,27 @@ def register_headline_slice6_callbacks(
                 persist=True,
             )
             m = payload["meta"]
-            return payload, html.Div(
-                [
-                    html.Strong("Conditional complete"),
-                    html.Span(f" · {m['source_type']}"),
-                    html.Span(f" · vintage {m['headline_vintage']}"),
-                    html.Span(f" · {m['n_draws']} paired draws"),
-                    html.Span(f" · condition {m['condition_horizon']}m / compute {m['computational_horizon']}m"),
-                    html.Span(f" · lineage {m['lineage_verification_status']}"),
-                    html.Span(f" · run {str(m['headline_run_id'])[:12]}"),
-                    html.Span(" · BVAR re-estimation: NO"),
-                ]
-            )
+            path_note = ""
+            if m.get("source_type") in {
+                "energy_scenario",
+                "joint_energy_scenario",
+            }:
+                path_note = (
+                    f" · {m.get('condition_statistic_label', m.get('condition_statistic', ''))}"
+                )
+            return payload, html.Div([
+                html.Strong("Conditional complete"),
+                html.Span(f" · {m['source_type']}"),
+                html.Span(path_note),
+                html.Span(f" · vintage {m['headline_vintage']}"),
+                html.Span(f" · {m['n_draws']} paired Headline draws"),
+                html.Span(f" · condition {m['condition_horizon']}m / compute {m['computational_horizon']}m"),
+                html.Span(f" · lineage {m['lineage_verification_status']}"),
+                html.Span(f" · run {str(m['headline_run_id'])[:12]}"),
+                html.Span(" · BVAR re-estimation: NO"),
+            ])
         except Exception as exc:
-            return None, html.Div(
-                [html.Strong("Conditional failed: "), html.Span(str(exc))],
-                className="banner-error",
-            )
+            return None, html.Div([html.Strong("Conditional failed: "), html.Span(str(exc))], className="banner-error")
 
     @app.callback(
         Output("h6-kpi-1", "children"),
@@ -920,10 +1685,10 @@ def register_headline_slice6_callbacks(
         Output("h6-contributions", "figure"),
         Output("h6-summary-table", "data"),
         Input("h6-headline-scenario-store", "data"),
-        Input("h6-horizon", "value"),
+        Input("h6-display-horizon", "value"),
     )
-    def figures(payload, H):
-        h = int(H or 3)
+    def figures(payload, display_H):
+        h = int(display_H or 6)
         k = _impact_kpis(payload)
         block = (((payload or {}).get("fans") or {}).get("hicp_total") or {}).get("yoy") or {}
         table = paired_blocks_records(
@@ -941,7 +1706,6 @@ def register_headline_slice6_callbacks(
             contribution_impact_figure(payload, h),
             table,
         )
-
 
 __all__ = [
     "headline_scenarios_page",

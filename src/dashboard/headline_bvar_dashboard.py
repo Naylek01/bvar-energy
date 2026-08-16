@@ -685,7 +685,7 @@ def headline_contributions_page():
                         ],
                         className="panel-heading",
                     ),
-                    dash_table.DataTable(
+                    dash_table.DataTable(export_format="xlsx", export_headers="display", export_columns="all", 
                         id="headline-contrib-table",
                         columns=[
                             {"name": "Date", "id": "date"},
@@ -753,7 +753,7 @@ def headline_components_page():
                         ],
                         className="panel-heading",
                     ),
-                    dash_table.DataTable(
+                    dash_table.DataTable(export_format="xlsx", export_headers="display", export_columns="all", 
                         id="headline-components-table",
                         columns=[
                             {"name": "Component", "id": "component"},
@@ -1143,21 +1143,21 @@ def headline_diagnostics_page():
             html.Div(
                 [
                     html.Div([html.H3("Posterior roots by frequency", className="panel-title"), html.P("Stable near-roots at 6m and 3m are monitored rather than mechanically removed. The publication horizon remains capped at 12 months.", className="panel-subtitle")], className="panel-heading"),
-                    dash_table.DataTable(id="headline-root-table", columns=[{"name": "Frequency", "id": "frequency"}, {"name": "q05", "id": "q05", "type": "numeric"}, {"name": "Median", "id": "median", "type": "numeric"}, {"name": "q95", "id": "q95", "type": "numeric"}, {"name": "P(|λ|>.90)", "id": "p90", "type": "numeric"}, {"name": "P(|λ|>.95)", "id": "p95", "type": "numeric"}, {"name": "P(|λ|>.97)", "id": "p97", "type": "numeric"}], data=[], style_as_list_view=True, style_cell={"fontFamily": "Inter, Segoe UI, sans-serif"}, style_data_conditional=[{"if": {"filter_query": '{frequency} = "6m" || {frequency} = "3m"'}, "fontWeight": "700"}]),
+                    dash_table.DataTable(export_format="xlsx", export_headers="display", export_columns="all", id="headline-root-table", columns=[{"name": "Frequency", "id": "frequency"}, {"name": "q05", "id": "q05", "type": "numeric"}, {"name": "Median", "id": "median", "type": "numeric"}, {"name": "q95", "id": "q95", "type": "numeric"}, {"name": "P(|λ|>.90)", "id": "p90", "type": "numeric"}, {"name": "P(|λ|>.95)", "id": "p95", "type": "numeric"}, {"name": "P(|λ|>.97)", "id": "p97", "type": "numeric"}], data=[], style_as_list_view=True, style_cell={"fontFamily": "Inter, Segoe UI, sans-serif"}, style_data_conditional=[{"if": {"filter_query": '{frequency} = "6m" || {frequency} = "3m"'}, "fontWeight": "700"}]),
                 ],
                 className="panel table-panel",
             ),
             html.Div(
                 [
                     html.Div([html.H3("MCMC precision", className="panel-title"), html.P("Single-chain ESS and Monte Carlo standard error diagnostics for key SV/outlier/VAR parameters. No synthetic R-hat is reported.", className="panel-subtitle")], className="panel-heading"),
-                    dash_table.DataTable(id="headline-mcmc-table", columns=[{"name": "Parameter", "id": "parameter"}, {"name": "Posterior mean", "id": "mean", "type": "numeric"}, {"name": "Posterior sd", "id": "sd", "type": "numeric"}, {"name": "ESS", "id": "ess", "type": "numeric"}, {"name": "MCSE / sd", "id": "mcse_sd", "type": "numeric"}], data=[], page_size=14, sort_action="native", style_as_list_view=True, style_cell={"fontFamily": "Inter, Segoe UI, sans-serif"}),
+                    dash_table.DataTable(export_format="xlsx", export_headers="display", export_columns="all", id="headline-mcmc-table", columns=[{"name": "Parameter", "id": "parameter"}, {"name": "Posterior mean", "id": "mean", "type": "numeric"}, {"name": "Posterior sd", "id": "sd", "type": "numeric"}, {"name": "ESS", "id": "ess", "type": "numeric"}, {"name": "MCSE / sd", "id": "mcse_sd", "type": "numeric"}], data=[], page_size=14, sort_action="native", style_as_list_view=True, style_cell={"fontFamily": "Inter, Segoe UI, sans-serif"}),
                 ],
                 className="panel table-panel",
             ),
             html.Div(
                 [
                     html.Div([html.H3("Model-selection record", className="panel-title"), html.P("Frozen evidence behind the locked production specification.", className="panel-subtitle")], className="panel-heading"),
-                    dash_table.DataTable(
+                    dash_table.DataTable(export_format="xlsx", export_headers="display", export_columns="all", 
                         columns=[
                             {"name": "Prior-root control", "id": "metric"},
                             {"name": "Value", "id": "value"},
@@ -1185,7 +1185,7 @@ def headline_diagnostics_page():
             html.Div(
                 [
                     html.Div([html.H3("Accounting reconstruction", className="panel-title"), html.P("Headline history reconstructed from Energy/Food/NEIG/Services and annual Eurostat weights. These are data/aggregation diagnostics, not sampler diagnostics.", className="panel-subtitle")], className="panel-heading"),
-                    dash_table.DataTable(id="headline-validation-table", columns=[{"name": "Metric", "id": "metric"}, {"name": "Value", "id": "value", "type": "numeric"}], data=[], page_size=12, style_as_list_view=True, style_cell={"fontFamily": "Inter, Segoe UI, sans-serif"}),
+                    dash_table.DataTable(export_format="xlsx", export_headers="display", export_columns="all", id="headline-validation-table", columns=[{"name": "Metric", "id": "metric"}, {"name": "Value", "id": "value", "type": "numeric"}], data=[], page_size=12, style_as_list_view=True, style_cell={"fontFamily": "Inter, Segoe UI, sans-serif"}),
                     html.Div(
                         [
                             html.Strong("Specification record: "),

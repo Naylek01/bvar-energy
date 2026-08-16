@@ -40,7 +40,6 @@ from .heatmap import (
     style_figure_for_export,
 )
 from .monetary_policy import build_monetary_policy_snapshot
-from .climate import climate_section, register_climate_callbacks
 from inflation_table_contract import (
     ECONOMIC_CONDITIONS_COLUMNS,
     economic_conditions_records,
@@ -552,11 +551,11 @@ def economic_data_page():
                         "color": TOKENS["muted"],
                     }),
                     html.H1(
-                        "Economic Conditions, Climate & Central Banks",
+                        "Economic Conditions & Central Banks",
                         style={"margin": "4px 0 4px 0", "fontSize": "26px"},
                     ),
                     html.P(
-                        "Independent macro-data module: official ECB/BoE policy and liquidity, a GloFAS/PEGELONLINE climate-hydrology monitor, and the Haver Economic Conditions Heatmap.",
+                        "Independent macro-data module: official ECB/BoE policy and liquidity snapshots plus the Haver Economic Conditions Heatmap.",
                         style={"margin": 0, "color": TOKENS["muted"], "fontSize": "12px"},
                     ),
                 ],
@@ -610,8 +609,6 @@ def economic_data_page():
                 ],
                 style=PANEL_STYLE,
             ),
-
-            climate_section(),
 
             html.Div(
                 [
@@ -945,12 +942,6 @@ def register_callbacks(
 ):
     """Register every Economic Data callback on the host Dash app."""
     project_root = Path(project_root)
-
-    register_climate_callbacks(
-        app,
-        project_root=project_root,
-        registry_store_id=registry_store_id,
-    )
 
     @app.callback(
         Output("economic-policy-store", "data"),

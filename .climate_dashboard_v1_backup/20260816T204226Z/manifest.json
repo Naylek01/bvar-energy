@@ -1,0 +1,15 @@
+{
+  "patch_version": "climate-dashboard-v1-20260816",
+  "created_at_utc": "2026-08-16T20:42:26.732903+00:00",
+  "files": {
+    "requirements.txt": {
+      "sha256": "dc88b86846630fe1c0ad3358ab8539309b9ae815451d5ee07e221e4cbb34d563"
+    },
+    "src/dashboard/economic_data/feature.py": {
+      "sha256": "0e7ea4a8cf4a6a031ff9597d1d681314a190a75a0795eb622315f567666aba3c"
+    },
+    "src/dashboard/economic_data/climate.py": null,
+    "src/dashboard/economic_data/climate_data.py": null,
+    "tests/test_economic_data_climate.py": null
+  }
+}

@@ -258,17 +258,19 @@ def _tax_scenario_values(
     return values
 
 
+# ENERGY_SCENARIO_TAX_CUTS_V1
 def _validate_vat_percent(values: np.ndarray) -> None:
-    values = np.asarray(values, dtype=float)
-    if np.any((values < 0.0) | (values > 100.0)):
-        raise ValueError("VAT must be supplied in percentage points between 0 and 100.")
-    suspicious = (values > 0.0) & (values < 1.0)
-    if suspicious.any():
-        raise ValueError(
-            "VAT is expressed in percentage points: use 22.0 for 22%, not 0.22. "
-            "Values strictly between 0 and 1 are rejected to catch unit mistakes."
-        )
+    """Validate a VAT *level* expressed in percentage points.
 
+    Any finite value in [0, 100] is legitimate.  In particular, low positive
+    rates below 1% are valid scenario outcomes after a tax cut; unit mistakes
+    are prevented in the dashboard by showing baseline + delta -> final VAT.
+    """
+    values = np.asarray(values, dtype=float)
+    if not np.all(np.isfinite(values)):
+        raise ValueError("VAT must contain only finite percentage-point levels.")
+    if np.any((values < 0.0) | (values > 100.0)):
+        raise ValueError("VAT level must lie between 0 and 100 percentage points.")
 
 def _apply_monthly_tax_scenario(
     baseline_vat: pd.Series,

@@ -1,0 +1,28 @@
+# Core numerical stack
+numpy>=1.26.4,<3
+pandas>=2.2.0,<4
+scipy>=1.12.0,<2
+statsmodels>=0.14.1,<1
+matplotlib>=3.8.0,<4
+
+# Dashboard runtime
+dash>=4.4,<5
+plotly>=6.9,<7
+diskcache>=5.6,<6
+
+# Result serialization
+pyarrow>=15.0.0,<30
+
+# Data-pipeline dependencies
+openpyxl>=3.1.2,<4
+requests>=2.31.0,<3
+
+# Notebook and development environment
+ipykernel>=6.29.0,<8
+jupyter-core>=5.7.0,<6
+jupyterlab>=4.1.0,<5
+nbconvert>=7.16.0,<8
+pytest>=8.0.0,<9
+
+# Haver is desk-specific. Install it separately in the same .venv when needed:
+# python -m pip install haver

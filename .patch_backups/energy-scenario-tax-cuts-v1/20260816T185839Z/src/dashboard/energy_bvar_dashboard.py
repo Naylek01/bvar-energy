@@ -200,7 +200,6 @@ from energy_bvar_dashboard_structural import (  # noqa: E402
 )
 from energy_bvar_dashboard_conditional import (  # noqa: E402
     CONDITIONAL_CONTRACT_VERSION,
-    ConditionalScenarioError,
     clear_conditional_set,
     compute_conditional_scenario,
     compute_joint_energy_scenario,
@@ -1893,7 +1892,7 @@ def scenario_page() -> html.Div:
             ),
             html.Div(
                 [
-                    html.Label("VAT change (pp; − = cut)", className="control-label"),
+                    html.Label("VAT change (pp)", className="control-label"),
                     dcc.Input(
                         id="scenario-vat-delta",
                         type="number",
@@ -1909,7 +1908,7 @@ def scenario_page() -> html.Div:
                 [
                     html.Label(
                         id="scenario-excise-label",
-                        children="Excise change (− = cut)",
+                        children="Excise change",
                         className="control-label",
                     ),
                     dcc.Input(
@@ -9471,7 +9470,6 @@ def joint_energy_figures(payload, fan_mode):
     return main_fig, impact_fig, contribution_fig
 
 
-# ENERGY_SCENARIO_TAX_CUTS_V1
 # Tax-scenario page callbacks
 # ---------------------------------------------------------------------------
 
@@ -9604,48 +9602,20 @@ def _scenario_excise_plausibility_error(
     return None
 
 
-def _scenario_vat_delta_error(
-    *,
-    baseline_vat: float,
-    delta_vat: float,
-) -> str | None:
-    """Return an actionable error when a VAT delta leaves [0, 100]."""
-    baseline = float(baseline_vat)
-    delta = float(delta_vat)
-    result = baseline + delta
-    if result < -1e-12:
-        return (
-            f"VAT cut too large: baseline {baseline:.2f}% + "
-            f"({delta:+.2f} pp) = {result:.2f}%. Minimum allowed change is "
-            f"{-baseline:+.2f} pp (VAT = 0%)."
-        )
-    if result > 100.0 + 1e-12:
-        return (
-            f"VAT increase too large: baseline {baseline:.2f}% + "
-            f"({delta:+.2f} pp) = {result:.2f}%. Maximum allowed change is "
-            f"{100.0 - baseline:+.2f} pp (VAT = 100%)."
-        )
-    return None
-
-
 def _scenario_component_contract_for_row(
     vintage: str,
     model_id: str,
     row,
-    *,
-    start_date=None,
 ):
-    """Load the saved-run tax contract, optionally at a selected start date."""
+    """Load the saved-run tax-scenario contract once per frozen snapshot."""
     from energy_bvar_io import load_energy_bvar_forecast
 
     directory = Path(str(row["directory"]))
-    start_key = "default" if start_date is None else str(pd.Timestamp(start_date))
     key = (
         _registry_snapshot_id(),
         str(vintage),
         str(model_id),
         str(directory.resolve()),
-        start_key,
     )
 
     def _build():
@@ -9661,7 +9631,6 @@ def _scenario_component_contract_for_row(
             model_id,
             forecast,
             dataset_path=dataset,
-            start_date=start_date,
         )
 
     return snapshot_get_or_build(
@@ -9669,6 +9638,8 @@ def _scenario_component_contract_for_row(
         key,
         _build,
     )
+
+
 
 def _cached_conditional_aggregate_contract(directory: Path) -> dict:
     directory = Path(directory)
@@ -10413,7 +10384,7 @@ def scenario_component_options(vintage, forecast_name, _, current):
 def scenario_control_defaults(model_id, vintage, forecast_name, _, scenario_store):
     if not model_id or not vintage or not forecast_name:
         return (
-            None, None, None, 0.0, 0.0, "Excise change (− = cut)", 0.1,
+            None, None, None, 0.0, 0.0, "Excise change", 0.1,
             "No scenario-capable component forecast is available.",
             True, True, True,
         )
@@ -10421,7 +10392,7 @@ def scenario_control_defaults(model_id, vintage, forecast_name, _, scenario_stor
     row = _scenario_component_forecast_row(vintage, model_id, forecast_name)
     if row is None:
         return (
-            None, None, None, 0.0, 0.0, "Excise change (− = cut)", 0.1,
+            None, None, None, 0.0, 0.0, "Excise change", 0.1,
             f"{model_spec(model_id).label}: no unique saved forecast. "
             "Promote one run if several coexist.",
             True, True, True,
@@ -10433,13 +10404,16 @@ def scenario_control_defaults(model_id, vintage, forecast_name, _, scenario_stor
         )
     except Exception as exc:
         return (
-            None, None, None, 0.0, 0.0, "Excise change (− = cut)", 0.1,
+            None, None, None, 0.0, 0.0, "Excise change", 0.1,
             f"Scenario controls unavailable: {exc}",
             True, True, True,
         )
 
     existing = scenario_set_payload(scenario_store, model_id)
     em = dict((existing or {}).get("meta", {}) or {})
+    source_unit = str(contract.get("excise_unit", "source unit"))
+    display = _scenario_excise_display_spec(source_unit)
+
     frequency = str(contract.get("frequency", "monthly"))
     min_start = _normalise_scenario_period(contract["min_start"], frequency)
     max_start = _normalise_scenario_period(contract["max_start"], frequency)
@@ -10451,26 +10425,13 @@ def scenario_control_defaults(model_id, vintage, forecast_name, _, scenario_stor
     if start < min_start or start > max_start:
         start = default_start
 
-    try:
-        contract = _scenario_component_contract_for_row(
-            str(vintage), model_id, row, start_date=start
-        )
-    except Exception as exc:
-        return (
-            start.date(), min_start.date(), max_start.date(), 0.0, 0.0,
-            "Excise change (− = cut)", 0.1,
-            f"Scenario controls unavailable at {start.date()}: {exc}",
-            False, True, True,
-        )
-
-    source_unit = str(contract.get("excise_unit", "source unit"))
-    display = _scenario_excise_display_spec(source_unit)
     source_baseline = float(contract["baseline_excise_at_start"])
-    display_baseline = _scenario_excise_to_display(source_baseline, source_unit)
+    display_baseline = _scenario_excise_to_display(
+        source_baseline, source_unit
+    )
     stored_source_delta = float(em.get("excise_delta", 0.0) or 0.0)
-    display_delta = _scenario_excise_to_display(stored_source_delta, source_unit)
-    min_excise_display = _scenario_excise_to_display(
-        float(contract["excise_delta_min"]), source_unit
+    display_delta = _scenario_excise_to_display(
+        stored_source_delta, source_unit
     )
 
     freq_label = (
@@ -10483,6 +10444,7 @@ def scenario_control_defaults(model_id, vintage, forecast_name, _, scenario_stor
         if frequency == "weekly"
         else "VAT + excise tax bridge · "
     )
+
     conversion_note = ""
     if bool(display["scaled"]):
         conversion_note = (
@@ -10494,13 +10456,11 @@ def scenario_control_defaults(model_id, vintage, forecast_name, _, scenario_stor
         f"{model_spec(model_id).label} · run {str(row['run_id'])[:12]} · "
         f"available scenario window {min_start.date().isoformat()} — "
         f"{max_start.date().isoformat()} ({freq_label}) · "
-        f"{tax_source_note}baseline at selected start {start.date().isoformat()}: "
-        f"VAT {contract['baseline_vat_at_start']:.2f}% · excise "
-        f"{display_baseline:.2f} {display['display_unit']}. "
-        f"Negative changes are tax cuts. VAT may be cut by at most "
-        f"{abs(float(contract['vat_delta_min'])):.2f} pp; excise may be cut by "
-        f"at most {abs(min_excise_display):.2f} {display['display_unit']} (to zero)."
-        f"{conversion_note} Zero/zero removes the component from the active set."
+        f"{tax_source_note}baseline at first future period: VAT "
+        f"{contract['baseline_vat_at_start']:.2f}% · excise "
+        f"{display_baseline:.2f} {display['display_unit']}."
+        f"{conversion_note} Enter a non-zero VAT and/or excise change; "
+        "zero/zero removes the component from the active set."
     )
 
     return (
@@ -10509,7 +10469,7 @@ def scenario_control_defaults(model_id, vintage, forecast_name, _, scenario_stor
         max_start.date(),
         float(em.get("vat_delta_pp", 0.0) or 0.0),
         display_delta,
-        f"Excise change ({display['display_unit']}; − = cut)",
+        f"Excise change ({display['display_unit']})",
         float(display["step"]),
         note,
         False,
@@ -10517,15 +10477,12 @@ def scenario_control_defaults(model_id, vintage, forecast_name, _, scenario_stor
         False,
     )
 
+
 @callback(
     Output("scenario-tax-preview", "children"),
-    Output("scenario-vat-delta", "min"),
-    Output("scenario-vat-delta", "max"),
-    Output("scenario-excise-delta", "min"),
     Input("scenario-component-select", "value"),
     Input("vintage-select", "value"),
     Input("forecast-select", "value"),
-    Input("scenario-start-date", "date"),
     Input("scenario-vat-delta", "value"),
     Input("scenario-excise-delta", "value"),
     Input("registry-store", "data"),
@@ -10534,27 +10491,20 @@ def scenario_tax_input_preview(
     model_id,
     vintage,
     forecast_name,
-    start_date,
     vat_delta,
     excise_delta_display,
     _,
 ):
     if not model_id or not vintage or not forecast_name:
-        return (
-            "Select a scenario-capable component to preview the tax change.",
-            None, None, None,
-        )
+        return "Select a scenario-capable component to preview the tax change."
 
     row = _scenario_component_forecast_row(vintage, model_id, forecast_name)
     if row is None:
-        return (
-            "No unique saved component forecast is available.",
-            None, None, None,
-        )
+        return "No unique saved component forecast is available."
 
     try:
         contract = _scenario_component_contract_for_row(
-            str(vintage), model_id, row, start_date=start_date
+            str(vintage), model_id, row
         )
         source_unit = str(contract.get("excise_unit", "source unit"))
         display = _scenario_excise_display_spec(source_unit)
@@ -10573,46 +10523,25 @@ def scenario_tax_input_preview(
         base_vat = float(contract["baseline_vat_at_start"])
         delta_vat = float(vat_delta or 0.0)
         scenario_vat = base_vat + delta_vat
-        vat_guard = _scenario_vat_delta_error(
-            baseline_vat=base_vat,
-            delta_vat=delta_vat,
-        )
-        excise_guard = _scenario_excise_plausibility_error(
+        guard = _scenario_excise_plausibility_error(
             displayed_delta=delta_display,
             source_delta=delta_source,
             source_baseline=baseline_source,
             source_unit=source_unit,
         )
-        vat_min = float(contract["vat_delta_min"])
-        vat_max = float(contract["vat_delta_max"])
-        excise_min_display = _scenario_excise_to_display(
-            float(contract["excise_delta_min"]), source_unit
-        )
-        selected_start = pd.Timestamp(contract["selected_start"]).date().isoformat()
     except Exception as exc:
-        return (
-            html.Span(f"Tax-input preview unavailable: {exc}"),
-            None, None, None,
-        )
+        return html.Span(f"Tax-input preview unavailable: {exc}")
 
     pieces = [
         html.Strong("Scenario preview · "),
-        html.Span(f"start {selected_start} · "),
         html.Span(
-            f"VAT baseline {base_vat:.2f}% · change {delta_vat:+.2f} pp → "
+            f"VAT {base_vat:.2f}% {delta_vat:+.2f} pp → "
             f"{scenario_vat:.2f}%"
         ),
         html.Span(
-            f" · allowed VAT change [{vat_min:+.2f}, {vat_max:+.2f}] pp"
-        ),
-        html.Span(
-            f" · Excise baseline {baseline_display:.2f} "
-            f"{display['display_unit']} · change {delta_display:+.2f} → "
+            f" · Excise {baseline_display:.2f} "
+            f"{display['display_unit']} {delta_display:+.2f} → "
             f"{scenario_display:.2f} {display['display_unit']}"
-        ),
-        html.Span(
-            f" · minimum excise change {excise_min_display:+.2f} "
-            f"{display['display_unit']} (tax = 0)"
         ),
     ]
     if bool(display["scaled"]):
@@ -10623,24 +10552,15 @@ def scenario_tax_input_preview(
                 style={"color": "#64748b"},
             )
         )
-    for guard in (vat_guard, excise_guard):
-        if guard:
-            pieces.append(
-                html.Span(
-                    " · BLOCKED: " + guard,
-                    style={"color": "#B42318", "fontWeight": "700"},
-                )
-            )
-    if not vat_guard and not excise_guard and (
-        delta_vat < 0.0 or delta_display < 0.0
-    ):
+    if guard:
         pieces.append(
             html.Span(
-                " · Tax cut is valid.",
-                style={"color": "#067647", "fontWeight": "700"},
+                " · WARNING: " + guard,
+                style={"color": "#B42318", "fontWeight": "700"},
             )
         )
-    return pieces, vat_min, vat_max, excise_min_display
+    return pieces
+
 
 @callback(
     Output("scenario-store","data"),
@@ -10673,7 +10593,10 @@ def mutate_scenario_set(
 
     if trigger == "scenario-reset-all":
         return (
-            clear_scenario_set(vintage=vintage, forecast_name=forecast_name),
+            clear_scenario_set(
+                vintage=vintage,
+                forecast_name=forecast_name,
+            ),
             html.Div(
                 "All component tax scenarios cleared.",
                 className="selection-banner",
@@ -10681,7 +10604,10 @@ def mutate_scenario_set(
         )
 
     if not model_id:
-        return no_update, html.Div("Select a component.", className="banner-error")
+        return no_update, html.Div(
+            "Select a component.",
+            className="banner-error",
+        )
 
     if trigger == "scenario-remove":
         return (
@@ -10701,10 +10627,13 @@ def mutate_scenario_set(
             className="banner-error",
         )
 
-    row = _scenario_component_forecast_row(vintage, model_id, forecast_name)
+    row = _scenario_component_forecast_row(
+        vintage, model_id, forecast_name
+    )
     if row is None:
         return no_update, html.Div(
-            f"{model_spec(model_id).label}: no unique promoted/saved run is available.",
+            f"{model_spec(model_id).label}: no unique promoted/saved "
+            "run is available.",
             className="banner-error",
         )
 
@@ -10724,71 +10653,68 @@ def mutate_scenario_set(
             / str(vintage)
             / model_spec(model_id).dataset_file
         )
-        base_contract = component_tax_scenario_contract(
-            model_id,
-            forecast,
-            dataset_path=dataset,
-        )
-        frequency = str(base_contract.get("frequency", "monthly"))
-        effective_start = _normalise_scenario_period(start_date, frequency)
-        min_start = _normalise_scenario_period(base_contract["min_start"], frequency)
-        max_start = _normalise_scenario_period(base_contract["max_start"], frequency)
-        if effective_start < min_start or effective_start > max_start:
-            return no_update, html.Div(
-                f"Scenario start must lie inside the selected forecast horizon: "
-                f"{min_start.date().isoformat()} — {max_start.date().isoformat()}.",
-                className="banner-error",
-            )
-
         contract = component_tax_scenario_contract(
             model_id,
             forecast,
             dataset_path=dataset,
-            start_date=effective_start,
         )
-        source_unit = str(contract.get("excise_unit", "source unit"))
+
+        source_unit = str(
+            contract.get("excise_unit", "source unit")
+        )
+        display = _scenario_excise_display_spec(source_unit)
         excise_delta = _scenario_excise_from_display(
             excise_delta_display,
             source_unit,
         )
 
-        if abs(vat_delta) < 1e-15 and abs(excise_delta) < 1e-15:
+        if (
+            abs(vat_delta) < 1e-15
+            and abs(excise_delta) < 1e-15
+        ):
             return (
-                remove_scenario_component(current_store, model_id),
+                remove_scenario_component(
+                    current_store, model_id
+                ),
                 html.Div(
-                    f"{model_spec(model_id).label}: zero changes, component removed "
-                    "from the active set.",
+                    f"{model_spec(model_id).label}: zero changes, "
+                    "component removed from the active set.",
                     className="selection-banner",
                 ),
             )
 
-        vat_guard = _scenario_vat_delta_error(
-            baseline_vat=float(contract["baseline_vat_at_start"]),
-            delta_vat=vat_delta,
-        )
-        if vat_guard:
-            return no_update, html.Div(
-                [html.Strong("Scenario not applied: "), html.Span(vat_guard)],
-                className="banner-error",
-            )
-
-        excise_guard = _scenario_excise_plausibility_error(
+        guard = _scenario_excise_plausibility_error(
             displayed_delta=excise_delta_display,
             source_delta=excise_delta,
-            source_baseline=float(contract["baseline_excise_at_start"]),
+            source_baseline=float(
+                contract["baseline_excise_at_start"]
+            ),
             source_unit=source_unit,
         )
-        if excise_guard:
-            suffix = (
-                " A negative final excise would be a subsidy, not an excise tax cut."
-                if float(contract["baseline_excise_at_start"]) + excise_delta < 0.0
-                else ""
-            )
+        if guard:
             return no_update, html.Div(
                 [
                     html.Strong("Scenario not applied: "),
-                    html.Span(excise_guard + suffix),
+                    html.Span(guard),
                 ],
+                className="banner-error",
+            )
+
+        frequency = str(contract.get("frequency", "monthly"))
+        effective_start = _normalise_scenario_period(
+            start_date, frequency
+        )
+        min_start = _normalise_scenario_period(
+            contract["min_start"], frequency
+        )
+        max_start = _normalise_scenario_period(
+            contract["max_start"], frequency
+        )
+        if effective_start < min_start or effective_start > max_start:
+            return no_update, html.Div(
+                f"Scenario start must lie inside the selected forecast "
+                f"horizon: {min_start.date().isoformat()} — "
+                f"{max_start.date().isoformat()}.",
                 className="banner-error",
             )
 
@@ -10818,7 +10744,10 @@ def mutate_scenario_set(
 
     except Exception as exc:
         return no_update, html.Div(
-            [html.Strong("Scenario calculation failed: "), html.Span(str(exc))],
+            [
+                html.Strong("Scenario calculation failed: "),
+                html.Span(str(exc)),
+            ],
             className="banner-error",
         )
 
@@ -10831,23 +10760,17 @@ def mutate_scenario_set(
     display_unit = _scenario_excise_display_spec(
         meta.get("excise_unit")
     )["display_unit"]
-    resulting_vat = float(contract["baseline_vat_at_start"]) + vat_delta
-    resulting_excise = _scenario_excise_to_display(
-        float(contract["baseline_excise_at_start"]) + float(meta.get("excise_delta", 0.0) or 0.0),
-        meta.get("excise_unit"),
-    )
 
     return updated, html.Div(
         [
             html.Strong(str(result["hicp_label"])),
+            html.Span(f" · VAT {vat_delta:+.2f} pp"),
             html.Span(
-                f" · VAT change {vat_delta:+.2f} pp → {resulting_vat:.2f}%"
+                f" · excise {display_delta:+.2f} {display_unit}"
             ),
             html.Span(
-                f" · excise change {display_delta:+.2f} {display_unit} → "
-                f"{resulting_excise:.2f} {display_unit}"
+                f" · {meta['n_draws_effective']} paired draws"
             ),
-            html.Span(f" · {meta['n_draws_effective']} paired draws"),
             html.Span(
                 f" · {count} active component scenario"
                 + ("s" if count != 1 else "")
@@ -10855,6 +10778,7 @@ def mutate_scenario_set(
         ],
         className="selection-banner",
     )
+
 
 @callback(
     Output("scenario-set-summary","children"),

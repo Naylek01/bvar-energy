@@ -61,7 +61,7 @@ def readable_table(table_id: str, columns: Sequence[Mapping[str, Any]], *, page_
             "fontWeight": 650,
             "color": "#111827",
         })
-    return dash_table.DataTable(
+    return dash_table.DataTable(export_format="xlsx", export_headers="display", export_columns="all", 
         id=table_id,
         columns=list(columns),
         data=[],

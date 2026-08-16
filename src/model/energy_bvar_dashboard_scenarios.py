@@ -42,6 +42,7 @@ except Exception:  # pragma: no cover - safe fallback during standalone testing
         return fig
 
 
+# TAX_SCENARIO_EXPLICIT_HICP_LABEL_V1
 _QUANTILES = (0.05, 0.16, 0.50, 0.84, 0.95)
 _QCOLS = ("q05", "q16", "q50", "q84", "q95")
 _BASE = TOKENS["cyan_deep"]
@@ -262,6 +263,21 @@ def _finalise_scenario_layout(
     )
     return fig
 
+
+def _selected_hicp_label(payload: Mapping | None) -> str:
+    meta = dict((payload or {}).get("meta") or {})
+    label = str(meta.get("hicp_label") or "").strip()
+    if label:
+        return label
+    series = str(meta.get("hicp_series") or "").strip()
+    if series:
+        return series.replace("_", " ").title()
+    model_id = str(meta.get("model_id") or "").strip()
+    if model_id:
+        return "HICP " + model_id.replace("_", " ").title()
+    return "Selected HICP component"
+
+
 def scenario_main_figure(payload: Mapping | None, *, fan_mode: str = "68", uirevision: str = "tax-scenario") -> go.Figure:
     """Observed -> nowcast -> forecast, with baseline/scenario split only in forecast."""
     frames = scenario_frames(payload)
@@ -273,6 +289,7 @@ def scenario_main_figure(payload: Mapping | None, *, fan_mode: str = "68", uirev
         return empty_scenario_figure("No paired tax-scenario paths are available")
 
     meta = (payload or {}).get("meta", {})
+    hicp_label = _selected_hicp_label(payload)
     last_observed = pd.to_datetime(meta.get("last_observed"), errors="coerce")
     forecast_origin = pd.to_datetime(meta.get("forecast_origin"), errors="coerce")
     scenario_start = pd.to_datetime(meta.get("scenario_start"), errors="coerce")
@@ -291,7 +308,7 @@ def scenario_main_figure(payload: Mapping | None, *, fan_mode: str = "68", uirev
     if not history.empty:
         hist = history.loc[history["date"] <= last_observed] if not pd.isna(last_observed) else history
         fig.add_trace(go.Scatter(
-            x=hist["date"], y=hist["value"], mode="lines", name="Observed HICP inflation",
+            x=hist["date"], y=hist["value"], mode="lines", name=f"Observed {hicp_label} inflation",
             line={"color": _INK, "width": 1.8},
             hovertemplate="%{x|%Y-%m}<br>%{y:.2f}%<extra>Observed</extra>",
         ))
@@ -348,7 +365,7 @@ def scenario_main_figure(payload: Mapping | None, *, fan_mode: str = "68", uirev
 
     return _finalise_scenario_layout(
         fig,
-        title="Tax assumption impact on HICP inflation",
+        title=f"{hicp_label} — inflation: baseline vs tax scenario",
         y_title="% y/y",
         height=520,
         uirevision=uirevision,
@@ -374,6 +391,7 @@ def scenario_impact_figure(payload: Mapping | None, *, metric: str, fan_mode: st
     ))
     fig.add_hline(y=0.0, line={"color": TOKENS["hairline"], "width": 1})
     meta = (payload or {}).get("meta", {})
+    hicp_label = _selected_hicp_label(payload)
     origin = pd.to_datetime(meta.get("forecast_origin"), errors="coerce")
     start = pd.to_datetime(meta.get("scenario_start"), errors="coerce")
     if not pd.isna(origin):
@@ -381,9 +399,9 @@ def scenario_impact_figure(payload: Mapping | None, *, metric: str, fan_mode: st
     if not pd.isna(start) and (pd.isna(origin) or start != origin):
         fig.add_vline(x=start, line={"color": _SCEN, "width": 1, "dash": "dot"})
     if metric == "level":
-        title, unit = "Price-level impact", "Scenario − baseline (%)"
+        title, unit = f"{hicp_label} — price-level impact", "Scenario − baseline (%)"
     else:
-        title, unit = "YoY inflation impact", "Scenario − baseline (pp)"
+        title, unit = f"{hicp_label} — year-on-year inflation impact", "Scenario − baseline (pp)"
     return _finalise_scenario_layout(
         fig,
         title=title,
@@ -402,6 +420,7 @@ def scenario_tax_figure(payload: Mapping | None, *, uirevision: str = "tax-path"
     if tax.empty:
         return empty_scenario_figure("No tax path is available")
     meta = (payload or {}).get("meta", {})
+    hicp_label = _selected_hicp_label(payload)
     excise_unit = str(meta.get("excise_unit", "source unit"))
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.10,
                         subplot_titles=("VAT", "Excise"))
@@ -454,7 +473,7 @@ def scenario_tax_figure(payload: Mapping | None, *, uirevision: str = "tax-path"
     fig.update_yaxes(title_text=f"Excise ({excise_unit})", row=2, col=1)
     return _finalise_scenario_layout(
         fig,
-        title="Tax assumptions",
+        title=f"{hicp_label} — VAT and excise assumptions",
         y_title=None,
         height=660,
         uirevision=uirevision,

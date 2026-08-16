@@ -50,10 +50,10 @@ from headline_bvar_pipeline import (
 )
 
 CONDITIONAL_CONTRACT_VERSION = "headline-conditional-v2"
-ENERGY_BRIDGE_CONTRACT_VERSION = "energy-headline-bridge-v2"
+ENERGY_BRIDGE_CONTRACT_VERSION = "energy-headline-bridge-v3"
 COMPUTATIONAL_HORIZON = MAX_PUBLISHED_HORIZON_MONTHS
 DEFAULT_CONDITIONAL_SEED = 2026  # legacy import compatibility only; run contract wins
-CONDITION_STATISTICS = ("mean", "q16", "q50", "q84")
+CONDITION_STATISTICS = ("mean", "q16", "q50", "q84") + tuple(f"p{x:02d}" for x in range(1, 100))
 MANUAL_METRICS = ("level", "yoy")
 ENERGY_RATIO_PATHOLOGICAL_THRESHOLD = 0.02
 
@@ -327,59 +327,115 @@ def manual_condition_levels(
     return future_dates, levels
 
 
+def _energy_path_summaries(paths: np.ndarray) -> dict[str, list[float]]:
+    """Compact pointwise Energy summaries computed directly from saved draws.
+
+    P01..P99 are computed independently at each month.  They are therefore
+    pointwise percentile paths, not a claim that one posterior draw occupies
+    the same percentile rank at every horizon.
+    """
+    values = np.asarray(paths, dtype=float)
+    if values.ndim != 2 or values.shape[0] < 1 or values.shape[1] < 2:
+        raise HeadlineConditionalError(
+            "Energy bridge paths must have shape (draws, >=2 monthly dates)."
+        )
+    if not np.isfinite(values).any(axis=0).all():
+        raise HeadlineConditionalError(
+            "Energy bridge has a month with no finite posterior draw."
+        )
+    probs = np.arange(1, 100, dtype=float) / 100.0
+    pct = np.nanquantile(values, probs, axis=0)
+    out = {
+        "mean": np.nanmean(values, axis=0).tolist(),
+        **{f"p{i:02d}": pct[i - 1].tolist() for i in range(1, 100)},
+    }
+    # Backward-compatible named fan statistics. They are exact aliases of
+    # the corresponding directly-computed pointwise percentiles.
+    out["q16"] = list(out["p16"])
+    out["q50"] = list(out["p50"])
+    out["q84"] = list(out["p84"])
+    return out
+
+
+def energy_level_paths_headline_bridge(
+    *,
+    dates: Sequence[pd.Timestamp],
+    baseline_level_paths: np.ndarray,
+    scenario_level_paths: np.ndarray,
+    vintage: str,
+    aggregate_run_id: str,
+    forecast_name: str,
+    scenario_active: bool,
+    lineage: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the compact Energy -> Headline bridge from raw aggregate draws."""
+    idx = _normalise_months(dates)
+    baseline = np.asarray(baseline_level_paths, dtype=float)
+    scenario = np.asarray(scenario_level_paths, dtype=float)
+    if (
+        scenario.ndim != 2
+        or baseline.shape != scenario.shape
+        or scenario.shape[1] != len(idx)
+    ):
+        raise HeadlineConditionalError(
+            "Energy aggregate level-path dimensions are inconsistent."
+        )
+    if idx.has_duplicates or not idx.is_monotonic_increasing:
+        raise HeadlineConditionalError(
+            "Energy aggregate bridge dates must be unique and increasing."
+        )
+    extra = dict(lineage or {})
+    source_kind = str(extra.get("source_kind") or "energy_scenario")
+    source_label = str(extra.get("source_label") or "Energy scenario")
+    return {
+        "contract": ENERGY_BRIDGE_CONTRACT_VERSION,
+        "vintage": str(vintage),
+        "aggregate_run_id": str(aggregate_run_id),
+        "forecast_name": str(forecast_name),
+        "scenario_active": bool(scenario_active),
+        "n_draws": int(scenario.shape[0]),
+        "dates": [pd.Timestamp(x).isoformat() for x in idx],
+        "baseline_level": _energy_path_summaries(baseline),
+        "scenario_level": _energy_path_summaries(scenario),
+        "available_percentiles": list(range(1, 100)),
+        "scenario_signature": extra.get("scenario_signature"),
+        "scenario_components": list(extra.get("scenario_components") or []),
+        "scenario_starts": dict(extra.get("scenario_starts") or {}),
+        "source_kind": source_kind,
+        "source_label": source_label,
+        "source_metadata": {
+            key: value
+            for key, value in extra.items()
+            if key not in {
+                "scenario_signature", "scenario_components", "scenario_starts",
+                "source_kind", "source_label",
+            }
+        },
+        "percentile_contract": "pointwise_direct_from_energy_aggregate_draws",
+        "transfer_contract": "month_to_month_growth_reanchored_on_headline_energy",
+        "interpretation": (
+            "one deterministic Energy HICP summary path is converted to monthly growth; "
+            "P01..P99 are pointwise percentiles computed directly from Energy aggregate "
+            "draws; full Energy-path uncertainty is not integrated out inside the Headline BVAR"
+        ),
+    }
+
+
 def energy_outcome_headline_bridge(
     outcome: Any,
     lineage: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Compact Energy aggregate bridge stored in ``agg-scenario-store``.
-
-    Level quantiles are retained only to derive deterministic month-to-month
-    growth paths. They are never injected directly into the Headline BVAR.
-    """
-    dates = pd.DatetimeIndex(outcome.dates, name="date")
-    scenario = np.asarray(outcome.scenario["level_paths"], dtype=float)
-    baseline = np.asarray(outcome.baseline["level_paths"], dtype=float)
-    if (
-        scenario.ndim != 2
-        or baseline.shape != scenario.shape
-        or scenario.shape[1] != len(dates)
-    ):
-        raise HeadlineConditionalError("Energy aggregate level-path dimensions are inconsistent.")
-    q = (0.16, 0.50, 0.84)
-    scenario_q = np.nanquantile(scenario, q, axis=0)
-    baseline_q = np.nanquantile(baseline, q, axis=0)
-    scenario_mean = np.nanmean(scenario, axis=0)
-    baseline_mean = np.nanmean(baseline, axis=0)
-    extra = dict(lineage or {})
-    return {
-        "contract": ENERGY_BRIDGE_CONTRACT_VERSION,
-        "vintage": str(outcome.vintage),
-        "aggregate_run_id": str(outcome.aggregate_run_id),
-        "forecast_name": str(outcome.forecast_name),
-        "scenario_active": bool(outcome.scenario_active),
-        "n_draws": int(scenario.shape[0]),
-        "dates": [pd.Timestamp(x).isoformat() for x in dates],
-        "baseline_level": {
-            "mean": baseline_mean.tolist(),
-            "q16": baseline_q[0].tolist(),
-            "q50": baseline_q[1].tolist(),
-            "q84": baseline_q[2].tolist(),
-        },
-        "scenario_level": {
-            "mean": scenario_mean.tolist(),
-            "q16": scenario_q[0].tolist(),
-            "q50": scenario_q[1].tolist(),
-            "q84": scenario_q[2].tolist(),
-        },
-        "scenario_signature": extra.get("scenario_signature"),
-        "scenario_components": list(extra.get("scenario_components") or []),
-        "scenario_starts": dict(extra.get("scenario_starts") or {}),
-        "transfer_contract": "month_to_month_growth_reanchored_on_headline_energy",
-        "interpretation": (
-            "one deterministic Energy HICP summary path is converted to monthly growth; "
-            "full Energy-path uncertainty is not integrated out inside the Headline BVAR"
-        ),
-    }
+    """Compact bridge for an Energy aggregate outcome."""
+    return energy_level_paths_headline_bridge(
+        dates=outcome.dates,
+        baseline_level_paths=np.asarray(outcome.baseline["level_paths"], dtype=float),
+        scenario_level_paths=np.asarray(outcome.scenario["level_paths"], dtype=float),
+        vintage=str(outcome.vintage),
+        aggregate_run_id=str(outcome.aggregate_run_id),
+        forecast_name=str(outcome.forecast_name),
+        scenario_active=bool(outcome.scenario_active),
+        lineage=lineage,
+    )
 
 
 def energy_headline_ratio_diagnostic(
@@ -460,12 +516,18 @@ def energy_bridge_condition(
     if not bool(bridge.get("scenario_active", False)):
         raise HeadlineConditionalError("The selected Energy aggregate has no active scenario.")
     same_vintage(posterior.vintage, str(bridge.get("vintage")))
-    statistic = str(statistic)
-    if statistic not in CONDITION_STATISTICS:
-        raise ValueError(f"statistic must be one of {CONDITION_STATISTICS}.")
+    statistic = str(statistic or "mean").strip().lower()
+    if statistic.startswith("q") and statistic[1:].isdigit():
+        statistic = f"p{int(statistic[1:]):02d}"
+    if statistic != "mean":
+        match = re.fullmatch(r"p(\d{1,2})", statistic)
+        if match is None or not (1 <= int(match.group(1)) <= 99):
+            raise ValueError("Energy path statistic must be 'mean' or a percentile P01..P99.")
+        statistic = f"p{int(match.group(1)):02d}"
 
     dates = _normalise_months(bridge.get("dates") or [])
-    values = np.asarray((bridge.get("scenario_level") or {}).get(statistic), dtype=float)
+    path_map = dict(bridge.get("scenario_level") or {})
+    values = np.asarray(path_map.get(statistic, []), dtype=float)
     if len(dates) != len(values):
         raise HeadlineConditionalError("Energy bridge dates/path lengths differ.")
     if dates.has_duplicates:
@@ -522,6 +584,8 @@ def energy_bridge_condition(
         "energy_scenario_signature": bridge.get("scenario_signature"),
         "energy_scenario_components": list(bridge.get("scenario_components") or []),
         "condition_statistic": statistic,
+        "condition_statistic_label": ("Posterior mean" if statistic == "mean" else f"Pointwise percentile {statistic.upper()}"),
+        "energy_percentile_contract": bridge.get("percentile_contract"),
         "energy_path_uncertainty_propagated": False,
         "energy_transfer_method": "mom_growth_reanchored_on_headline_energy",
         "headline_energy_anchor_date": anchor_date.isoformat(),
@@ -846,6 +910,7 @@ __all__ = [
     "future_dates_for_saved",
     "parse_manual_values",
     "manual_condition_levels",
+    "energy_level_paths_headline_bridge",
     "energy_outcome_headline_bridge",
     "energy_headline_ratio_diagnostic",
     "energy_bridge_condition",
