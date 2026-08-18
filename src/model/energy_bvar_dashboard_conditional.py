@@ -3170,6 +3170,7 @@ def _band(
     )
 
 
+# GRAPH_EXPORT_READABILITY_G4_ENERGY_CONDITIONAL_V1
 def _layout(
     fig: go.Figure,
     *,
@@ -3204,8 +3205,8 @@ def _layout(
             "font": {"size": 11},
         },
         uirevision=uirevision,
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="white",
+        plot_bgcolor="white",
     )
     fig.update_xaxes(showgrid=False, linecolor="#e5e7eb")
     fig.update_yaxes(gridcolor=_GRID, zerolinecolor="#d1d5db")
@@ -3229,8 +3230,8 @@ def empty_conditional_figure(message: str) -> go.Figure:
         margin={"l": 54, "r": 24, "t": 54, "b": 42},
         xaxis={"visible": False},
         yaxis={"visible": False},
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="white",
+        plot_bgcolor="white",
     )
     return fig
 

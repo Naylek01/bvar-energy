@@ -166,7 +166,6 @@ def model_contract() -> dict[str, object]:
         "food_weight_source": "Eurostat FOOD_NP + FOOD_P annual item weights",
         "publication_horizon_max_months": MAX_PUBLISHED_HORIZON_MONTHS,
         "dashboard_publish_beyond_h12": False,
-        "missing_data_method_baseline": "dk",
         "pipeline_version": PIPELINE_VERSION,
         "sampler": {
             "reps": 6000,
@@ -356,7 +355,6 @@ def estimate_locked_headline(
     *,
     prior_config: BVARSVOPriorConfig | None = None,
     sampler_config: SamplerConfig | None = None,
-    missing_data_method: str = "dk",
     code_version: str = PIPELINE_VERSION,
 ) -> dict:
     """Estimate the only production specification: BVAR(12) + 11 month dummies."""
@@ -376,7 +374,6 @@ def estimate_locked_headline(
         exog_prior_scale=SEASONAL_EXOG_PRIOR_SCALE,
         prior_config=prior_config,
         sampler_config=sampler_config,
-        missing_data_method=str(missing_data_method),
         code_version=code_version,
     )
     result["headline_joint_context"] = {
@@ -741,7 +738,6 @@ def run_headline(
     results_root: str | Path | None = None,
     prior_config: BVARSVOPriorConfig | None = None,
     sampler_config: SamplerConfig | None = None,
-    missing_data_method: str = "dk",
     H: int = MAX_PUBLISHED_HORIZON_MONTHS,
     n_forecast_draws: int | None = 1000,
     simulate_future_outliers: bool = True,
@@ -757,7 +753,6 @@ def run_headline(
         inputs,
         prior_config=prior_config,
         sampler_config=sampler_config,
-        missing_data_method=str(missing_data_method),
     )
     available = int(result["n_draws"])
     requested = available if n_forecast_draws is None else int(n_forecast_draws)

@@ -16,12 +16,7 @@ from dash import Input, Output, State, dcc, html
 from dash.exceptions import PreventUpdate
 
 from dashboard_snapshot_cache import frame_from_store as snapshot_frame_from_store, get_or_build as snapshot_get_or_build
-from energy_bvar_model import (
-    BVARSVOPriorConfig,
-    SamplerConfig,
-    outlier_mean_frequency_from_years,
-    outlier_prior_observations_from_years,
-)
+from energy_bvar_model import BVARSVOPriorConfig, SamplerConfig
 from energy_bvar_theme import (
     TOKENS,
     INFLATION_COLORS,
@@ -121,20 +116,14 @@ def _fmt(value, suffix=""):
     return "—" if not np.isfinite(x) else f"{x:.2f}{suffix}"
 
 
-# GRAPH_EXPORT_READABILITY_G5_HEADLINE_FORECAST_V1
 def _figure_base(fig, *, uirevision, y_title=None, height=430):
     """Shared Headline chart geometry; panel headings own the visible title."""
-    apply_inflation_figure_style(
+    return apply_inflation_figure_style(
         fig,
         uirevision=uirevision,
         height=height,
         y_title=y_title,
     )
-    fig.update_layout(
-        paper_bgcolor="white",
-        plot_bgcolor="white",
-    )
-    return fig
 
 
 def _empty(message, height=430):
@@ -1425,19 +1414,8 @@ def headline_estimation_v2_page():
             html.Div([html.Div("Run diagnostics",className="eyebrow"),html.Div(id="h5-estimation-diagnostics",children="Select a Headline run.")],className="panel")
         ],className="two-column-grid"),
         html.Div([html.Div("Prior",className="eyebrow"),html.H3("Minnesota + outlier prior",className="panel-title"),html.Div([
-            html.Div([html.Label("λ1"),_num("h5-lambda1",p.lambda1,.01,.001)]),
-            html.Div([html.Label("λ2"),_num("h5-lambda2",p.lambda2,.01,.001)]),
-            html.Div([html.Label("λ3"),_num("h5-lambda3",p.lambda3,.05,.001)]),
-            html.Div([html.Label("λ4"),_num("h5-lambda4",p.lambda4,.5,.001)]),
-            html.Div([html.Label("A variance (standardized)"),_num("h5-a-prior-var",p.a_prior_var,.5,.001)]),
-            html.Div([html.Label("φ mean"),_num("h5-phi-mean",p.phi_prior_mean,.005,.000001)]),
-            html.Div([html.Label("φ df"),_num("h5-phi-df",p.phi_prior_df,1,2.000001)]),
-            html.Div([html.Label("h₀ variance"),_num("h5-h0-var",p.h0_var,.5,.000001)]),
-            html.Div([html.Label("Mean outlier interval (years)"),_num("h5-outlier-years",4.0,.25,.05)]),
-            html.Div([html.Label("Outlier prior confidence (years)"),_num("h5-outlier-prior-years",10.0,.5,.1)]),
-            html.Div("Monthly Headline model: 4 years = 48 months. A variance is scale-normalised by σᵢ/σⱼ in the shared engine.",className="stat-subtitle")],className="selectors-grid")],className="panel"),
+            html.Div([html.Label("λ1"),_num("h5-lambda1",p.lambda1,.01,.001)]),html.Div([html.Label("λ2"),_num("h5-lambda2",p.lambda2,.01,.001)]),html.Div([html.Label("λ3"),_num("h5-lambda3",p.lambda3,.05,.001)]),html.Div([html.Label("λ4"),_num("h5-lambda4",p.lambda4,.5,.001)]),html.Div([html.Label("Mean outlier interval (months)"),_num("h5-outlier-months",1/p.outlier_mean_frequency,1,2)])],className="selectors-grid")],className="panel"),
         html.Div([html.Div("Sampler",className="eyebrow"),html.H3("Gibbs configuration",className="panel-title"),html.Div([
-            html.Div([html.Label("Missing values"),dcc.Dropdown(id="h5-missing-method",options=[{"label":"Durbin–Koopman (exact augmentation)","value":"dk"},{"label":"Linear interpolation (fast approximation)","value":"linear"}],value="dk",clearable=False)]),
             html.Div([html.Label("Reps"),_num("h5-reps",s.reps,500,2)]),html.Div([html.Label("Burn"),_num("h5-burn",s.burn,500,0)]),html.Div([html.Label("Thin"),_num("h5-thin",s.thin,1,1)]),html.Div([html.Label("Seed"),_num("h5-seed",s.seed,1,0)]),html.Div([dcc.Checklist(id="h5-promote-after",options=[{"label":"Promote after successful run","value":"promote"}],value=["promote"])])],className="selectors-grid"),
             html.Div([html.Button("Run Headline BVAR",id="h5-estimate-run",n_clicks=0,className="refresh-button"),html.Button("Cancel",id="h5-estimate-cancel",n_clicks=0,disabled=True,className="refresh-button")],style={"display":"flex","gap":"10px","marginTop":"16px"}),
             html.Progress(id="h5-estimate-progress",value=0,max=100,style={"width":"100%","marginTop":"16px"}),html.Div("Ready",id="h5-estimate-progress-text",className="stat-subtitle"),dcc.Store(id="h5-estimate-result"),html.Div(id="h5-estimate-result-banner",className="selection-banner")
@@ -1578,7 +1556,7 @@ def register_headline_slice5_callbacks(app, *, results_root, registry_path=None,
         if not r: return ""
         return html.Div([html.Strong("Complete" if r.get("ok") else "Failed"),html.Span(f" · {r.get('message','')}"),html.Span(f" · run {str(r.get('run_id',''))[:12]}" if r.get("run_id") else "")])
 
-    states=[State(vintage_selector_id,"value"),State("h5-lambda1","value"),State("h5-lambda2","value"),State("h5-lambda3","value"),State("h5-lambda4","value"),State("h5-a-prior-var","value"),State("h5-phi-mean","value"),State("h5-phi-df","value"),State("h5-h0-var","value"),State("h5-outlier-years","value"),State("h5-outlier-prior-years","value"),State("h5-missing-method","value"),State("h5-reps","value"),State("h5-burn","value"),State("h5-thin","value"),State("h5-seed","value"),State("h5-promote-after","value")]
+    states=[State(vintage_selector_id,"value"),State("h5-lambda1","value"),State("h5-lambda2","value"),State("h5-lambda3","value"),State("h5-lambda4","value"),State("h5-outlier-months","value"),State("h5-reps","value"),State("h5-burn","value"),State("h5-thin","value"),State("h5-seed","value"),State("h5-promote-after","value")]
     if background_manager is None:
         @app.callback(Output("h5-estimate-result","data"),Input("h5-estimate-run","n_clicks"),*states,prevent_initial_call=True)
         def no_manager(n,*_):
@@ -1589,19 +1567,18 @@ def register_headline_slice5_callbacks(app, *, results_root, registry_path=None,
     @app.callback(Output("h5-estimate-result","data"),Input("h5-estimate-run","n_clicks"),*states,background=True,manager=background_manager,
                   progress=[Output("h5-estimate-progress","value"),Output("h5-estimate-progress-text","children")],progress_default=[0,"Ready"],
                   cancel=[Input("h5-estimate-cancel","n_clicks")],running=[(Output("h5-estimate-run","disabled"),True,False),(Output("h5-estimate-cancel","disabled"),False,True)],prevent_initial_call=True)
-    def estimate(set_progress,n,vintage,l1,l2,l3,l4,a_prior_var,phi_mean,phi_df,h0_var,outlier_years,outlier_prior_years,missing_method,reps,burn,thin,seed,promote):
+    def estimate(set_progress,n,vintage,l1,l2,l3,l4,outlier_months,reps,burn,thin,seed,promote):
         if not n: raise PreventUpdate
         started=time.monotonic()
         try:
             if vintage is None: raise ValueError("Select a Headline vintage.")
-            outlier_years=float(outlier_years)
+            outlier_months=float(outlier_months)
+            if outlier_months<=1: raise ValueError("Mean outlier interval must exceed one month.")
             p0=production_prior_config(); s0=production_sampler_config()
-            missing_method=str(missing_method or "dk").lower()
-            if missing_method not in {"dk","linear"}: raise ValueError("Missing values must be 'dk' or 'linear'.")
-            prior=BVARSVOPriorConfig(lambda1=float(l1),lambda2=float(l2),lambda3=float(l3),lambda4=float(l4),a_prior_var=float(a_prior_var),phi_prior_mean=float(phi_mean),phi_prior_df=float(phi_df),h0_var=float(h0_var),outlier_mean_frequency=outlier_mean_frequency_from_years(outlier_years,"monthly"),outlier_prior_observations=outlier_prior_observations_from_years(float(outlier_prior_years),"monthly"),outlier_grid_min=p0.outlier_grid_min,outlier_grid_max=p0.outlier_grid_max,outlier_grid_step=p0.outlier_grid_step,ksc_offset_scale=p0.ksc_offset_scale,ksc_offset_floor=p0.ksc_offset_floor)
+            prior=BVARSVOPriorConfig(lambda1=float(l1),lambda2=float(l2),lambda3=float(l3),lambda4=float(l4),a_prior_var=p0.a_prior_var,phi_prior_mean=p0.phi_prior_mean,phi_prior_df=p0.phi_prior_df,h0_var=p0.h0_var,outlier_mean_frequency=1/outlier_months,outlier_prior_observations=p0.outlier_prior_observations,outlier_grid_min=p0.outlier_grid_min,outlier_grid_max=p0.outlier_grid_max,outlier_grid_step=p0.outlier_grid_step,ksc_offset_scale=p0.ksc_offset_scale,ksc_offset_floor=p0.ksc_offset_floor)
             sampler=SamplerConfig(reps=int(reps),burn=int(burn),thin=int(thin),seed=int(seed),max_stability_tries=s0.max_stability_tries,progress_every=s0.progress_every,sv_sampler=s0.sv_sampler,dk_projection_mode=s0.dk_projection_mode,dk_level_relative_gate=s0.dk_level_relative_gate,dk_difference_relative_gate=s0.dk_difference_relative_gate,dk_catastrophic_level_relative_gate=s0.dk_catastrophic_level_relative_gate,dk_catastrophic_difference_relative_gate=s0.dk_catastrophic_difference_relative_gate)
             prior.validate(); sampler.validate(); set_progress((5,"Preparing locked Headline BVAR")); set_progress((15,"Sampling BVAR — this stage may take time"))
-            outcome=run_headline(str(vintage),results_root=results_root,prior_config=prior,sampler_config=sampler,missing_data_method=missing_method,H=MAX_PUBLISHED_HORIZON_MONTHS,n_forecast_draws=1000,simulate_future_outliers=True,forecast_seed=2026,persist=True)
+            outcome=run_headline(str(vintage),results_root=results_root,prior_config=prior,sampler_config=sampler,H=MAX_PUBLISHED_HORIZON_MONTHS,n_forecast_draws=1000,simulate_future_outliers=True,forecast_seed=2026,persist=True)
             set_progress((88,"Materialising display")); build_headline_display(outcome.run_directory,forecast_name="unconditional",overwrite=True)
             set_progress((93,"Materialising one-step fitted paths")); materialize_headline_fitted(outcome.run_directory,forecast_name="unconditional")
             promoted=False; msg="Promotion not requested."

@@ -41,13 +41,13 @@ from inflation_table_contract import (
 from headline_bvar_conditional import (
     CONDITION_STATISTICS,
     CONDITIONAL_CONTRACT_VERSION,
+    COMPUTATIONAL_HORIZON,
     ENERGY_BRIDGE_CONTRACT_VERSION,
     HeadlineConditionalError,
-    energy_bridge_condition,
-    future_dates_for_saved,
     load_saved_headline_posterior,
     manual_condition_levels,
     run_saved_headline_conditional,
+    run_saved_headline_energy_marginal,
 )
 
 # HEADLINE_CONSUMES_PREBUILT_JOINT_ENERGY_V1
@@ -64,13 +64,19 @@ SERIES_LABELS = {
 }
 
 
+# GRAPH_EXPORT_READABILITY_G5_HEADLINE_SCENARIOS_V1
 def _layout(fig: go.Figure, revision: str, y_title: str | None, height: int = 440) -> go.Figure:
-    return apply_inflation_figure_style(
+    apply_inflation_figure_style(
         fig,
         uirevision=revision,
         height=height,
         y_title=y_title,
     )
+    fig.update_layout(
+        paper_bgcolor="white",
+        plot_bgcolor="white",
+    )
+    return fig
 
 
 def _empty(message: str, height: int = 420) -> go.Figure:
@@ -171,6 +177,98 @@ def _calendar_hover(dates: pd.DatetimeIndex) -> list[str]:
     return [pd.Timestamp(x).strftime("%Y-%m") for x in dates]
 
 
+def _impact_semantics(payload: dict | None) -> dict[str, str]:
+    """Render A/B semantics from structured lineage, with legacy fallback only."""
+    meta = dict((payload or {}).get("meta") or {})
+    definition = str(meta.get("impact_definition") or "")
+    baseline_label = str(meta.get("impact_baseline_label") or "")
+    scenario_label = str(meta.get("impact_scenario_label") or "")
+    interpretation = str(meta.get("impact_interpretation") or "")
+
+    if definition and baseline_label and scenario_label:
+        return {
+            "definition": definition,
+            "reference": f"A · {baseline_label}",
+            "scenario": f"B · {scenario_label}",
+            "impact": "Impact · B − A",
+            "denominator": baseline_label,
+            "draws": f"A · {baseline_label} · B · {scenario_label}",
+            "interpretation": interpretation,
+        }
+
+    # Legacy persisted scenarios predate the structured semantic lineage.
+    reference = str(meta.get("impact_reference") or "")
+    source_type = str(meta.get("source_type") or "")
+    if reference == "energy_baseline_conditioned":
+        baseline_label = "Energy baseline-conditioned · legacy metadata"
+        scenario_label = "Energy scenario-conditioned · legacy metadata"
+        definition = "legacy_energy_scenario_minus_energy_baseline"
+    elif source_type in {"energy_scenario", "joint_energy_scenario"}:
+        baseline_label = "Headline unconditional · legacy definition"
+        scenario_label = "Energy-conditioned · legacy definition"
+        definition = "legacy_energy_minus_unconditional"
+    elif source_type == "manual" or reference == "unconditional":
+        baseline_label = "Headline unconditional · legacy metadata"
+        scenario_label = "Manual conditional · legacy metadata"
+        definition = "legacy_manual_minus_unconditional"
+    else:
+        baseline_label = "Headline unconditional · legacy metadata"
+        scenario_label = "Conditional · legacy metadata"
+        definition = "legacy_conditional_minus_unconditional"
+    return {
+        "definition": definition,
+        "reference": f"A · {baseline_label}",
+        "scenario": f"B · {scenario_label}",
+        "impact": "Impact · B − A",
+        "denominator": baseline_label,
+        "draws": f"A · {baseline_label} · B · {scenario_label}",
+        "interpretation": interpretation,
+    }
+
+
+def _horizon_semantics(payload: dict | None) -> str:
+    meta = dict((payload or {}).get("meta") or {})
+    conditioned = meta.get(
+        "conditioned_horizon_months",
+        meta.get("condition_horizon"),
+    )
+    computational = meta.get("computational_horizon")
+    propagated = meta.get("free_propagation_horizon_months")
+    try:
+        conditioned_i = int(conditioned)
+        computational_i = int(computational)
+        propagated_i = (
+            int(propagated)
+            if propagated is not None
+            else max(0, computational_i - conditioned_i)
+        )
+    except (TypeError, ValueError):
+        return ""
+    return (
+        f"conditioned {conditioned_i}m · freely propagated "
+        f"{propagated_i}m inside {computational_i}m DK horizon"
+    )
+
+
+def _energy_source_contract(payload: dict | None) -> tuple[str, str]:
+    """Resolve the saved source aggregate and forecast contract without fallback IDs."""
+    item = dict(payload or {})
+    meta = dict(item.get("meta") or {})
+    bridge = dict(item.get("headline_bridge") or {})
+    source_aggregate_run_id = str(meta.get("aggregate_run_id") or "")
+    forecast_name = str(bridge.get("forecast_name") or "")
+    if not source_aggregate_run_id:
+        raise HeadlineConditionalError(
+            "Energy scenario payload is missing meta.aggregate_run_id "
+            "(saved source aggregate)."
+        )
+    if not forecast_name:
+        raise HeadlineConditionalError(
+            "Energy scenario bridge is missing forecast_name."
+        )
+    return source_aggregate_run_id, forecast_name
+
+
 def _symmetric_zero_axis(fig: go.Figure, *arrays, minimum: float = 0.01) -> None:
     finite = []
     for array in arrays:
@@ -215,9 +313,26 @@ def headline_scenario_main_figure(payload: dict | None, horizon: int = 3) -> go.
             customdata=[anchor_date or "Latest observed"],
             hovertemplate="Actual · %{customdata}<br>%{y:.2f}%<extra>Latest observed</extra>",
         ))
+    semantics = _impact_semantics(payload)
     errors = [
-        _fan(fig, dates, base, name="Baseline", color=INFLATION_COLORS["baseline"], bands=("68",), anchor_value=anchor_value),
-        _fan(fig, dates, cond, name="Conditional", color=INFLATION_COLORS["conditional"], bands=("68",), anchor_value=anchor_value),
+        _fan(
+            fig,
+            dates,
+            base,
+            name=semantics["reference"],
+            color=INFLATION_COLORS["baseline"],
+            bands=("68",),
+            anchor_value=anchor_value,
+        ),
+        _fan(
+            fig,
+            dates,
+            cond,
+            name=semantics["scenario"],
+            color=INFLATION_COLORS["conditional"],
+            bands=("68",),
+            anchor_value=anchor_value,
+        ),
     ]
     errors = [error for error in errors if error]
     if errors:
@@ -248,21 +363,52 @@ def headline_scenario_impact_figure(payload: dict | None, horizon: int = 3) -> g
     if not all(np.isfinite(x).all() for x in (q16, q50, mean, q84)):
         return _empty("Headline impact is unavailable: posterior summaries contain non-finite values.")
     labels = short_horizon_labels(dates)
+    semantics = _impact_semantics(payload)
+    horizon_note = _horizon_semantics(payload)
     fig = go.Figure()
     for trace in fan_traces(
         labels, {"q16": q16, "q50": q50, "q84": q84}, bands=("68",),
-        color=INFLATION_COLORS["impact"], name="Impact", show_median=False,
+        color=INFLATION_COLORS["impact"], name=semantics["impact"], show_median=False,
     ):
         fig.add_trace(trace)
     fig.add_trace(go.Scatter(
         x=labels, y=mean, customdata=_calendar_hover(dates), mode="lines+markers",
-        name="Posterior mean impact", line=dict(color=INFLATION_COLORS["impact"], width=2), marker=dict(size=5),
+        name="Posterior mean impact",
+        line=dict(color=INFLATION_COLORS["impact"], width=2),
+        marker=dict(size=5),
         hovertemplate="%{x} · %{customdata}<br>%{y:+.3f} pp<extra>Posterior mean impact</extra>",
     ))
     fig.add_hline(y=0, line_width=1, line_color=TOKENS["hairline"])
     apply_short_horizon_axis(fig, labels)
     _symmetric_zero_axis(fig, q16, q84, mean)
-    return _layout(fig, f"h6-impact::{payload.get('meta', {}).get('scenario_id')}::{horizon}", "percentage points", 420)
+    _layout(
+        fig,
+        f"h6-impact::{payload.get('meta', {}).get('scenario_id')}::{horizon}",
+        "percentage points",
+        420,
+    )
+    note = (
+        f"{semantics['impact']} · {semantics['reference']} · {semantics['scenario']}"
+    )
+    if horizon_note:
+        note += " · " + horizon_note
+    if semantics.get("interpretation"):
+        note += " · " + semantics["interpretation"]
+    if str((payload.get("meta") or {}).get("impact_reference") or "") == "energy_baseline_conditioned":
+        note += "; pre-scenario dispersion can arise from joint DK conditioning"
+    fig.add_annotation(
+        x=0,
+        y=1.12,
+        xref="paper",
+        yref="paper",
+        text=note,
+        showarrow=False,
+        xanchor="left",
+        yanchor="bottom",
+        align="left",
+        font=dict(size=10, color=TOKENS["muted"]),
+    )
+    return fig
 
 def component_transmission_figure(payload: dict | None, horizon: int = 3) -> go.Figure:
     if not payload:
@@ -287,7 +433,13 @@ def component_transmission_figure(payload: dict | None, horizon: int = 3) -> go.
     fig.add_hline(y=0, line_width=1, line_color=TOKENS["hairline"])
     apply_short_horizon_axis(fig, labels)
     _symmetric_zero_axis(fig, *plotted)
-    return _layout(fig, f"h6-components::{payload.get('meta', {}).get('scenario_id')}::{horizon}", "pp vs baseline", 430)
+    semantics = _impact_semantics(payload)
+    return _layout(
+        fig,
+        f"h6-components::{payload.get('meta', {}).get('scenario_id')}::{horizon}",
+        f"pp vs {semantics['denominator']}",
+        430,
+    )
 
 def contribution_impact_figure(payload: dict | None, horizon: int = 3) -> go.Figure:
     if not payload:
@@ -316,7 +468,13 @@ def contribution_impact_figure(payload: dict | None, horizon: int = 3) -> go.Fig
     fig.add_hline(y=0, line_width=1, line_color=TOKENS["hairline"])
     apply_short_horizon_axis(fig, labels)
     _symmetric_zero_axis(fig, positive, negative)
-    return _layout(fig, f"h6-contrib::{payload.get('meta', {}).get('scenario_id')}::{horizon}", "pp contribution impact · posterior mean", 430)
+    semantics = _impact_semantics(payload)
+    return _layout(
+        fig,
+        f"h6-contrib::{payload.get('meta', {}).get('scenario_id')}::{horizon}",
+        f"pp contribution impact vs {semantics['denominator']} · posterior mean",
+        430,
+    )
 
 def overlay_headline_conditional_forecast(
     fig: go.Figure,
@@ -595,6 +753,11 @@ def headline_scenarios_page() -> html.Div:
                 [
                     html.Button("Run conditional forecast", id="h6-run", n_clicks=0, className="refresh-button"),
                     html.Button("Clear", id="h6-clear", n_clicks=0, className="refresh-button h6-secondary-button"),
+                    html.Span(
+                        "Energy source runtime on the 20260816 reference run: "
+                        "~24 s with cached Energy-baseline A; ~46 s on a cold A+B run.",
+                        className="placeholder-text",
+                    ),
                 ],
                 className="h6-actions",
             ),
@@ -613,7 +776,10 @@ def headline_scenarios_page() -> html.Div:
                 [
                     html.Div(
                         [
-                            _panel_heading("Headline impact", "Conditional − baseline"),
+                            _panel_heading(
+                                "Headline impact",
+                                "Scenario effect — exact denominator shown inside chart",
+                            ),
                             dcc.Loading(dcc.Graph(id="h6-impact", config=graph_config("headline_scenario_impact")), type="circle"),
                         ],
                         className="panel chart-panel",
@@ -1243,21 +1409,32 @@ def _run_directory(results_root: Path, store: dict | None) -> Path:
 def _impact_kpis(payload: dict | None) -> tuple[str, str, str, str, str, str, str, str]:
     if not payload:
         return "—", "", "—", "", "—", "", "—", ""
-    q50 = _q(payload.get("headline_yoy_impact") or {})
+    mean = _q(payload.get("headline_yoy_impact") or {}, "mean")
     dates = pd.DatetimeIndex(pd.to_datetime(payload.get("dates") or []))
+    semantics = _impact_semantics(payload)
 
     def item(i: int):
-        if len(q50) <= i or not np.isfinite(q50[i]):
+        if len(mean) <= i or not np.isfinite(mean[i]):
             return "—", ""
         date = "" if len(dates) <= i else pd.Timestamp(dates[i]).strftime("%Y-%m")
-        return f"{q50[i]:+.2f} pp", date
+        note = f"{date} · posterior mean · vs {semantics['denominator']}"
+        return f"{mean[i]:+.2f} pp", note
 
     a, ad = item(0)
     b, bd = item(1)
     c, cd = item(2)
     meta = payload.get("meta") or {}
     draws = meta.get("n_draws")
-    return a, ad, b, bd, c, cd, ("—" if draws is None else f"{int(draws):,}"), "paired baseline/conditional"
+    return (
+        a,
+        ad,
+        b,
+        bd,
+        c,
+        cd,
+        ("—" if draws is None else f"{int(draws):,}"),
+        semantics["draws"],
+    )
 
 
 def register_headline_slice6_callbacks(
@@ -1528,7 +1705,6 @@ def register_headline_slice6_callbacks(
             H = int(H or 3)
             run_dir = _run_directory(results_root, headline_store)
             posterior = load_saved_headline_posterior(run_dir, project_root=project_root)
-            target = future_dates_for_saved(posterior, H)
             if source == "energy":
                 statistic = _energy_statistic(
                     path_kind,
@@ -1541,39 +1717,27 @@ def register_headline_slice6_callbacks(
                             "Build / refresh the Joint Energy scenario in "
                             "Energy → Scenarios before applying it to Headline."
                         )
-                    values, lineage = energy_bridge_condition(
-                        energy_payload,
-                        posterior=posterior,
-                        target_dates=target,
-                        statistic=statistic,
-                        project_root=project_root,
-                    )
-                    joint_meta = dict(
-                        energy_payload.get("meta") or {}
-                    )
-                    lineage.update(
-                        {
-                            "source_type": "joint_energy_scenario",
-                            "energy_application_mode": "joint",
-                            "energy_joint_scenario_count": int(
-                                joint_meta.get("scenario_count", 0)
-                            ),
-                            "energy_joint_scenario_labels": list(
-                                joint_meta.get(
-                                    "dashboard_active_labels"
-                                )
-                                or []
-                            ),
-                            "energy_joint_contract": energy_payload.get(
-                                "contract_version"
-                            ),
-                            "energy_marginal_effects_summed": False,
-                            "energy_joint_source": (
-                                "prebuilt_energy_scenarios_workspace"
-                            ),
-                            "energy_headline_bridge_rebuilt_on_apply": False,
-                        }
-                    )
+                    joint_meta = dict(energy_payload.get("meta") or {})
+                    lineage = {
+                        "source_type": "joint_energy_scenario",
+                        "energy_application_mode": "joint",
+                        "energy_joint_scenario_count": int(
+                            joint_meta.get("scenario_count", 0)
+                        ),
+                        "energy_joint_scenario_labels": list(
+                            joint_meta.get("dashboard_active_labels") or []
+                        ),
+                        "energy_joint_contract": energy_payload.get(
+                            "contract_version"
+                        ),
+                        "energy_marginal_effects_summed": False,
+                        "energy_joint_source": (
+                            "prebuilt_energy_scenarios_workspace"
+                        ),
+                        "energy_headline_bridge_rebuilt_on_apply": False,
+                        "condition_metric": "level",
+                        "condition_variable": "hicp_energy",
+                    }
                 else:
                     energy_row = _selected_energy_scenario_record(
                         conditional_store,
@@ -1590,29 +1754,27 @@ def register_headline_slice6_callbacks(
                         results_root=results_root,
                         project_root=project_root,
                     )
-                    values, lineage = energy_bridge_condition(
-                        energy_payload,
-                        posterior=posterior,
-                        target_dates=target,
-                        statistic=statistic,
-                        project_root=project_root,
-                    )
-                    lineage.update(
-                        {
-                            "energy_application_mode": "selected",
-                            "energy_scenario_selection_id": str(
-                                selected_id
-                            ),
-                            "energy_headline_bridge_rebuilt_on_apply": bool(
-                                bridge_rebuilt
-                            ),
-                        }
-                    )
-                conditions = {"hicp_energy": values}
-                lineage.update({
-                    "condition_metric": "level",
-                    "condition_variable": "hicp_energy",
-                })
+                    lineage = {
+                        "source_type": "energy_scenario",
+                        "energy_application_mode": "selected",
+                        "energy_scenario_selection_id": str(selected_id),
+                        "energy_headline_bridge_rebuilt_on_apply": bool(
+                            bridge_rebuilt
+                        ),
+                        "condition_metric": "level",
+                        "condition_variable": "hicp_energy",
+                    }
+                source_aggregate_run_id, energy_forecast_name = (
+                    _energy_source_contract(energy_payload)
+                )
+                lineage.update(
+                    {
+                        "impact_definition": "energy_scenario_minus_energy_baseline",
+                        "impact_baseline_label": "Energy baseline-conditioned",
+                        "impact_scenario_label": "Energy scenario-conditioned",
+                        "impact_interpretation": "conditional-forecast effect",
+                    }
+                )
             else:
                 _, values = manual_condition_levels(
                     posterior,
@@ -1628,6 +1790,13 @@ def register_headline_slice6_callbacks(
                     "condition_metric": manual_metric or "yoy",
                     "condition_input_values": str(manual_values or ""),
                     "energy_path_uncertainty_propagated": False,
+                    "impact_reference": "unconditional",
+                    "impact_definition": "manual_minus_unconditional",
+                    "impact_baseline_label": "Headline unconditional",
+                    "impact_scenario_label": "Manual conditional",
+                    "impact_interpretation": "conditional-forecast effect",
+                    "conditioned_horizon_months": H,
+                    "free_propagation_horizon_months": max(0, COMPUTATIONAL_HORIZON - H),
                 }
 
             official = pd.Series(posterior.inputs.official_total).astype(float).sort_index()
@@ -1639,30 +1808,46 @@ def register_headline_slice6_callbacks(
                     "headline_observed_anchor_yoy": float(observed_yoy.iloc[-1]),
                 })
 
-            payload = run_saved_headline_conditional(
-                run_dir,
-                native_level_conditions=conditions,
-                H=H,
-                lineage=lineage,
-                project_root=project_root,
-                persist=True,
-            )
-            m = payload["meta"]
-            path_note = ""
-            if m.get("source_type") in {
-                "energy_scenario",
-                "joint_energy_scenario",
-            }:
-                path_note = (
-                    f" · {m.get('condition_statistic_label', m.get('condition_statistic', ''))}"
+            if source == "energy":
+                payload = run_saved_headline_energy_marginal(
+                    run_dir,
+                    energy_store=energy_payload,
+                    source_aggregate_run_id=source_aggregate_run_id,
+                    forecast_name=energy_forecast_name,
+                    H=H,
+                    statistic=statistic,
+                    lineage=lineage,
+                    project_root=project_root,
+                    persist=True,
                 )
+            else:
+                payload = run_saved_headline_conditional(
+                    run_dir,
+                    native_level_conditions=conditions,
+                    H=H,
+                    lineage=lineage,
+                    project_root=project_root,
+                    persist=True,
+                )
+            m = payload["meta"]
+            semantics = _impact_semantics(payload)
+            path_note = (
+                f" · {m.get('condition_statistic_label', m.get('condition_statistic', ''))}"
+                if m.get("source_type") in {"energy_scenario", "joint_energy_scenario"}
+                else ""
+            )
+            path_note += (
+                f" · {semantics['impact']} · "
+                f"{semantics['reference']} · {semantics['scenario']}"
+            )
+            horizon_note = _horizon_semantics(payload)
             return payload, html.Div([
                 html.Strong("Conditional complete"),
                 html.Span(f" · {m['source_type']}"),
                 html.Span(path_note),
                 html.Span(f" · vintage {m['headline_vintage']}"),
                 html.Span(f" · {m['n_draws']} paired Headline draws"),
-                html.Span(f" · condition {m['condition_horizon']}m / compute {m['computational_horizon']}m"),
+                html.Span(f" · {horizon_note}" if horizon_note else ""),
                 html.Span(f" · lineage {m['lineage_verification_status']}"),
                 html.Span(f" · run {str(m['headline_run_id'])[:12]}"),
                 html.Span(" · BVAR re-estimation: NO"),

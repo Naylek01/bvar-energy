@@ -194,8 +194,7 @@ def policy_table(policy: dict | None):
         html.Td(ecb.get("rate_name") or "Deposit facility rate", style=cell),
         html.Td(current(ecb), style=cell), html.Td(_policy_move(ecb.get("last_move_pp")), style=cell),
         html.Td(_policy_date(ecb.get("effective_date")), style=cell), html.Td(_policy_date(ecb.get("next_meeting")), style=cell),
-    ])]
-    rows.append(html.Tr([
+    ])]    rows.append(html.Tr([
         html.Td(inst("United Kingdom · BoE", "Monetary Policy Committee", boe), style=cell),
         html.Td(boe.get("rate_name") or "Bank Rate", style=cell), html.Td(current(boe), style=cell),
         html.Td(_policy_move(boe.get("last_move_pp")), style=cell),

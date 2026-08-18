@@ -68,6 +68,7 @@ class StructuralDashboardError(RuntimeError):
     """Raised when a saved run cannot satisfy the structural contract."""
 
 
+# GRAPH_EXPORT_READABILITY_G2_ENERGY_STRUCTURAL_V1
 def _read_json(path: Path) -> dict[str, Any]:
     if not path.is_file():
         raise StructuralDashboardError(f"Missing metadata: {path}")
@@ -592,8 +593,8 @@ def volatility_sparkline_figure(
         template="plotly_white",
         height=105,
         margin={"l": 4, "r": 4, "t": 2, "b": 2},
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="white",
+        plot_bgcolor="white",
         hovermode="x",
         dragmode=False,
         xaxis={"visible": False, "fixedrange": True},
@@ -636,8 +637,8 @@ def relative_volatility_state_figure(
         template="plotly_white",
         height=max(220, 58 * len(cards) + 58),
         margin={"l": 10, "r": 54, "t": 18, "b": 42},
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="white",
+        plot_bgcolor="white",
         xaxis={
             "title": "Structural variance relative to its own sample median (×)",
             "range": [0.0, xmax],
@@ -1431,8 +1432,8 @@ def _empty_figure(message: str, *, height: int = 500) -> go.Figure:
         margin={"l": 48, "r": 24, "t": 56, "b": 48},
         xaxis={"visible": False},
         yaxis={"visible": False},
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="white",
+        plot_bgcolor="white",
     )
     return fig
 
@@ -1470,8 +1471,8 @@ def _layout(
             "zerolinecolor": "#CBD5E1",
             "zerolinewidth": 1,
         },
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="white",
+        plot_bgcolor="white",
         hoverlabel={"bgcolor": "white", "bordercolor": "#E2E8F0"},
         uirevision=uirevision,
     )

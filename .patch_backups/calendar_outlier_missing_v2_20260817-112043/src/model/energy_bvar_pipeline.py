@@ -148,7 +148,7 @@ class ModelSpec:
     seed: int = 42
     missing_data_method: str = "linear"
     simulate_future_outliers: bool = True
-    code_version: str = "energy_bvar_model-v4-calendar-prior-missing-selectable"
+    code_version: str = "energy_bvar_model-v3-frequency-aware-a-prior"
     forecast_seed: int = 2026
     forecast_draws_rule: str = "min_1000"
     forecast_draws: int = 500

@@ -64,21 +64,6 @@ CONTROL_LABEL_STYLE = {
     "letterSpacing": ".04em",
 }
 
-CLIMATE_DISPLAY_START_DATE = f"{GLOFAS_CLIMATOLOGY_START}-01-01"
-CLIMATE_DISPLAY_END_DATE = (
-    pd.Timestamp.today().to_period("M").to_timestamp().strftime("%Y-%m-%d")
-)
-_CLIMATE_MONTH_RANGE = pd.date_range(
-    CLIMATE_DISPLAY_START_DATE,
-    pd.Timestamp.today().to_period("M").to_timestamp(),
-    freq="MS",
-)
-CLIMATE_MONTH_OPTIONS = [
-    {"label": month.strftime("%Y-%m"), "value": month.strftime("%Y-%m-%d")}
-    for month in reversed(_CLIMATE_MONTH_RANGE)
-]
-DEFAULT_CLIMATE_COLOUR_LIMIT = 3.0
-
 
 def _panel_heading(eyebrow: str, title: str, subtitle: str):
     return html.Div(
@@ -222,66 +207,14 @@ def climate_section():
                         [
                             html.Div("Climate stress heatmap", style={"fontSize": "13px", "fontWeight": 700, "marginBottom": "2px"}),
                             html.Div(
-                                f"Positive values = drier / lower-flow stress. Seasonal z-scores always use the fixed {GLOFAS_CLIMATOLOGY_START}–{GLOFAS_CLIMATOLOGY_END} climatology; changing the display bounds does not recompute the scores.",
+                                f"Positive values = drier / lower-flow stress. Seasonal z-scores use the {GLOFAS_CLIMATOLOGY_START}–{GLOFAS_CLIMATOLOGY_END} climatology.",
                                 style={"fontSize": "10px", "color": TOKENS["muted"]},
                             ),
                         ]
                     ),
-                    html.Div(
-                        [
-                            html.Div(
-                                [
-                                    html.Label("Heatmap date range", style=CONTROL_LABEL_STYLE),
-                                    html.Div(
-                                        [
-                                            dcc.Dropdown(
-                                                id="economic-climate-start-month",
-                                                options=CLIMATE_MONTH_OPTIONS,
-                                                value=CLIMATE_DISPLAY_START_DATE,
-                                                clearable=False,
-                                                searchable=True,
-                                                style={"width": "130px"},
-                                            ),
-                                            html.Span("→", style={"color": TOKENS["muted"]}),
-                                            dcc.Dropdown(
-                                                id="economic-climate-end-month",
-                                                options=CLIMATE_MONTH_OPTIONS,
-                                                value=CLIMATE_DISPLAY_END_DATE,
-                                                clearable=False,
-                                                searchable=True,
-                                                style={"width": "130px"},
-                                            ),
-                                        ],
-                                        style={"display": "flex", "gap": "8px", "alignItems": "center"},
-                                    ),
-                                ]
-                            ),
-                            html.Div(
-                                [
-                                    html.Label("Colour range", style=CONTROL_LABEL_STYLE),
-                                    dcc.Slider(
-                                        id="economic-climate-colour-limit",
-                                        min=1,
-                                        max=6,
-                                        step=0.5,
-                                        value=DEFAULT_CLIMATE_COLOUR_LIMIT,
-                                        marks={1: "±1", 2: "±2", 3: "±3", 4: "±4", 5: "±5", 6: "±6"},
-                                    ),
-                                ]
-                            ),
-                        ],
-                        style={
-                            "display": "grid",
-                            "gridTemplateColumns": "minmax(300px,1fr) minmax(240px,.8fr)",
-                            "gap": "20px",
-                            "alignItems": "end",
-                            "marginTop": "14px",
-                            "marginBottom": "8px",
-                        },
-                    ),
                     dcc.Graph(
                         id="economic-climate-heatmap",
-                        figure=_empty_figure("Run the one-time GloFAS build to populate climate history.", height=380),
+                        figure=_empty_figure("Run the one-time GloFAS build to populate climate history.", height=360),
                         config={"displaylogo": False, "scrollZoom": True},
                     ),
                 ],
@@ -378,65 +311,26 @@ def render_kpis(payload: Mapping[str, Any] | None):
     return cards
 
 
-def _filter_display_window(
-    frame: pd.DataFrame,
-    start_date: str | None = None,
-    end_date: str | None = None,
-) -> tuple[pd.DataFrame, str | None]:
-    if frame.empty:
-        return frame, None
-    try:
-        start = (
-            pd.Timestamp(start_date).to_period("M").to_timestamp(how="start")
-            if start_date
-            else pd.Timestamp(frame["date"].min())
-        )
-        end = (
-            pd.Timestamp(end_date).to_period("M").to_timestamp(how="start")
-            if end_date
-            else pd.Timestamp(frame["date"].max())
-        )
-    except Exception:
-        return frame.iloc[0:0].copy(), "Select valid monthly display bounds."
-    if start > end:
-        return frame.iloc[0:0].copy(), "The display start month must be earlier than the display end month."
-    out = frame.loc[(frame["date"] >= start) & (frame["date"] <= end)].copy()
-    if out.empty:
-        return out, "No climate observations fall inside the selected display range."
-    return out, None
-
-
-def climate_heatmap_figure(
-    payload: Mapping[str, Any] | None,
-    start_date: str | None = None,
-    end_date: str | None = None,
-    colour_limit: float = DEFAULT_CLIMATE_COLOUR_LIMIT,
-) -> go.Figure:
+def climate_heatmap_figure(payload: Mapping[str, Any] | None) -> go.Figure:
     frame = _frame(payload)
     if frame.empty:
         return _empty_figure("No processed GloFAS history. Run climate_data.py build.", height=360)
     use = frame.loc[frame["series"].astype(str).isin(SERIES_ORDER)].copy()
     if use.empty:
-        return _empty_figure("Climate cache has no recognised stress series.", height=380)
-    use, range_error = _filter_display_window(use, start_date, end_date)
-    if range_error:
-        return _empty_figure(range_error, height=380)
+        return _empty_figure("Climate cache has no recognised stress series.", height=360)
+    # Keep a readable macro window while retaining zoom/pan for older history.
+    cutoff = use["date"].max() - pd.DateOffset(years=12)
+    use = use.loc[use["date"] >= cutoff]
     pivot = use.pivot_table(index="series", columns="date", values="stress_score", aggfunc="last")
     pivot = pivot.reindex([name for name in SERIES_ORDER if name in pivot.index])
     labels = [SERIES_LABELS.get(name, name) for name in pivot.index]
-    try:
-        limit = abs(float(colour_limit))
-    except (TypeError, ValueError):
-        limit = DEFAULT_CLIMATE_COLOUR_LIMIT
-    if not np.isfinite(limit) or limit < 0.5:
-        limit = DEFAULT_CLIMATE_COLOUR_LIMIT
     fig = go.Figure(
         go.Heatmap(
             z=pivot.to_numpy(dtype=float),
             x=pd.DatetimeIndex(pivot.columns),
             y=labels,
-            zmin=-limit,
-            zmax=limit,
+            zmin=-3,
+            zmax=3,
             zmid=0,
             colorscale="RdBu_r",
             colorbar={"title": "stress σ", "thickness": 12},
@@ -445,29 +339,20 @@ def climate_heatmap_figure(
         )
     )
     fig.update_layout(
-        template="plotly_white", height=380,
+        template="plotly_white", height=360,
         margin={"l": 165, "r": 30, "t": 18, "b": 35},
         dragmode="pan", hovermode="closest",
         xaxis_title=None, yaxis_title=None,
-        uirevision=f"climate-heatmap::{start_date or 'full'}::{end_date or 'full'}::{limit:g}",
     )
     fig.update_xaxes(showgrid=False)
     return fig
 
 
-def climate_detail_figure(
-    payload: Mapping[str, Any] | None,
-    series: str,
-    start_date: str | None = None,
-    end_date: str | None = None,
-) -> go.Figure:
+def climate_detail_figure(payload: Mapping[str, Any] | None, series: str) -> go.Figure:
     frame = _frame(payload)
     block = frame.loc[frame.get("series", pd.Series(dtype=str)).astype(str).eq(str(series))].sort_values("date") if not frame.empty else pd.DataFrame()
     if block.empty:
         return _empty_figure("No history is available for this climate series.")
-    block, range_error = _filter_display_window(block, start_date, end_date)
-    if range_error:
-        return _empty_figure(range_error)
     label = SERIES_LABELS.get(str(series), str(series))
     fig = go.Figure()
     fig.add_trace(
@@ -586,20 +471,12 @@ def register_climate_callbacks(
         Output("economic-climate-heatmap", "figure"),
         Output("economic-climate-kaub", "figure"),
         Input("economic-climate-store", "data"),
-        Input("economic-climate-start-month", "value"),
-        Input("economic-climate-end-month", "value"),
-        Input("economic-climate-colour-limit", "value"),
     )
-    def render_climate(payload, start_date, end_date, colour_limit):
+    def render_climate(payload):
         return (
             climate_status_text(payload),
             render_kpis(payload),
-            climate_heatmap_figure(
-                payload,
-                start_date=start_date,
-                end_date=end_date,
-                colour_limit=colour_limit,
-            ),
+            climate_heatmap_figure(payload),
             kaub_figure(payload),
         )
 
@@ -607,16 +484,9 @@ def register_climate_callbacks(
         Output("economic-climate-detail", "figure"),
         Input("economic-climate-store", "data"),
         Input("economic-climate-series", "value"),
-        Input("economic-climate-start-month", "value"),
-        Input("economic-climate-end-month", "value"),
     )
-    def render_detail(payload, series, start_date, end_date):
-        return climate_detail_figure(
-            payload,
-            series or SERIES_ORDER[0],
-            start_date=start_date,
-            end_date=end_date,
-        )
+    def render_detail(payload, series):
+        return climate_detail_figure(payload, series or SERIES_ORDER[0])
 
 
 __all__ = [
@@ -625,7 +495,4 @@ __all__ = [
     "climate_heatmap_figure",
     "climate_detail_figure",
     "kaub_figure",
-    "CLIMATE_MONTH_OPTIONS",
-    "CLIMATE_DISPLAY_START_DATE",
-    "CLIMATE_DISPLAY_END_DATE",
 ]

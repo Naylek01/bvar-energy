@@ -388,6 +388,7 @@ def _core_scenario_payload(run_dir: Path, headline_payload: dict) -> dict:
     }
 
 
+# GRAPH_EXPORT_READABILITY_G5_CORE_V1
 def _empty(message: str, height: int = 440) -> go.Figure:
     fig = go.Figure()
     fig.add_annotation(
@@ -395,6 +396,10 @@ def _empty(message: str, height: int = 440) -> go.Figure:
         showarrow=False, font=dict(size=13, color=TOKENS["muted"]),
     )
     apply_inflation_figure_style(fig, uirevision="core-empty", height=height)
+    fig.update_layout(
+        paper_bgcolor="white",
+        plot_bgcolor="white",
+    )
     fig.update_xaxes(visible=False)
     fig.update_yaxes(visible=False)
     return fig
@@ -443,12 +448,17 @@ def core_scenario_main_figure(payload: dict | None, headline_store: dict | None)
 
     _add_fan(fig, dates, (payload.get("baseline") or {}).get("yoy") or {}, name="Baseline", color=INFLATION_COLORS["baseline"])
     _add_fan(fig, dates, (payload.get("conditional") or {}).get("yoy") or {}, name="Conditional", color=INFLATION_COLORS["conditional"])
-    return apply_inflation_figure_style(
+    apply_inflation_figure_style(
         fig,
         uirevision=f"core-scenario::{(payload.get('meta') or {}).get('scenario_id')}",
         height=500,
         y_title="% y/y",
     )
+    fig.update_layout(
+        paper_bgcolor="white",
+        plot_bgcolor="white",
+    )
+    return fig
 
 
 def core_scenario_impact_figure(payload: dict | None) -> go.Figure:
@@ -476,12 +486,17 @@ def core_scenario_impact_figure(payload: dict | None) -> go.Figure:
         )
     )
     fig.add_hline(y=0, line_width=1, line_color=TOKENS["hairline"])
-    return apply_inflation_figure_style(
+    apply_inflation_figure_style(
         fig,
         uirevision=f"core-impact::{(payload.get('meta') or {}).get('scenario_id')}",
         height=430,
         y_title="percentage points",
     )
+    fig.update_layout(
+        paper_bgcolor="white",
+        plot_bgcolor="white",
+    )
+    return fig
 
 
 def register_core_dashboard_callbacks(

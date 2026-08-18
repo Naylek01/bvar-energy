@@ -960,3 +960,230 @@ html, body {
   }
 }
 
+/* ------------------------ LOT 1 result blocks ---------------------------- */
+/* Canonical result grammar used by scenario propagation cards.
+   Existing dashboard variables are used deliberately; LOT 1 does not repair
+   the pre-existing Python-token/CSS-variable theme drift. */
+.result-block {
+  min-width: 0;
+  min-height: 174px;
+  padding: 14px 15px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: none;
+  font-variant-numeric: tabular-nums;
+}
+.result-block-eyebrow {
+  margin-bottom: 8px;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1;
+  font-weight: 700;
+  letter-spacing: .085em;
+  text-transform: uppercase;
+}
+.result-block-value,
+.result-block-value-frame {
+  min-height: 27px;
+  display: flex;
+  align-items: center;
+}
+.result-block-value {
+  color: var(--text);
+  font-size: 23px;
+  line-height: 1.15;
+  font-weight: 700;
+  letter-spacing: -.025em;
+}
+.result-block-value--previous {
+  color: var(--text-soft);
+}
+.result-block-skeleton-bar {
+  display: block;
+  width: 72%;
+  height: 24px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-2);
+}
+.result-block-unit-date {
+  min-height: 17px;
+  margin-top: 4px;
+  color: var(--text-soft);
+  font-size: 11px;
+  line-height: 1.35;
+}
+.result-block-uncertainty {
+  min-height: 17px;
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 10.5px;
+  line-height: 1.35;
+}
+.result-block-state-text {
+  min-height: 16px;
+  margin-top: 5px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 650;
+  line-height: 1.35;
+}
+.result-block-rule {
+  margin: 10px 0 8px;
+  border-top: 1px solid var(--border);
+}
+.result-block-provenance {
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 9.5px;
+  line-height: 1.4;
+}
+.result-block--stale .result-block-eyebrow,
+.result-block--stale .result-block-value,
+.result-block--stale .result-block-unit-date,
+.result-block--stale .result-block-uncertainty,
+.result-block--stale .result-block-rule,
+.result-block--stale .result-block-provenance {
+  opacity: .62;
+}
+.result-block--stale .result-block-state-text {
+  color: var(--text-soft);
+}
+
+/* ----------------------- LOT 1 propagation block ------------------------- */
+.propagation-result-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+.propagation-contract-note {
+  margin-top: 12px;
+}
+.propagation-core-static {
+  min-width: 0;
+}
+@media (max-width: 980px) {
+  .propagation-result-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ---------------- LOT 1 explicit Headline propagation -------------------- */
+.propagation-headline-column {
+  min-width: 0;
+  display: grid;
+  gap: 8px;
+}
+.propagation-headline-column .estimation-run-button {
+  width: 100%;
+}
+.propagation-headline-status {
+  min-height: 18px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+/* HEADLINE STRUCTURAL FOLLOW-UP V1.2 */
+/* Equal-width comparison cards on wide screens. */
+.structural-comparison-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
+  width: 100%;
+  min-width: 0;
+}
+
+/* The original right-hand outer panel is converted in Python to this
+   neutral structural wrapper. It therefore owns no panel box to lose. */
+.structural-comparison-grid > .structural-total-fevd-group {
+  display: contents;
+}
+
+.structural-comparison-grid > *,
+.structural-comparison-grid > .structural-total-fevd-group > * {
+  min-width: 0;
+}
+
+/* FEVD has its own newly-created real panel and spans both columns. */
+.structural-comparison-grid .structural-fevd-panel {
+  grid-column: 1 / -1;
+  width: 100%;
+  min-width: 0;
+}
+
+.structural-comparison-grid .panel-heading {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: flex-start;
+  gap: 10px;
+}
+
+.structural-comparison-grid .panel-heading > * {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.structural-comparison-grid .panel-heading .chart-controls {
+  width: 100%;
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  justify-content: flex-start;
+  gap: 10px;
+}
+
+.structural-comparison-grid .panel-heading .control-block {
+  min-width: 0;
+  flex: 1 1 140px;
+}
+
+.structural-comparison-grid .panel-heading .wide-control {
+  min-width: 170px;
+  flex: 1 1 210px;
+}
+
+.structural-comparison-grid .panel-title,
+.structural-comparison-grid .panel-subtitle {
+  max-width: none;
+  overflow-wrap: normal;
+  word-break: normal;
+}
+
+.structural-comparison-grid .dash-table-container,
+.structural-comparison-grid .js-plotly-plot,
+.structural-comparison-grid .plot-container {
+  min-width: 0;
+  width: 100%;
+}
+
+/* Readability wins on genuinely narrow viewports. */
+@media (max-width: 1080px) {
+  .structural-comparison-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .structural-comparison-grid .structural-fevd-panel {
+    grid-column: 1;
+  }
+}
+
+/* GLOBAL PRODUCTION RESULTS WARNING V1 */
+.selection-banner.global-production-results-warning {
+  border-color: var(--danger);
+  background: var(--danger-soft);
+  color: var(--danger);
+  font-weight: 500;
+}
+.selection-banner.global-production-results-warning strong {
+  color: var(--danger);
+  font-weight: 700;
+}
+.selection-banner.global-production-results-warning span {
+  color: var(--danger);
+}

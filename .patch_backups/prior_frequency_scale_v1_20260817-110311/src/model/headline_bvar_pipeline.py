@@ -30,7 +30,6 @@ from energy_bvar_io import save_energy_bvar_forecast, save_energy_bvar_result
 from energy_bvar_model import (
     BVARSVOPriorConfig,
     SamplerConfig,
-    outlier_mean_frequency_from_years,
     forecast_bvar_sv_outlier,
     monthly_seasonal_dummies,
     run_energy_bvar,
@@ -53,7 +52,7 @@ from headline_joint_bvar import (
     state_paths_to_native,
 )
 
-PIPELINE_VERSION = "2026-08-17-frequency-aware-a-prior-v3"
+PIPELINE_VERSION = "2026-08-13-headline-dashboard-lineage-v2"
 # HEADLINE DELIVERY 1 — LINEAGE HARNESS
 MODEL_STATUS = "locked"
 BASELINE_P = 12
@@ -83,7 +82,7 @@ def production_prior_config() -> BVARSVOPriorConfig:
         phi_prior_mean=0.02,
         phi_prior_df=10.0,
         h0_var=4.0,
-        outlier_mean_frequency=outlier_mean_frequency_from_years(4.0, "monthly"),
+        outlier_mean_frequency=1.0 / 48.0,
         outlier_prior_observations=120.0,
         outlier_grid_min=2.0,
         outlier_grid_max=20.0,
@@ -157,7 +156,6 @@ def model_contract() -> dict[str, object]:
         "suite": "headline",
         "model_id": MODEL_ID,
         "status": MODEL_STATUS,
-        "frequency": "monthly",
         "lag_order": BASELINE_P,
         "seasonal_dummies": 11,
         "seasonal_reference_month": SEASONAL_REFERENCE_MONTH,
@@ -166,7 +164,6 @@ def model_contract() -> dict[str, object]:
         "food_weight_source": "Eurostat FOOD_NP + FOOD_P annual item weights",
         "publication_horizon_max_months": MAX_PUBLISHED_HORIZON_MONTHS,
         "dashboard_publish_beyond_h12": False,
-        "missing_data_method_baseline": "dk",
         "pipeline_version": PIPELINE_VERSION,
         "sampler": {
             "reps": 6000,
@@ -181,13 +178,10 @@ def model_contract() -> dict[str, object]:
             "lambda3": 1.00,
             "lambda4": 10.0,
             "a_prior_var": 10.0,
-            "a_prior_scale_normalized": True,
             "phi_prior_mean": 0.02,
             "phi_prior_df": 10.0,
             "h0_var": 4.0,
-            "outlier_mean_frequency": outlier_mean_frequency_from_years(4.0, "monthly"),
-            "outlier_mean_interval_years": 4.0,
-            "outlier_mean_interval_periods": 48.0,
+            "outlier_mean_frequency": 1.0 / 48.0,
             "outlier_prior_observations": 120.0,
             "outlier_grid_min": 2.0,
             "outlier_grid_max": 20.0,
@@ -356,7 +350,6 @@ def estimate_locked_headline(
     *,
     prior_config: BVARSVOPriorConfig | None = None,
     sampler_config: SamplerConfig | None = None,
-    missing_data_method: str = "dk",
     code_version: str = PIPELINE_VERSION,
 ) -> dict:
     """Estimate the only production specification: BVAR(12) + 11 month dummies."""
@@ -376,7 +369,6 @@ def estimate_locked_headline(
         exog_prior_scale=SEASONAL_EXOG_PRIOR_SCALE,
         prior_config=prior_config,
         sampler_config=sampler_config,
-        missing_data_method=str(missing_data_method),
         code_version=code_version,
     )
     result["headline_joint_context"] = {
@@ -741,7 +733,6 @@ def run_headline(
     results_root: str | Path | None = None,
     prior_config: BVARSVOPriorConfig | None = None,
     sampler_config: SamplerConfig | None = None,
-    missing_data_method: str = "dk",
     H: int = MAX_PUBLISHED_HORIZON_MONTHS,
     n_forecast_draws: int | None = 1000,
     simulate_future_outliers: bool = True,
@@ -757,7 +748,6 @@ def run_headline(
         inputs,
         prior_config=prior_config,
         sampler_config=sampler_config,
-        missing_data_method=str(missing_data_method),
     )
     available = int(result["n_draws"])
     requested = available if n_forecast_draws is None else int(n_forecast_draws)

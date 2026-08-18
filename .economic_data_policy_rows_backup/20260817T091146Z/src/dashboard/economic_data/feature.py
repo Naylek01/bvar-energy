@@ -195,6 +195,16 @@ def policy_table(policy: dict | None):
         html.Td(current(ecb), style=cell), html.Td(_policy_move(ecb.get("last_move_pp")), style=cell),
         html.Td(_policy_date(ecb.get("effective_date")), style=cell), html.Td(_policy_date(ecb.get("next_meeting")), style=cell),
     ])]
+    shade = {**cell, "background": "rgba(17,24,39,.018)"}
+    for country in ("France", "Germany"):
+        rows.append(html.Tr([
+            html.Td(inst(country, "Eurosystem · ECB policy applies", indent=True), style=shade),
+            html.Td("ECB DFR applies", style={**shade, "color": TOKENS["muted"]}),
+            html.Td(current(ecb), style=shade),
+            html.Td(html.Span("same ECB", style={"fontSize": "9px", "color": TOKENS["muted"]}), style=shade),
+            html.Td(_policy_date(ecb.get("effective_date")), style={**shade, "color": TOKENS["muted"]}),
+            html.Td(_policy_date(ecb.get("next_meeting")), style={**shade, "color": TOKENS["muted"]}),
+        ]))
     rows.append(html.Tr([
         html.Td(inst("United Kingdom · BoE", "Monetary Policy Committee", boe), style=cell),
         html.Td(boe.get("rate_name") or "Bank Rate", style=cell), html.Td(current(boe), style=cell),
@@ -558,7 +568,7 @@ def economic_data_page():
                     _panel_heading(
                         "Monetary policy",
                         "Official policy rates",
-                        "ECB Deposit Facility Rate and Bank of England Bank Rate.",
+                        "ECB Deposit Facility Rate and Bank of England Bank Rate. France and Germany inherit the ECB rate through the Eurosystem.",
                     ),
                     html.Div(
                         [

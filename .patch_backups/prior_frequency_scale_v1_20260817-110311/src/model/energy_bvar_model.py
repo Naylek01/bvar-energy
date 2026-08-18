@@ -58,14 +58,6 @@ class BVARSVOPriorConfig:
         sd(constant i) = sigma_i * lambda4
 
     The coefficient prior is centred on white noise (all lag means equal 0).
-
-    ``a_prior_var`` is the variance in standardized residual units. The effective
-    prior for a contemporaneous coefficient a[i,j] is scale-normalised as
-    ``a_prior_var * (sigma_i / sigma_j)**2``.
-
-    ``outlier_mean_frequency`` is always a probability per model period. Production
-    callers should use :func:`default_bvar_svo_prior_config` when they want the
-    paper-style calendar interpretation of one outlier every four years.
     """
 
     lambda1: float = 0.20
@@ -200,76 +192,6 @@ def _canonical_frequency(frequency: str) -> str:
         return _FREQUENCY_ALIASES[key]
     except KeyError as exc:
         raise ValueError("frequency must be 'monthly' or 'weekly'.") from exc
-
-
-_PERIODS_PER_YEAR = {"monthly": 12.0, "weekly": 52.0}
-PRIOR_IMPLEMENTATION_VERSION = "2026-08-17-frequency-aware-outlier-scale-normalised-A-v2"
-
-
-def periods_per_year(frequency: str) -> float:
-    """Return the production calendar conversion used by prior controls."""
-    return float(_PERIODS_PER_YEAR[_canonical_frequency(frequency)])
-
-
-def outlier_mean_frequency_from_years(mean_interval_years: float, frequency: str) -> float:
-    """Convert a calendar mean interval in years to a per-period Bernoulli mean."""
-    years = float(mean_interval_years)
-    if not np.isfinite(years) or years <= 0:
-        raise ValueError("mean_interval_years must be finite and positive.")
-    periods = years * periods_per_year(frequency)
-    if periods <= 1.0:
-        raise ValueError("The mean outlier interval must exceed one model period.")
-    return float(1.0 / periods)
-
-
-def outlier_mean_interval_years(outlier_mean_frequency: float, frequency: str) -> float:
-    """Convert a per-period Bernoulli prior mean back to a calendar interval."""
-    probability = float(outlier_mean_frequency)
-    if not np.isfinite(probability) or not 0 < probability < 1:
-        raise ValueError("outlier_mean_frequency must lie in (0, 1).")
-    return float((1.0 / probability) / periods_per_year(frequency))
-
-
-def outlier_prior_observations_from_years(prior_strength_years: float, frequency: str) -> float:
-    """Convert calendar years of Beta-prior information to model periods.
-
-    The legacy monthly baseline used 120 prior observations, i.e. ten years of
-    monthly information.  This helper preserves the same calendar strength at
-    other frequencies: ten years -> 120 months or 520 weeks.
-    """
-    years = float(prior_strength_years)
-    if not np.isfinite(years) or years <= 0:
-        raise ValueError("prior_strength_years must be finite and positive.")
-    return float(years * periods_per_year(frequency))
-
-
-def outlier_prior_strength_years(outlier_prior_observations: float, frequency: str) -> float:
-    """Convert Beta-prior pseudo-observations back to calendar years."""
-    observations = float(outlier_prior_observations)
-    if not np.isfinite(observations) or observations <= 0:
-        raise ValueError("outlier_prior_observations must be finite and positive.")
-    return float(observations / periods_per_year(frequency))
-
-
-def default_bvar_svo_prior_config(
-    frequency: str = "monthly",
-    *,
-    outlier_interval_years: float = 4.0,
-    outlier_prior_strength_years: float = 10.0,
-) -> BVARSVOPriorConfig:
-    """Frequency-aware production baseline for the common BVAR-SV-outlier prior.
-
-    Both the prior mean interval and the Beta-prior strength are expressed in
-    calendar time, so the monthly and weekly models encode the same belief.
-    """
-    return BVARSVOPriorConfig(
-        outlier_mean_frequency=outlier_mean_frequency_from_years(
-            outlier_interval_years, frequency
-        ),
-        outlier_prior_observations=outlier_prior_observations_from_years(
-            outlier_prior_strength_years, frequency
-        ),
-    )
 
 
 def _calendar_rule(frequency: str) -> str:
@@ -918,22 +840,6 @@ def make_bvar_svo_prior(
     if np.any(v0_diag <= 0):
         raise ValueError("The coefficient prior contains non-positive variances.")
 
-    # A[row, col] multiplies a reduced-form residual measured in units ``col``
-    # inside structural equation ``row``. Its natural coefficient scale is
-    # therefore sigma_row / sigma_col. Keeping ``a_prior_var`` in standardized
-    # units makes the prior invariant to harmless rescalings of observables.
-    a_var_matrix = np.full((n, n), np.nan, dtype=float)
-    for row in range(1, n):
-        a_var_matrix[row, :row] = (
-            float(config.a_prior_var)
-            * (scales[row] / scales[:row]) ** 2
-        )
-    finite_a = a_var_matrix[np.tril_indices(n, k=-1)]
-    if finite_a.size and (
-        np.any(~np.isfinite(finite_a)) or np.any(finite_a <= 0)
-    ):
-        raise ValueError("The scale-normalised A prior contains invalid variances.")
-
     outlier_alpha = config.outlier_mean_frequency * config.outlier_prior_observations
     outlier_beta = (1.0 - config.outlier_mean_frequency) * config.outlier_prior_observations
     grid = np.arange(
@@ -956,12 +862,7 @@ def make_bvar_svo_prior(
         "coefficient_labels": coefficient_labels(variables, p, exog_names),
         "scales": scales,
         "a_mean": 0.0,
-        # ``a_var`` is retained as the standardized scalar for backward-facing
-        # diagnostics. Sampling uses ``a_var_matrix`` whenever it is present.
         "a_var": float(config.a_prior_var),
-        "a_var_standardized": float(config.a_prior_var),
-        "a_var_matrix": a_var_matrix,
-        "a_prior_scale_normalized": True,
         "phi_shape": float(phi_shape),
         "phi_scale": float(phi_scale),
         "phi_prior_mean": float(config.phi_prior_mean),
@@ -1114,25 +1015,15 @@ def draw_constant_cholesky_A(
     if q.shape != (T, n):
         raise ValueError("structural_variances has the wrong shape.")
     A = np.eye(n)
+    prior_var = float(prior["a_var"])
     prior_mean = float(prior["a_mean"])
-    matrix = prior.get("a_var_matrix")
-    if matrix is not None:
-        matrix = np.asarray(matrix, dtype=float)
-        if matrix.shape != (n, n):
-            raise ValueError("a_var_matrix has the wrong shape.")
 
     for row in range(1, n):
         Z = residuals[:, :row]
         y = -residuals[:, row]
         weights = 1.0 / q[:, row]
-        if matrix is None:
-            prior_var = np.full(row, float(prior["a_var"]), dtype=float)
-        else:
-            prior_var = np.asarray(matrix[row, :row], dtype=float)
-        if np.any(~np.isfinite(prior_var)) or np.any(prior_var <= 0):
-            raise ValueError(f"Invalid A-prior variance in row {row}.")
-        precision = np.diag(1.0 / prior_var) + Z.T @ (weights[:, None] * Z)
-        rhs = prior_mean / prior_var + Z.T @ (weights * y)
+        precision = np.eye(row) / prior_var + Z.T @ (weights[:, None] * Z)
+        rhs = np.full(row, prior_mean / prior_var) + Z.T @ (weights * y)
         covariance = np.linalg.inv(0.5 * (precision + precision.T))
         mean = covariance @ rhs
         A[row, :row] = mean + _safe_cholesky(covariance) @ rng.standard_normal(row)
@@ -2114,12 +2005,7 @@ def gibbs_bvar_sv_outlier(
     progress_callback=None,
 ) -> dict:
     """Estimate the constant-coefficient BVAR-SV-outlier model."""
-    frequency = _canonical_frequency(frequency)
-    prior_config = (
-        default_bvar_svo_prior_config(frequency)
-        if prior_config is None
-        else prior_config
-    )
+    prior_config = BVARSVOPriorConfig() if prior_config is None else prior_config
     sampler_config = SamplerConfig() if sampler_config is None else sampler_config
     prior_config.validate()
     sampler_config.validate()
@@ -3838,7 +3724,6 @@ def hash_run_config(
     missing_data_method: str = "dk",
 ) -> str:
     payload = {
-        "prior_implementation_version": PRIOR_IMPLEMENTATION_VERSION,
         "frequency": _canonical_frequency(frequency),
         "missing_data_method": _canonical_missing_data_method(missing_data_method),
         "p": int(p),
@@ -3904,18 +3789,7 @@ def build_run_metadata(
         **identity,
         "run_id": run_id,
         "result_schema_version": result_schema_version,
-        "prior_implementation_version": PRIOR_IMPLEMENTATION_VERSION,
-        "prior_config": asdict(prior_config),
         "frequency": frequency,
-        "outlier_period_unit": "months" if frequency == "monthly" else "weeks",
-        "outlier_mean_interval_periods": float(1.0 / prior_config.outlier_mean_frequency),
-        "outlier_mean_interval_years": outlier_mean_interval_years(
-            prior_config.outlier_mean_frequency, frequency
-        ),
-        "outlier_prior_observations": float(prior_config.outlier_prior_observations),
-        "outlier_prior_strength_years": outlier_prior_strength_years(
-            prior_config.outlier_prior_observations, frequency
-        ),
         "calendar_rule": _calendar_rule(frequency),
         "missing_data_method": _canonical_missing_data_method(missing_data_method),
         "missing_treatment_exact": bool(missing_treatment_exact),
@@ -3950,11 +3824,7 @@ def run_energy_bvar(
     """Run the generic monthly/weekly engine and attach a cache-safe identity."""
     frequency = _canonical_frequency(frequency)
     missing_data_method = _canonical_missing_data_method(missing_data_method)
-    prior_config = (
-        default_bvar_svo_prior_config(frequency)
-        if prior_config is None
-        else prior_config
-    )
+    prior_config = BVARSVOPriorConfig() if prior_config is None else prior_config
     sampler_config = SamplerConfig() if sampler_config is None else sampler_config
     variables = list(levels.columns) if variables is None else list(variables)
     result = gibbs_bvar_sv_outlier(
@@ -4010,26 +3880,6 @@ def run_energy_bvar(
         ),
         "dk_projection_mode": sampler_config.dk_projection_mode,
         "dk_projection_diagnostics": result.get("dk_projection_diagnostics"),
-        "a_prior_scale_normalized": bool(
-            result.get("prior", {}).get("a_prior_scale_normalized", False)
-        ),
-        "a_prior_variance_standardized": float(prior_config.a_prior_var),
-        "ar1_residual_scales": {
-            str(name): float(value)
-            for name, value in zip(
-                variables, np.asarray(result.get("prior", {}).get("scales", []), dtype=float)
-            )
-        },
-        "a_prior_effective_variances": (
-            [
-                [None if not np.isfinite(value) else float(value) for value in row]
-                for row in np.asarray(
-                    result.get("prior", {}).get("a_var_matrix"), dtype=float
-                )
-            ]
-            if result.get("prior", {}).get("a_var_matrix") is not None
-            else None
-        ),
     })
     return result
 
@@ -4045,13 +3895,6 @@ gas_historical_decomposition = historical_decomposition
 __all__ = [
     "BVARSVOPriorConfig",
     "SamplerConfig",
-    "PRIOR_IMPLEMENTATION_VERSION",
-    "periods_per_year",
-    "outlier_mean_frequency_from_years",
-    "outlier_mean_interval_years",
-    "outlier_prior_observations_from_years",
-    "outlier_prior_strength_years",
-    "default_bvar_svo_prior_config",
     "load_energy_panel",
     "monthly_seasonal_dummies",
     "prepare_bvar_panel",

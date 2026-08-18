@@ -148,7 +148,7 @@ class ModelSpec:
     seed: int = 42
     missing_data_method: str = "linear"
     simulate_future_outliers: bool = True
-    code_version: str = "energy_bvar_model-v4-calendar-prior-missing-selectable"
+    code_version: str = "energy_bvar_model-v2"
     forecast_seed: int = 2026
     forecast_draws_rule: str = "min_1000"
     forecast_draws: int = 500
@@ -961,7 +961,6 @@ def planned_run_metadata(
         BVARSVOPriorConfig,
         SamplerConfig,
         build_run_metadata,
-        default_bvar_svo_prior_config,
     )
 
     spec = model_spec(name, **(spec_overrides or {}))
@@ -971,11 +970,7 @@ def planned_run_metadata(
         project_root=project_root,
         spec_overrides=spec_overrides,
     )
-    prior_config = (
-        default_bvar_svo_prior_config(spec.frequency)
-        if prior_config is None
-        else prior_config
-    )
+    prior_config = BVARSVOPriorConfig() if prior_config is None else prior_config
     sampler_config = (
         SamplerConfig(seed=spec.seed) if sampler_config is None else sampler_config
     )
@@ -1033,7 +1028,6 @@ def run_component(
     from energy_bvar_model import (
         BVARSVOPriorConfig,
         SamplerConfig,
-        default_bvar_svo_prior_config,
         forecast_bvar_sv_outlier,
         run_energy_bvar,
     )
@@ -1056,11 +1050,7 @@ def run_component(
         results_root = find_project_root(project_root) / "results"
     results_root = Path(results_root)
 
-    prior_config = (
-        default_bvar_svo_prior_config(spec.frequency)
-        if prior_config is None
-        else prior_config
-    )
+    prior_config = BVARSVOPriorConfig() if prior_config is None else prior_config
     if sampler_config is None:
         sampler_config = SamplerConfig(seed=spec.seed)
 

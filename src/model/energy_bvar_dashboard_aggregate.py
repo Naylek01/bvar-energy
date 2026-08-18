@@ -190,6 +190,7 @@ def _append_anchor(block: pd.DataFrame, *, date, value) -> pd.DataFrame:
     return pd.concat([pd.DataFrame([anchor]), block], ignore_index=True).sort_values("date")
 
 
+# GRAPH_EXPORT_READABILITY_G3_AGGREGATE_V1
 def _layout(fig: go.Figure, *, title: str, unit: str | None, uirevision: str, height: int = 500) -> go.Figure:
     fig.update_layout(
         template="plotly_white",
@@ -204,8 +205,8 @@ def _layout(fig: go.Figure, *, title: str, unit: str | None, uirevision: str, he
         hoverlabel={"bgcolor": "white", "bordercolor": "#e5e7eb", "font": {"color": _INK}},
         legend={"orientation": "h", "y": 1.08, "x": 1, "xanchor": "right", "font": {"size": 11}},
         uirevision=uirevision,
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="white",
+        plot_bgcolor="white",
     )
     fig.update_xaxes(showgrid=False, linecolor="#e5e7eb", tickfont={"color": _MUTED})
     fig.update_yaxes(gridcolor=_GRID, zerolinecolor="#d1d5db", tickfont={"color": _MUTED})
@@ -221,7 +222,7 @@ def empty_aggregate_figure(message: str) -> go.Figure:
     fig.update_layout(
         template="plotly_white", height=420, margin={"l": 54, "r": 24, "t": 54, "b": 42},
         xaxis={"visible": False}, yaxis={"visible": False},
-        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="white", plot_bgcolor="white",
     )
     return fig
 

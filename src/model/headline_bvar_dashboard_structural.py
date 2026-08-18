@@ -47,6 +47,8 @@ from inflation_table_contract import (
     structural_fevd_table,
     structural_hd_records,
     structural_irf_records,
+    fmt,
+    interval,
 )
 from headline_bvar_conditional import (
     HeadlineConditionalError,
@@ -77,6 +79,7 @@ class HeadlineStructuralDashboardError(RuntimeError):
     """Raised when a saved Headline run cannot satisfy the interactive contract."""
 
 
+# GRAPH_EXPORT_READABILITY_G1_HEADLINE_STRUCTURAL_V1
 def _label(name: str) -> str:
     return STATE_LABELS.get(str(name), str(name).replace("state__hicp_", "").replace("_", " ").title())
 
@@ -436,8 +439,8 @@ def _empty_figure(message: str, *, height: int = 430) -> go.Figure:
         margin={"l": 48, "r": 24, "t": 42, "b": 48},
         xaxis={"visible": False},
         yaxis={"visible": False},
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="white",
+        plot_bgcolor="white",
     )
     return fig
 
@@ -506,8 +509,8 @@ def volatility_sparkline_figure(
         template="plotly_white",
         height=105,
         margin={"l": 4, "r": 4, "t": 2, "b": 2},
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="white",
+        plot_bgcolor="white",
         hovermode="x",
         dragmode=False,
         xaxis={"visible": False, "fixedrange": True},
@@ -559,8 +562,8 @@ def relative_volatility_state_figure(
         template="plotly_white",
         height=max(220, 58 * len(cards) + 58),
         margin={"l": 10, "r": 54, "t": 18, "b": 42},
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="white",
+        plot_bgcolor="white",
         xaxis={
             "title": "Structural variance relative to its own sample median (×)",
             "range": [0.0, xmax],
@@ -864,8 +867,8 @@ def _layout(
             "zerolinecolor": "#CBD5E1",
             "zerolinewidth": 1,
         },
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="white",
+        plot_bgcolor="white",
         hoverlabel={"bgcolor": "white", "bordercolor": "#E2E8F0"},
         uirevision=uirevision,
     )
@@ -923,9 +926,7 @@ def irf_figure(
             hoverinfo="skip",
         ))
     fig.add_trace(go.Scatter(
-        x=part["horizon"],
-        y=part["q50"],
-        mode="lines+markers",
+        x=part["horizon"], y=part["q50"], mode="lines+markers",
         line={"width": 2.5, "color": "#2563EB"},
         marker={"size": 4, "color": "#2563EB"},
         name="Posterior median",
@@ -933,12 +934,9 @@ def irf_figure(
     ))
     fig.add_hline(y=0.0, line_width=1.1, line_color="#94A3B8")
     fig.update_xaxes(title="Horizon (months)")
-    y_title = (
-        "100 × Δlog points"
-        if metric == "change"
-        else "100 × cumulative Δlog"
-    )
-    return _layout(
+    y_title = "100 × Δlog points" if metric == "change" else "100 × cumulative Δlog"
+    labels = dict(payload.get("labels", {}) or {})
+    result = _layout(
         fig,
         y_title=y_title,
         height=470,
@@ -947,6 +945,26 @@ def irf_figure(
             f"{payload.get('shock_unit')}::{payload.get('shock_size')}"
         ),
     )
+    result.update_layout(
+        title=(
+            "Component IRF — "
+            f"{labels.get(shock, _label(shock))} shock → "
+            f"{labels.get(response, _label(response))} · {y_title}"
+        )
+    )
+    result.update_layout(
+        title_x=0.0,
+        title_xanchor="left",
+        legend={
+            "orientation": "h",
+            "x": 0.0,
+            "xanchor": "left",
+            "y": -0.24,
+            "yanchor": "top",
+        },
+        margin={"b": 110},
+    )
+    return result
 
 
 def fevd_figure(
@@ -969,10 +987,19 @@ def fevd_figure(
     if part.empty:
         return _empty_figure("No FEVD summary is available.", height=420)
 
-    fig = go.Figure()
+    # Display-only focus. The full FEVD remains in the table.
+    cross = part.loc[part["shock"] != response].copy()
+    if cross.empty:
+        return _empty_figure("No cross-shock FEVD shares are available.", height=420)
+
     labels = dict(payload.get("labels", {}) or {})
-    for j, shock in enumerate(payload["variables"]):
-        block = part.loc[part["shock"] == shock].sort_values("horizon")
+    variables = list(payload.get("variables") or [])
+
+    fig = go.Figure()
+    for j, shock in enumerate(variables):
+        if shock == response:
+            continue
+        block = cross.loc[cross["shock"] == shock].sort_values("horizon")
         if block.empty:
             continue
         label = labels.get(shock, _label(shock))
@@ -980,23 +1007,50 @@ def fevd_figure(
             x=block["horizon"],
             y=block["q50"],
             name=label,
-            marker={
-                "color": _STRUCTURAL_COLOURS[j % len(_STRUCTURAL_COLOURS)]
-            },
-            hovertemplate="h=%{x}<br>%{y:.1f}%<extra>" + label + "</extra>",
+            marker={"color": _STRUCTURAL_COLOURS[j % len(_STRUCTURAL_COLOURS)]},
+            hovertemplate="h=%{x}<br>%{y:.2f}%<extra>" + label + "</extra>",
         ))
+
+    cross_sum = (
+        cross.groupby("horizon", as_index=False)["q50"]
+        .sum()["q50"]
+        .to_numpy(dtype=float)
+    )
+    finite = cross_sum[np.isfinite(cross_sum)]
+    upper = float(np.max(finite)) if finite.size else 1.0
+    upper = max(1.0, upper * 1.15)
+
     fig.update_layout(barmode="stack", bargap=0.18)
-    fig.update_yaxes(range=[0, 100], ticksuffix="%")
+    fig.update_yaxes(range=[0.0, upper], ticksuffix="%")
     fig.update_xaxes(title="Forecast horizon (months)")
-    return _layout(
+
+    response_label = labels.get(response, _label(response))
+    result = _layout(
         fig,
-        y_title="Forecast-error variance share",
+        y_title="Cross-shock forecast-error variance share",
         height=420,
         uirevision=(
-            f"{payload.get('run_id')}::headline-fevd::{response}::"
+            f"{payload.get('run_id')}::headline-fevd-cross::{response}::"
             f"{payload.get('reference_date')}"
         ),
     )
+    result.update_layout(
+        title=(
+            f"Cross-shock FEVD — {response_label} · "
+            "own shock excluded from chart"
+        ),
+        title_x=0.0,
+        title_xanchor="left",
+        legend={
+            "orientation": "h",
+            "x": 0.0,
+            "xanchor": "left",
+            "y": -0.24,
+            "yanchor": "top",
+        },
+        margin={"b": 110},
+    )
+    return result
 
 
 def _visible_x_window(relayout_data):
@@ -1156,6 +1210,10 @@ def _stat_card(title: str, value_id: str, subtitle_id: str) -> html.Div:
     )
 
 
+# HEADLINE_STRUCTURAL_PRESENTATION_V1
+# HEADLINE_STRUCTURAL_LABELS_LOTA_V1
+# HEADLINE_STRUCTURAL_LAYOUT_LOTB_V1
+# HEADLINE_STRUCTURAL_FOLLOWUP_V1_2
 def headline_structural_page() -> html.Div:
     """Energy-style Structural workspace for the Headline joint BVAR."""
     badge_style = {
@@ -1173,6 +1231,7 @@ def headline_structural_page() -> html.Div:
     return html.Div(
         [
             dcc.Store(id="headline-structural-live-store", storage_type="memory"),
+            dcc.Store(id="headline-total-structural-store", storage_type="memory"),
             html.Div(
                 [
                     html.Div(
@@ -1220,7 +1279,7 @@ def headline_structural_page() -> html.Div:
                                         min=1,
                                         max=MAX_HORIZON,
                                         step=1,
-                                        value=DEFAULT_HORIZON,
+                                        value=6,
                                         className="est-profile-name-input",
                                     ),
                                 ],
@@ -1568,152 +1627,269 @@ def headline_structural_page() -> html.Div:
                         [
                             html.Div(
                                 [
-                                    html.H3(
-                                        "Impulse responses",
-                                        className="panel-title",
+                                    html.Div(
+                                        [
+                                            html.H3(
+                                                "Impulse responses",
+                                                className="panel-title",
+                                            ),
+                                            html.P(
+                                                'Structural timing: the shock hits at the reference date; h=0 is the contemporaneous impact.',
+                                                className="panel-subtitle",
+                                            ),
+                                            html.P(
+                                                "A 1σ IRF uses the shocked equation's √λ at the computed reference date. "
+                                                "Level-impact IRFs are normalised in 100 × log points and are exactly invariant "
+                                                "to the selected SV date.",
+                                                className="panel-subtitle",
+                                            ),
+                                        ]
                                     ),
-                                    html.P(
-                                        "A 1σ IRF uses the shocked equation's √λ at the computed reference date. "
-                                        "Level-impact IRFs are normalised in 100 × log points and are exactly invariant "
-                                        "to the selected SV date.",
-                                        className="panel-subtitle",
+                                    html.Div(
+                                        [
+                                            html.Div(
+                                                [
+                                                    html.Label(
+                                                        "Shock",
+                                                        className="control-label",
+                                                    ),
+                                                    dcc.Dropdown(
+                                                        id="headline-structural-shock",
+                                                        options=[],
+                                                        clearable=False,
+                                                        className=(
+                                                            "compact-dropdown wide-control"
+                                                        ),
+                                                    ),
+                                                ],
+                                                className="control-block wide-control",
+                                            ),
+                                            html.Div(
+                                                [
+                                                    html.Label(
+                                                        "Response",
+                                                        className="control-label",
+                                                    ),
+                                                    dcc.Dropdown(
+                                                        id="headline-structural-response",
+                                                        options=[],
+                                                        clearable=False,
+                                                        className=(
+                                                            "compact-dropdown wide-control"
+                                                        ),
+                                                    ),
+                                                ],
+                                                className="control-block wide-control",
+                                            ),
+                                            html.Div(
+                                                [
+                                                    html.Label(
+                                                        "IRF object",
+                                                        className="control-label",
+                                                    ),
+                                                    dcc.RadioItems(
+                                                        id="headline-structural-irf-metric",
+                                                        options=[
+                                                            {
+                                                                "label": "Cumulative level",
+                                                                "value": "cumulative",
+                                                            },
+                                                            {
+                                                                "label": "Period change",
+                                                                "value": "change",
+                                                            },
+                                                        ],
+                                                        value="cumulative",
+                                                        inline=True,
+                                                        className="fan-radio",
+                                                    ),
+                                                ],
+                                                className="control-block",
+                                            ),
+                                            html.Div(
+                                                [
+                                                    html.Label(
+                                                        "Fan",
+                                                        className="control-label",
+                                                    ),
+                                                    dcc.RadioItems(
+                                                        id="headline-structural-irf-fan",
+                                                        options=[
+                                                            {
+                                                                "label": "68%",
+                                                                "value": "68",
+                                                            },
+                                                            {
+                                                                "label": "90%",
+                                                                "value": "90",
+                                                            },
+                                                            {
+                                                                "label": "Both",
+                                                                "value": "both",
+                                                            },
+                                                        ],
+                                                        value="68",
+                                                        inline=True,
+                                                        className="fan-radio",
+                                                    ),
+                                                ],
+                                                className="control-block",
+                                            ),
+                                        ],
+                                        className="chart-controls",
                                     ),
-                                ]
+                                ],
+                                className="panel-heading",
                             ),
+                            readable_table("headline-structural-irf-table", IRF_COLUMNS, page_size=7),
+                            dcc.Loading(
+                                dcc.Graph(
+                                    id="headline-structural-irf",
+                                    config=graph_config("headline_irf_interactive"),
+                                ),
+                                type="circle",
+                            ),
+                        ],
+                        className="panel chart-panel",
+                    ),
+                    html.Div(
+                        [
+                    html.Div(
+                        [
                             html.Div(
                                 [
                                     html.Div(
                                         [
-                                            html.Label(
-                                                "Shock",
-                                                className="control-label",
+                                            html.H3(
+                                                "Headline Total response",
+                                                className="panel-title",
                                             ),
-                                            dcc.Dropdown(
-                                                id="headline-structural-shock",
-                                                options=[],
-                                                clearable=False,
-                                                className=(
-                                                    "compact-dropdown wide-control"
-                                                ),
+                                            html.P(
+                                                'Structural timing: the shock hits at the reference date; h=0 is the contemporaneous impact.',
+                                                className="panel-subtitle",
                                             ),
-                                        ],
-                                        className="control-block wide-control",
+                                            html.P(
+                                                "Exact nonlinear re-aggregation of the four component structural responses "
+                                                "through the production Headline chain-link engine. Response is always "
+                                                "Headline HICP Total; no aggregate FEVD or historical decomposition is constructed.",
+                                                className="panel-subtitle",
+                                            ),
+                                        ]
                                     ),
                                     html.Div(
                                         [
-                                            html.Label(
-                                                "Response",
-                                                className="control-label",
-                                            ),
-                                            dcc.Dropdown(
-                                                id="headline-structural-response",
-                                                options=[],
-                                                clearable=False,
-                                                className=(
-                                                    "compact-dropdown wide-control"
-                                                ),
-                                            ),
-                                        ],
-                                        className="control-block wide-control",
-                                    ),
-                                    html.Div(
-                                        [
-                                            html.Label(
-                                                "IRF object",
-                                                className="control-label",
-                                            ),
-                                            dcc.RadioItems(
-                                                id="headline-structural-irf-metric",
-                                                options=[
-                                                    {
-                                                        "label": "Cumulative level",
-                                                        "value": "cumulative",
-                                                    },
-                                                    {
-                                                        "label": "Period change",
-                                                        "value": "change",
-                                                    },
+                                            html.Div(
+                                                [
+                                                    html.Label("Shock", className="control-label"),
+                                                    html.P("Shared with component IRF", className="panel-subtitle"),
                                                 ],
-                                                value="cumulative",
-                                                inline=True,
-                                                className="fan-radio",
+                                                className="control-block",
                                             ),
-                                        ],
-                                        className="control-block",
-                                    ),
-                                    html.Div(
-                                        [
-                                            html.Label(
-                                                "Fan",
-                                                className="control-label",
-                                            ),
-                                            dcc.RadioItems(
-                                                id="headline-structural-irf-fan",
-                                                options=[
-                                                    {
-                                                        "label": "68%",
-                                                        "value": "68",
-                                                    },
-                                                    {
-                                                        "label": "90%",
-                                                        "value": "90",
-                                                    },
-                                                    {
-                                                        "label": "Both",
-                                                        "value": "both",
-                                                    },
+                                            html.Div(
+                                                [
+                                                    html.Label("Metric", className="control-label"),
+                                                    dcc.RadioItems(
+                                                        id="headline-total-structural-metric",
+                                                        options=[
+                                                            {
+                                                                "label": "Level response [%]",
+                                                                "value": "level_response_pct",
+                                                            },
+                                                            {
+                                                                "label": "YoY response [pp]",
+                                                                "value": "yoy_response_pp",
+                                                            },
+                                                        ],
+                                                        value="level_response_pct",
+                                                        inline=True,
+                                                        className="fan-radio",
+                                                    ),
                                                 ],
-                                                value="68",
-                                                inline=True,
-                                                className="fan-radio",
+                                                className="control-block wide-control",
+                                            ),
+                                            html.Div(
+                                                [
+                                                    html.Label("Posterior band", className="control-label"),
+                                                    dcc.RadioItems(
+                                                        id="headline-total-structural-fan",
+                                                        options=[
+                                                            {"label": "68%", "value": "68"},
+                                                            {"label": "Mean only", "value": "mean"},
+                                                        ],
+                                                        value="68",
+                                                        inline=True,
+                                                        className="fan-radio",
+                                                    ),
+                                                ],
+                                                className="control-block",
                                             ),
                                         ],
-                                        className="control-block",
+                                        className="chart-controls",
                                     ),
                                 ],
-                                className="chart-controls",
+                                className="panel-heading",
                             ),
-                        ],
-                        className="panel-heading",
-                    ),
-                    readable_table("headline-structural-irf-table", IRF_COLUMNS, page_size=7),
-                    dcc.Loading(
-                        dcc.Graph(
-                            id="headline-structural-irf",
-                            config=graph_config("headline_irf_interactive"),
-                        ),
-                        type="circle",
-                    ),
-                ],
-                className="panel chart-panel",
-            ),
-
-            html.Div(
-                [
-                    html.Div(
-                        [
-                            html.H3(
-                                "Forecast error variance decomposition",
-                                className="panel-title",
+                            html.Div(
+                                id="headline-total-structural-status",
+                                className="selection-banner",
                             ),
                             html.P(
-                                "Posterior-median shares shown as 100% stacked bars. FEVD always uses 1σ structural shocks "
-                                "and changes with the selected joint regular-SV reference state.",
+                                id="headline-total-structural-effective-parameters",
                                 className="panel-subtitle",
                             ),
+                            html.P(
+                                id="headline-total-structural-weights",
+                                className="panel-subtitle",
+                            ),
+                            readable_table("headline-total-structural-table", [{'name': 'Horizon', 'id': 'horizon'}, {'name': 'Model horizon', 'id': 'model_h'}, {'name': 'Posterior mean', 'id': 'mean'}, {'name': '68% interval', 'id': 'interval68'}], page_size=13),
+                            html.P(
+                                id="headline-total-structural-yoy-base-note",
+                                className="panel-subtitle",
+                                style={"marginTop": "6px"},
+                            ),
+                            dcc.Loading(
+                                dcc.Graph(
+                                    id="headline-total-structural-irf",
+                                    config=graph_config("headline_total_structural_irf"),
+                                ),
+                                type="circle",
+                            ),
                         ],
-                        className="panel-heading",
+                        className="panel chart-panel",
                     ),
-                    readable_table("headline-structural-fevd-table", [{"name":"Shock","id":"shock"}], page_size=12),
-                    dcc.Loading(
-                        dcc.Graph(
-                            id="headline-structural-fevd",
-                            config=graph_config("headline_fevd_interactive"),
-                        ),
-                        type="circle",
+                            html.Div(
+                                [
+                                html.Div(
+                                    [
+                                        html.H3(
+                                            "Forecast error variance decomposition",
+                                            className="panel-title",
+                                        ),
+                                        html.P(
+                                            "The table reports the full posterior-median FEVD. "
+                                            "The chart isolates cross-shock transmission and excludes "
+                                            "the response variable\'s own shock.",
+                                            className="panel-subtitle",
+                                        ),
+                                    ],
+                                    className="panel-heading",
+                                ),
+                                readable_table("headline-structural-fevd-table", [{"name":"Shock","id":"shock"}], page_size=12),
+                                dcc.Loading(
+                                    dcc.Graph(
+                                        id="headline-structural-fevd",
+                                        config=graph_config("headline_fevd_interactive"),
+                                    ),
+                                    type="circle",
+                                ),
+                                ],
+                                className="panel chart-panel structural-fevd-panel",
+                            ),
+                        ],
+                        className="structural-total-fevd-group",
                     ),
                 ],
-                className="panel chart-panel",
+                className="structural-comparison-grid",
             ),
 
             html.Div(
@@ -1832,7 +2008,7 @@ def register_headline_structural_callbacks(
         State("headline-structural-response", "value"),
     )
     def controls(store, pathname, current_shock, current_response):
-        if (pathname or "") != "/headline/structural":
+        if (pathname or "") not in {"/structural/headline", "/headline/structural"}:
             raise PreventUpdate
         try:
             directory = _selected_run_directory(results_root, store)
@@ -2043,7 +2219,7 @@ def register_headline_structural_callbacks(
         hd_options,
         current_live_store,
     ):
-        if (pathname or "") != "/headline/structural":
+        if (pathname or "") not in {"/structural/headline", "/headline/structural"}:
             raise PreventUpdate
 
         context = dict((store or {}).get("context") or {})
@@ -2456,12 +2632,41 @@ def register_headline_structural_callbacks(
         Input("headline-structural-response", "value"),
     )
     def fevd_graph(structural_store, response):
-        rows, columns = structural_fevd_table(
-            structural_store, response=response
+        rows, columns = structural_fevd_table(structural_store, response=response)
+        labels = (
+            dict(structural_store.get("labels", {}) or {})
+            if isinstance(structural_store, dict) else {}
         )
-        return fevd_figure(
-            structural_store, response=response
-        ), rows, columns
+        variables = (
+            list(structural_store.get("variables") or [])
+            if isinstance(structural_store, dict) else []
+        )
+        response_label = labels.get(response, _label(response))
+
+        display_label_map = {}
+        for variable in variables:
+            pretty = labels.get(variable, _label(variable))
+            display_label_map[str(variable)] = pretty
+            display_label_map[_label(variable)] = pretty
+            display_label_map[str(variable).replace("_", " ").title()] = pretty
+
+        cleaned_rows = []
+        for row in rows or []:
+            item = dict(row)
+            raw = str(item.get("shock") or "")
+            if raw in display_label_map:
+                item["shock"] = display_label_map[raw]
+            cleaned_rows.append(item)
+
+        if columns:
+            columns = [dict(column) for column in columns]
+            columns[0]["name"] = f"Shock · FEVD of {response_label}"
+
+        return (
+            fevd_figure(structural_store, response=response),
+            cleaned_rows,
+            columns,
+        )
 
     @app.callback(
         Output("headline-structural-hd", "figure"),
@@ -2483,6 +2688,504 @@ def register_headline_structural_callbacks(
                 relayout_data=relayout_data,
             ),
             structural_hd_records(structural_store, response=response),
+        )
+    # LOT3_BLOCK4_HEADLINE_TOTAL_STRUCTURAL_UI_V1
+    def _headline_total_ui_contract(
+        directory,
+        *,
+        horizon,
+        posterior_draws,
+        shock_unit,
+        shock_size,
+        reference_date,
+    ):
+        contract = headline_structural_run_contract(
+            directory,
+            project_root=project_root,
+        )
+        endpoint = (
+            pd.Timestamp(contract["default_reference_date"])
+            .to_period("M")
+            .to_timestamp(how="start")
+        )
+
+        reasons = []
+        try:
+            resolved_horizon = int(horizon)
+        except (TypeError, ValueError):
+            resolved_horizon = None
+            reasons.append("Horizon must be an integer in [1, 12].")
+        if resolved_horizon is not None and not (1 <= resolved_horizon <= 12):
+            reasons.append(
+                f"Horizon {resolved_horizon}m is unsupported; "
+                "headline-total-structural-irf-v1.1 requires H in [1, 12]."
+            )
+
+        try:
+            resolved_draws = int(posterior_draws)
+        except (TypeError, ValueError):
+            resolved_draws = None
+            reasons.append("Posterior draws must be an integer in [1, 1000].")
+        if resolved_draws is not None and not (1 <= resolved_draws <= 1000):
+            reasons.append(
+                f"Posterior draws {resolved_draws} are outside the validated [1, 1000] range."
+            )
+
+        resolved_unit = str(shock_unit or "").strip().lower()
+        if resolved_unit != "structural_std":
+            reasons.append(
+                "Shock definition is unsupported; Headline Total v1 requires "
+                "Standard deviation (structural_std)."
+            )
+
+        try:
+            resolved_size = float(shock_size)
+        except (TypeError, ValueError):
+            resolved_size = None
+            reasons.append("Shock size must equal 1 structural standard deviation.")
+        if resolved_size is not None and resolved_size != 1.0:
+            reasons.append(
+                f"Shock size {resolved_size:g} is unsupported; Headline Total v1 requires 1σ."
+            )
+
+        if reference_date in (None, ""):
+            resolved_reference = endpoint
+        else:
+            resolved_reference = (
+                pd.Timestamp(reference_date)
+                .to_period("M")
+                .to_timestamp(how="start")
+            )
+        if resolved_reference != endpoint:
+            reasons.append(
+                "Historical reference dates are unsupported by "
+                "headline-total-structural-irf-v1.1; select the current structural endpoint "
+                f"{endpoint.strftime('%Y-%m')}."
+            )
+
+        return {
+            "compatible": not reasons,
+            "reasons": reasons,
+            "run_directory": str(Path(directory).resolve()),
+            "vintage": str(contract.get("vintage") or ""),
+            "run_id": str(contract.get("run_id") or ""),
+            "horizon": resolved_horizon,
+            "posterior_draws": resolved_draws,
+            "shock_unit": resolved_unit,
+            "shock_size": resolved_size,
+            "reference_date": resolved_reference.date().isoformat(),
+            "endpoint": endpoint.date().isoformat(),
+            "contract": "headline-total-structural-irf-v1.1",
+        }
+
+    def _headline_total_weights_note(total_store):
+        if not total_store or not total_store.get("ok"):
+            return ""
+        meta = dict(total_store.get("meta") or {})
+        years = list(meta.get("headline_weight_year_used") or [])
+        carried = list(meta.get("headline_weight_carried_forward") or [])
+        dates = list(total_store.get("dates") or [])
+        if not years or len(years) != len(carried) or len(years) != len(dates):
+            return "Aggregation weights: exact production chain-link diagnostics unavailable."
+        first_carried = next((i for i, flag in enumerate(carried) if bool(flag)), None)
+        if first_carried is None:
+            unique = sorted({int(year) for year in years})
+            return (
+                "Aggregation weights: published annual weights used throughout "
+                + ", ".join(str(year) for year in unique)
+                + "."
+            )
+        source_year = int(years[first_carried])
+        carry_date = pd.Timestamp(dates[first_carried]).strftime("%b %Y")
+        return (
+            f"Aggregation weights: {source_year} published weights are carried forward "
+            f"from {carry_date} where future annual weights are unavailable. "
+            "This assumption is part of the exact nonlinear Headline response."
+        )
+
+    def _headline_total_effective_text(total_store, display_horizon=None):
+        try:
+            display_h = int(display_horizon)
+        except (TypeError, ValueError):
+            display_h = 12
+        display_h = max(1, min(12, display_h))
+        if not total_store or not total_store.get("ok"):
+            return (
+                "Headline Total computation contract: H=12 stored once; "
+                f"displayed through H={display_h} · Recursive/Cholesky · "
+                "1 structural std · current endpoint · future innovations=0 · "
+                "future outliers=0."
+            )
+        meta = dict(total_store.get("meta") or {})
+        stored_h = int(meta.get("horizon", 12))
+        return (
+            "Headline Total computation contract: "
+            f"stored H={stored_h} · displayed H={display_h} · Recursive/Cholesky · "
+            f"{float(meta.get('shock_size', 1.0)):g} structural std · "
+            f"endpoint {str(meta.get('reference_date') or '—')[:7]} · "
+            f"{int(meta.get('n_draws', 0)):,} posterior draws · "
+            "future innovations=0 · future outliers=0. "
+            "The band reflects saved posterior-draw uncertainty only."
+        )
+
+    def _headline_total_records(total_store, *, shock, metric, horizon):
+        if not total_store or not total_store.get("ok"):
+            return []
+        shock_names = list(total_store.get("shock_names") or [])
+        resolved_shock = shock if shock in shock_names else (shock_names[0] if shock_names else None)
+        resolved_metric = metric if metric in {"level_response_pct", "yoy_response_pp"} else "level_response_pct"
+        if resolved_shock is None:
+            return []
+
+        try:
+            display_h = int(horizon)
+        except (TypeError, ValueError):
+            display_h = 12
+        display_h = max(1, min(12, display_h))
+
+        stats = dict(total_store.get("shocks") or {}).get(resolved_shock, {}).get(resolved_metric, {})
+        mean = np.asarray(stats.get("mean") or [], dtype=float)
+        q16 = np.asarray(stats.get("q16") or [], dtype=float)
+        q84 = np.asarray(stats.get("q84") or [], dtype=float)
+        available = min(len(mean), len(q16), len(q84), display_h + 1)
+        rows = []
+        for h in range(available):
+            rows.append({
+                "horizon": "Impact" if h == 0 else f"M+{h}",
+                "model_h": f"h={h}m",
+                "mean": fmt(mean[h], digits=4),
+                "interval68": interval(q16[h], q84[h], digits=4),
+            })
+        return rows
+
+
+    def _headline_total_figure(total_store, *, shock, metric, fan_mode, horizon):
+        import plotly.graph_objects as go
+
+        if not total_store or not total_store.get("ok"):
+            return _empty_figure("Headline Total response")
+        shock_names = list(total_store.get("shock_names") or [])
+        resolved_shock = shock if shock in shock_names else (shock_names[0] if shock_names else None)
+        resolved_metric = metric if metric in {"level_response_pct", "yoy_response_pp"} else "level_response_pct"
+        if resolved_shock is None:
+            return _empty_figure("Headline Total response")
+
+        try:
+            display_h = int(horizon)
+        except (TypeError, ValueError):
+            display_h = 12
+        display_h = max(1, min(12, display_h))
+
+        stats = dict(total_store.get("shocks") or {}).get(resolved_shock, {}).get(resolved_metric, {})
+        dates = pd.to_datetime(total_store.get("dates") or [])[: display_h + 1]
+        mean = np.asarray(stats.get("mean") or [], dtype=float)[: display_h + 1]
+        q16 = np.asarray(stats.get("q16") or [], dtype=float)[: display_h + 1]
+        q84 = np.asarray(stats.get("q84") or [], dtype=float)[: display_h + 1]
+        if len(dates) == 0 or len(mean) != len(dates):
+            return _empty_figure("Headline Total response")
+
+        horizons = np.arange(len(mean), dtype=int)
+        date_labels = np.asarray(
+            [pd.Timestamp(value).strftime("%Y-%m") for value in dates],
+            dtype=object,
+        )
+
+        labels = {
+            "hicp_energy": "Energy", "hicp_food": "Food",
+            "hicp_neig": "NEIG", "hicp_services": "Services",
+        }
+        unit = "%" if resolved_metric == "level_response_pct" else "pp"
+        metric_label = "Level response [%]" if resolved_metric == "level_response_pct" else "YoY response [pp]"
+
+        meta = dict(total_store.get("meta") or {})
+        reference_value = meta.get("reference_date")
+        if reference_value is None and len(dates):
+            reference_value = dates[0]
+        try:
+            reference_label = pd.Timestamp(reference_value).strftime("%Y-%m")
+        except Exception:
+            reference_label = str(reference_value or "—")[:7]
+
+        fig = go.Figure()
+        if str(fan_mode or "68") == "68" and len(q16) == len(horizons) and len(q84) == len(horizons):
+            fig.add_trace(go.Scatter(
+                x=horizons, y=q84, mode="lines", line={"width": 0},
+                hoverinfo="skip", showlegend=False,
+            ))
+            fig.add_trace(go.Scatter(
+                x=horizons, y=q16, mode="lines", line={"width": 0},
+                fill="tonexty", fillcolor="rgba(0,159,227,0.16)",
+                name="68% posterior interval", hoverinfo="skip",
+            ))
+        fig.add_trace(go.Scatter(
+            x=horizons, y=mean, mode="lines+markers",
+            customdata=date_labels,
+            line={"color": "#009FE3", "width": 2.5},
+            marker={"size": 4, "color": "#009FE3"},
+            name="Posterior mean",
+            hovertemplate=(
+                "h=%{x} · %{customdata}<br>%{y:+.4f} "
+                + unit
+                + "<extra></extra>"
+            ),
+        ))
+        fig.add_hline(y=0.0, line_width=1, line_dash="dot", line_color="#6B6E72")
+
+        if (
+            resolved_metric == "yoy_response_pp"
+            and display_h >= 12
+            and len(mean) > 12
+        ):
+            fig.add_vline(
+                x=12,
+                line_width=1,
+                line_dash="dot",
+                line_color="#A66A00",
+            )
+
+        fig.update_layout(
+            title=(
+                f"Headline Total — {labels.get(resolved_shock, resolved_shock)} shock · "
+                f"{metric_label}"
+                f"<br><sup>Structural reference {reference_label}; "
+                "h=0 is the contemporaneous impact</sup>"
+            ),
+            paper_bgcolor="white", plot_bgcolor="white",
+            margin={"l": 58, "r": 24, "t": 72, "b": 48},
+            legend={"orientation": "h", "y": 1.08, "x": 0},
+            hovermode="x unified",
+        )
+        fig.update_yaxes(title=unit, showgrid=True, gridcolor="#DEDCDD", zeroline=False)
+        fig.update_xaxes(
+            title="Horizon (months)",
+            showgrid=False,
+            tickmode="linear",
+            tick0=0,
+            dtick=1,
+        )
+        fig.update_layout(
+            title_x=0.0,
+            title_xanchor="left",
+            legend={
+                "orientation": "h",
+                "x": 0.0,
+                "xanchor": "left",
+                "y": -0.24,
+                "yanchor": "top",
+            },
+            margin={"b": 110},
+        )
+        return fig
+
+    @app.callback(
+        Output("headline-total-structural-store", "data"),
+        Input("headline-structural-run", "n_clicks"),
+        Input("url", "pathname"),
+        Input(store_id, "data"),
+        State("headline-structural-horizon", "value"),
+        State("headline-structural-draws", "value"),
+        State("headline-structural-shock-unit", "value"),
+        State("headline-structural-shock-size", "value"),
+        State("headline-structural-reference-date", "value"),
+        prevent_initial_call=False,
+    )
+    def headline_total_compute(
+        n_clicks,
+        pathname,
+        store,
+        horizon,
+        posterior_draws,
+        shock_unit,
+        shock_size,
+        reference_date,
+    ):
+        import time
+
+        if (pathname or "") not in {"/structural/headline", "/headline/structural"}:
+            raise PreventUpdate
+        try:
+            directory = _selected_run_directory(results_root, store)
+            ui = _headline_total_ui_contract(
+                directory,
+                horizon=horizon,
+                posterior_draws=posterior_draws,
+                shock_unit=shock_unit,
+                shock_size=shock_size,
+                reference_date=reference_date,
+            )
+            if not ui["compatible"]:
+                return {
+                    "ok": False, "status": "unsupported",
+                    "contract": "headline-total-structural-irf-v1.1",
+                    "reasons": list(ui["reasons"]), "ui": ui,
+                }
+
+            from headline_total_structural import run_saved_headline_total_structural_irf
+
+            started = time.perf_counter()
+            payload = run_saved_headline_total_structural_irf(
+                directory,
+                requested_draws=int(ui["posterior_draws"]),
+                horizon=12,
+                identification="recursive",
+                reference_date=ui["reference_date"],
+                shock_unit="structural_std",
+                shock_size=1.0,
+                include_outlier_scale=False,
+                seed=42,
+                project_root=project_root,
+            )
+            payload["ok"] = True
+            payload["status"] = "fresh"
+            payload["ui"] = ui
+            payload["compute_seconds"] = float(time.perf_counter() - started)
+            return payload
+        except Exception as exc:
+            return {
+                "ok": False, "status": "error",
+                "contract": "headline-total-structural-irf-v1.1",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+
+    @app.callback(
+        Output("headline-total-structural-yoy-base-note", "children"),
+        Input("headline-total-structural-metric", "value"),
+    )
+    def headline_total_yoy_base_note(metric):
+        if metric != "yoy_response_pp":
+            return ""
+        return (
+            "YoY metric — at h=12, the 12-month comparison base is h=0, "
+            "which is itself affected by the shock. The h=12 YoY response therefore "
+            "measures the net 12-month effect relative to an already-shocked base "
+            "and is not directly comparable with h<12."
+        )
+    @app.callback(
+        Output("headline-total-structural-status", "children"),
+        Output("headline-total-structural-effective-parameters", "children"),
+        Output("headline-total-structural-weights", "children"),
+        Output("headline-total-structural-table", "data"),
+        Output("headline-total-structural-irf", "figure"),
+        Input("headline-total-structural-store", "data"),
+        Input("headline-structural-shock", "value"),
+        Input("headline-total-structural-metric", "value"),
+        Input("headline-total-structural-fan", "value"),
+        Input(store_id, "data"),
+        Input("headline-structural-horizon", "value"),
+        Input("headline-structural-draws", "value"),
+        Input("headline-structural-shock-unit", "value"),
+        Input("headline-structural-shock-size", "value"),
+        Input("headline-structural-reference-date", "value"),
+    )
+    def headline_total_render(
+        total_store,
+        shock,
+        metric,
+        fan_mode,
+        store,
+        horizon,
+        posterior_draws,
+        shock_unit,
+        shock_size,
+        reference_date,
+    ):
+        try:
+            display_h = int(horizon)
+        except (TypeError, ValueError):
+            display_h = 12
+        display_h = max(1, min(12, display_h))
+
+        try:
+            directory = _selected_run_directory(results_root, store)
+            current = _headline_total_ui_contract(
+                directory,
+                horizon=display_h,
+                posterior_draws=posterior_draws,
+                shock_unit=shock_unit,
+                shock_size=shock_size,
+                reference_date=reference_date,
+            )
+        except Exception as exc:
+            return (
+                html.Div([html.Strong("Headline Total unavailable: "), html.Span(str(exc))],
+                         className="estimation-error-text"),
+                _headline_total_effective_text(None, display_h), "", [],
+                _empty_figure("Headline Total response"),
+            )
+
+        if not current["compatible"]:
+            reason = " ".join(current["reasons"])
+            return (
+                html.Div([
+                    html.Strong("Parameters not supported by headline-total-structural-irf-v1.1. "),
+                    html.Span(reason),
+                ], className="estimation-error-text"),
+                _headline_total_effective_text(None, display_h), "", [],
+                _empty_figure("Headline Total response · unsupported parameters"),
+            )
+
+        if not total_store:
+            return (
+                html.Div([
+                    html.Strong("Headline Total not calculated. "),
+                    html.Span("Open or refresh Structural analysis with the supported Headline Total parameters."),
+                ]),
+                _headline_total_effective_text(None, display_h), "", [],
+                _empty_figure("Headline Total response"),
+            )
+
+        if not total_store.get("ok"):
+            status = str(total_store.get("status") or "error")
+            detail = (
+                " ".join(total_store.get("reasons") or [])
+                if status == "unsupported"
+                else str(total_store.get("error") or "Unknown Headline Total error.")
+            )
+            return (
+                html.Div([html.Strong(f"Headline Total {status}: "), html.Span(detail)],
+                         className="estimation-error-text"),
+                _headline_total_effective_text(None, display_h), "", [],
+                _empty_figure("Headline Total response"),
+            )
+
+        stored_ui = dict(total_store.get("ui") or {})
+        compare_keys = (
+            "run_directory", "posterior_draws",
+            "shock_unit", "shock_size", "reference_date",
+        )
+        stale = any(stored_ui.get(key) != current.get(key) for key in compare_keys)
+        if stale:
+            return (
+                html.Div([
+                    html.Strong("Headline Total result is stale. "),
+                    html.Span(
+                        "The selected run, draws, shock definition, magnitude, or reference state "
+                        "changed after calculation; refresh Structural analysis."
+                    ),
+                ], className="estimation-error-text"),
+                _headline_total_effective_text(total_store, display_h),
+                _headline_total_weights_note(total_store), [],
+                _empty_figure("Headline Total response · stale"),
+            )
+
+        elapsed = float(total_store.get("compute_seconds", 0.0) or 0.0)
+        status = html.Div([
+            html.Strong("Headline Total response ready"),
+            html.Span(
+                f" · exact nonlinear re-aggregation · {elapsed:.2f}s"
+                if elapsed > 0 else " · exact nonlinear re-aggregation"
+            ),
+            html.Span(" · no aggregate FEVD/HD"),
+        ])
+        return (
+            status,
+            _headline_total_effective_text(total_store, display_h),
+            _headline_total_weights_note(total_store),
+            _headline_total_records(total_store, shock=shock, metric=metric, horizon=display_h),
+            _headline_total_figure(
+                total_store, shock=shock, metric=metric,
+                fan_mode=fan_mode, horizon=display_h,
+            ),
         )
 
 

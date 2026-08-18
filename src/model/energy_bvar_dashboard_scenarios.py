@@ -183,6 +183,7 @@ def _band(fig: go.Figure, block: pd.DataFrame, lower: str, upper: str, *, color:
     )
 
 
+# GRAPH_EXPORT_READABILITY_G4_ENERGY_SCENARIOS_V1
 def empty_scenario_figure(message: str = "Configure a tax scenario") -> go.Figure:
     fig = go.Figure()
     fig.add_annotation(
@@ -192,7 +193,7 @@ def empty_scenario_figure(message: str = "Configure a tax scenario") -> go.Figur
     fig.update_layout(
         template="plotly_white", height=440,
         xaxis={"visible": False}, yaxis={"visible": False},
-        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="white", plot_bgcolor="white",
     )
     return fig
 
@@ -260,6 +261,8 @@ def _finalise_scenario_layout(
         },
         hovermode="x unified",
         dragmode="pan",
+        paper_bgcolor="white",
+        plot_bgcolor="white",
     )
     return fig
 

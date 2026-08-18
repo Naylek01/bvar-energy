@@ -5,20 +5,29 @@
     if (window.__inflationActiveNavigationV1) return;
     window.__inflationActiveNavigationV1 = true;
 
-    function normalise(path) {
-        let p = String(path || "/overview").split("?")[0].split("#")[0];
-        if (!p || p === "/") return "/overview";
-        if (p.length > 1 && p.endsWith("/")) p = p.slice(0, -1);
-        const aliases = {
-            "/headline": "/headline/forecast",
-            "/headline/overview": "/headline/forecast",
-            "/headline/contributions": "/headline/forecast",
-            "/headline/components": "/headline/forecast",
-            "/headline/diagnostics": "/headline/estimation",
-            "/core": "/core/forecast"
-        };
-        return aliases[p] || p;
-    }
+    function normalise(pathname) {
+    var path = String(pathname || "/").split("?")[0].replace(/\/+$/, "") || "/";
+    var aliases = {
+        "/": "/overview",
+        "/aggregate": "/forecast",
+        "/forecast/aggregate": "/forecast",
+        "/headline": "/forecast/headline",
+        "/headline/overview": "/forecast/headline",
+        "/headline/forecast": "/forecast/headline",
+        "/headline/contributions": "/forecast/headline",
+        "/headline/components": "/forecast/headline",
+        "/headline/scenarios": "/scenarios/headline",
+        "/headline/structural": "/structural/headline",
+        "/headline/diagnostics": "/estimation/headline",
+        "/headline/estimation": "/estimation/headline",
+        "/core": "/forecast/core",
+        "/core/forecast": "/forecast/core",
+        "/core/scenarios": "/scenarios/core",
+        "/core/structural": "/structural/core",
+        "/core/estimation": "/estimation/core"
+    };
+    return aliases[path] || path;
+}
 
     function hrefPath(link) {
         try {
@@ -28,14 +37,17 @@
         }
     }
 
-    function domainFor(path) {
-        if (path.startsWith("/headline")) return "headline";
-        if (path.startsWith("/core")) return "core";
-        if (["/forecast", "/aggregate", "/scenarios", "/structural", "/estimation"].includes(path)) {
-            return "energy";
-        }
-        return null;
+    function domainFor(pathname) {
+    var path = String(pathname || "/").split("?")[0].replace(/\/+$/, "") || "/";
+    var parts = path.toLowerCase().split("/").filter(Boolean);
+    if (parts.length && (parts[0] === "headline" || parts[0] === "core")) {
+        return parts[0];
     }
+    if (parts.length >= 2 && (parts[1] === "headline" || parts[1] === "core")) {
+        return parts[1];
+    }
+    return "energy";
+}
 
     function update() {
         const path = normalise(window.location.pathname);

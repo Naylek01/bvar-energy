@@ -2013,10 +2013,15 @@ def _load_bundle(results_root: Path, registry_path, project_root: Path, vintage:
     }
     return bundle, messages
 
+# GRAPH_EXPORT_READABILITY_G5_OVERVIEW_V1
 def _empty(message: str, height: int = 500) -> go.Figure:
     fig = go.Figure()
     fig.add_annotation(x=0.5, y=0.5, xref="paper", yref="paper", text=message, showarrow=False, font=dict(size=13, color=TOKENS["muted"]))
     apply_inflation_figure_style(fig, uirevision="overview-empty", height=height)
+    fig.update_layout(
+        paper_bgcolor="white",
+        plot_bgcolor="white",
+    )
     fig.update_xaxes(visible=False)
     fig.update_yaxes(visible=False)
     return fig
@@ -2286,7 +2291,7 @@ def overview_main_figure(
 
     fig.add_hline(y=0.0, line_width=1, line_color=TOKENS["hairline"])
     fig.update_layout(dragmode="pan", hovermode="x unified")
-    return apply_inflation_figure_style(
+    apply_inflation_figure_style(
         fig,
         uirevision=(
             f"overview::{bundle.get('vintage')}::"
@@ -2296,6 +2301,11 @@ def overview_main_figure(
         height=560,
         y_title="% y/y",
     )
+    fig.update_layout(
+        paper_bgcolor="white",
+        plot_bgcolor="white",
+    )
+    return fig
 
 
 def _safe_series_block(frame: pd.DataFrame, series: str) -> pd.DataFrame:
@@ -2515,12 +2525,17 @@ def _contribution_figure(
         hovermode="x unified",
         uirevision=f"overview-decomp::{title_key}::{mode}::{horizon}",
     )
-    return apply_inflation_figure_style(
+    apply_inflation_figure_style(
         fig,
         uirevision=f"overview-decomp::{title_key}::{mode}::{horizon}",
         height=500,
         y_title="percentage points",
     )
+    fig.update_layout(
+        paper_bgcolor="white",
+        plot_bgcolor="white",
+    )
+    return fig
 
 
 def overview_decomposition_figure(

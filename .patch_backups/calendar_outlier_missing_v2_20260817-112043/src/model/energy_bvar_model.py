@@ -203,7 +203,7 @@ def _canonical_frequency(frequency: str) -> str:
 
 
 _PERIODS_PER_YEAR = {"monthly": 12.0, "weekly": 52.0}
-PRIOR_IMPLEMENTATION_VERSION = "2026-08-17-frequency-aware-outlier-scale-normalised-A-v2"
+PRIOR_IMPLEMENTATION_VERSION = "2026-08-17-frequency-aware-outlier-scale-normalised-A-v1"
 
 
 def periods_per_year(frequency: str) -> float:
@@ -230,45 +230,16 @@ def outlier_mean_interval_years(outlier_mean_frequency: float, frequency: str) -
     return float((1.0 / probability) / periods_per_year(frequency))
 
 
-def outlier_prior_observations_from_years(prior_strength_years: float, frequency: str) -> float:
-    """Convert calendar years of Beta-prior information to model periods.
-
-    The legacy monthly baseline used 120 prior observations, i.e. ten years of
-    monthly information.  This helper preserves the same calendar strength at
-    other frequencies: ten years -> 120 months or 520 weeks.
-    """
-    years = float(prior_strength_years)
-    if not np.isfinite(years) or years <= 0:
-        raise ValueError("prior_strength_years must be finite and positive.")
-    return float(years * periods_per_year(frequency))
-
-
-def outlier_prior_strength_years(outlier_prior_observations: float, frequency: str) -> float:
-    """Convert Beta-prior pseudo-observations back to calendar years."""
-    observations = float(outlier_prior_observations)
-    if not np.isfinite(observations) or observations <= 0:
-        raise ValueError("outlier_prior_observations must be finite and positive.")
-    return float(observations / periods_per_year(frequency))
-
-
 def default_bvar_svo_prior_config(
     frequency: str = "monthly",
     *,
     outlier_interval_years: float = 4.0,
-    outlier_prior_strength_years: float = 10.0,
 ) -> BVARSVOPriorConfig:
-    """Frequency-aware production baseline for the common BVAR-SV-outlier prior.
-
-    Both the prior mean interval and the Beta-prior strength are expressed in
-    calendar time, so the monthly and weekly models encode the same belief.
-    """
+    """Frequency-aware production baseline for the common BVAR-SV-outlier prior."""
     return BVARSVOPriorConfig(
         outlier_mean_frequency=outlier_mean_frequency_from_years(
             outlier_interval_years, frequency
-        ),
-        outlier_prior_observations=outlier_prior_observations_from_years(
-            outlier_prior_strength_years, frequency
-        ),
+        )
     )
 
 
@@ -3912,10 +3883,6 @@ def build_run_metadata(
         "outlier_mean_interval_years": outlier_mean_interval_years(
             prior_config.outlier_mean_frequency, frequency
         ),
-        "outlier_prior_observations": float(prior_config.outlier_prior_observations),
-        "outlier_prior_strength_years": outlier_prior_strength_years(
-            prior_config.outlier_prior_observations, frequency
-        ),
         "calendar_rule": _calendar_rule(frequency),
         "missing_data_method": _canonical_missing_data_method(missing_data_method),
         "missing_treatment_exact": bool(missing_treatment_exact),
@@ -4049,8 +4016,6 @@ __all__ = [
     "periods_per_year",
     "outlier_mean_frequency_from_years",
     "outlier_mean_interval_years",
-    "outlier_prior_observations_from_years",
-    "outlier_prior_strength_years",
     "default_bvar_svo_prior_config",
     "load_energy_panel",
     "monthly_seasonal_dummies",

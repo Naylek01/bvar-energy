@@ -246,12 +246,8 @@ from energy_bvar_component_hicp import (  # noqa: E402
 from energy_bvar_aggregate_pipeline import run_aggregate  # noqa: E402
 from headline_bvar_conditional import (  # noqa: E402
     ENERGY_BRIDGE_CONTRACT_VERSION,
-    SELECTED_ENERGY_BASELINE_CONTRACT_VERSION,
     energy_outcome_headline_bridge,
-    run_saved_headline_energy_marginal,
-    run_saved_headline_selected_energy_contribution,
 )
-from energy_bvar_theme import TOKENS, apply_theme, fan_traces  # noqa: E402
 from energy_bvar_fitted import (  # noqa: E402
     load_energy_aggregate_fitted,
 )
@@ -276,7 +272,6 @@ from energy_bvar_model import (  # noqa: E402
     SamplerConfig,
     default_bvar_svo_prior_config,
     outlier_mean_frequency_from_years,
-    outlier_prior_observations_from_years,
     periods_per_year,
 )
 from headline_bvar_pipeline import (  # noqa: E402
@@ -319,7 +314,6 @@ from headline_bvar_dashboard_structural import (  # noqa: E402
 # HEADLINE DASHBOARD SLICE 4
 # HEADLINE DASHBOARD SLICE 6
 from headline_dashboard_slice6 import (  # noqa: E402
-    headline_scenario_impact_figure,
     headline_scenarios_page,
     register_headline_slice6_callbacks,
 )
@@ -502,7 +496,6 @@ def _estimation_lock(model_id: str, vintage: str, run_id: str):
             pass
 
 
-# ENERGY_ESTIMATION_MISSING_METHOD_INDEPENDENT_V1
 def _paper_baseline_configs(model_id: str):
     """Frequency-aware literature/project baseline for one Energy model."""
     spec = model_spec(model_id)
@@ -530,7 +523,6 @@ def _baseline_per_model_rows() -> list[dict]:
                 "burn": int(sampler.burn),
                 "thin": int(sampler.thin),
                 "seed": int(sampler.seed),
-                "missing_data_method": str(spec.missing_data_method),
             }
         )
     return rows
@@ -554,7 +546,7 @@ def _baseline_config_payload() -> dict:
             "h0_var": prior.h0_var,
             "outlier_interval_years": 4.0,
             "outlier_interval_unit": "years",
-            "outlier_prior_strength_years": 10.0,
+            "outlier_prior_observations": prior.outlier_prior_observations,
             "outlier_grid_min": prior.outlier_grid_min,
             "outlier_grid_max": prior.outlier_grid_max,
             "outlier_grid_step": prior.outlier_grid_step,
@@ -574,7 +566,6 @@ def _baseline_config_payload() -> dict:
             "dk_catastrophic_level_relative_gate": sampler.dk_catastrophic_level_relative_gate,
             "dk_catastrophic_difference_relative_gate": sampler.dk_catastrophic_difference_relative_gate,
         },
-        "missing_data_method": "baseline",
         "per_model": _baseline_per_model_rows(),
     }
 
@@ -632,18 +623,6 @@ def _load_saved_profile(value: str) -> dict:
             "Legacy period-based outlier interval converted using 12 periods/year; "
             "review this value before re-saving the profile."
         )
-    if "outlier_prior_strength_years" not in prior:
-        if "outlier_prior_observations" in prior:
-            prior["outlier_prior_strength_years"] = float(
-                prior["outlier_prior_observations"]
-            ) / 12.0
-            payload["legacy_outlier_strength_migration"] = (
-                "Legacy period-based outlier prior strength converted using "
-                "12 periods/year; review before re-saving the profile."
-            )
-        else:
-            prior["outlier_prior_strength_years"] = 10.0
-    payload.setdefault("missing_data_method", "baseline")
     payload["prior"] = prior
     return payload
 
@@ -676,10 +655,6 @@ def _prior_from_mapping(
     outlier_frequency = outlier_mean_frequency_from_years(
         interval_years, frequency
     )
-    prior_strength_years = _safe_float(
-        values.get("outlier_prior_strength_years"),
-        "outlier prior confidence in years",
-    )
     prior = BVARSVOPriorConfig(
         lambda1=_safe_float(values.get("lambda1"), "lambda1"),
         lambda2=_safe_float(values.get("lambda2"), "lambda2"),
@@ -690,8 +665,9 @@ def _prior_from_mapping(
         phi_prior_df=_safe_float(values.get("phi_prior_df"), "phi prior df"),
         h0_var=_safe_float(values.get("h0_var"), "initial log-vol variance"),
         outlier_mean_frequency=outlier_frequency,
-        outlier_prior_observations=outlier_prior_observations_from_years(
-            prior_strength_years, frequency
+        outlier_prior_observations=_safe_float(
+            values.get("outlier_prior_observations"),
+            "outlier prior observations",
         ),
         outlier_grid_min=_safe_float(values.get("outlier_grid_min"), "outlier grid minimum"),
         outlier_grid_max=_safe_float(values.get("outlier_grid_max"), "outlier grid maximum"),
@@ -736,15 +712,6 @@ def _sampler_from_mapping(values: dict, *, seed_fallback: int = 42) -> SamplerCo
     return sampler
 
 
-def _missing_method_override(value) -> str | None:
-    key = str(value or "baseline").strip().lower()
-    if key in {"", "baseline", "model_baseline", "default"}:
-        return None
-    if key not in {"linear", "dk"}:
-        raise ValueError("Missing-data method must be baseline, linear or dk.")
-    return key
-
-
 def _row_for_model(config_store: dict, model_id: str) -> dict:
     for row in config_store.get("per_model", []):
         if str(row.get("model_id")) == str(model_id):
@@ -760,33 +727,37 @@ def _model_estimation_configs(
     selected_model_id: str,
     config_store: dict | None,
 ) -> tuple[BVARSVOPriorConfig, SamplerConfig, dict]:
-    # Missing-data treatment is independent from the prior/MCMC profile.
-    # Per-model scope remains authoritative for row-specific missing methods.
+    """Resolve effective prior/sampler/spec overrides for one model.
+
+    Scope semantics
+    ---------------
+    selected_only:
+        Custom settings apply only to the model selected in the Estimation UI.
+        The other six models retain the canonical project baseline in Estimate-all-7.
+    all_7:
+        Shared prior and sampler settings apply to every BVAR. Structural model
+        properties (lag order, seasonal reference month, exog prior scale) stay
+        at each model's baseline values.
+    per_model:
+        The editable seven-row table overrides lambda1-4, p, reps, burn, thin
+        and seed for each model. The remaining SV/outlier/numerical prior
+        settings come from the shared custom editor.
+    """
     if not config_store or not config_store.get("valid"):
         raise ValueError(
             "Estimation configuration is invalid. Correct the highlighted settings first."
         )
-
     profile_mode = str(config_store.get("profile_mode", "paper_baseline"))
     scope = str(config_store.get("scope", "selected_only"))
     spec = model_spec(model_id)
-    shared_missing = _missing_method_override(
-        config_store.get("missing_data_method", "baseline")
-    )
 
     if profile_mode == "paper_baseline":
         prior, sampler = _paper_baseline_configs(model_id)
-        spec_overrides = {}
-        if shared_missing is not None:
-            spec_overrides["missing_data_method"] = shared_missing
-        return prior, sampler, spec_overrides
+        return prior, sampler, {}
 
     if scope == "selected_only" and model_id != selected_model_id:
         prior, sampler = _paper_baseline_configs(model_id)
-        spec_overrides = {}
-        if shared_missing is not None:
-            spec_overrides["missing_data_method"] = shared_missing
-        return prior, sampler, spec_overrides
+        return prior, sampler, {}
 
     shared_prior = dict(config_store["prior"])
     shared_sampler = dict(config_store["sampler"])
@@ -806,16 +777,11 @@ def _model_estimation_configs(
             }
         )
         spec_overrides = {"p": _safe_int(row["p"], f"{model_id} lag order")}
-        method = _missing_method_override(
-            row.get("missing_data_method", "baseline")
-        )
-        if method is not None:
-            spec_overrides["missing_data_method"] = method
     else:
+        # selected_only uses the selected model's structure editor. all_7 keeps
+        # each model's native structure to avoid accidentally imposing p=12 on
+        # the weekly models or p=24 on monthly models.
         spec_overrides = {}
-        if shared_missing is not None:
-            spec_overrides["missing_data_method"] = shared_missing
-
         if scope == "selected_only" and model_id == selected_model_id:
             structure = dict(config_store.get("selected_structure", {}))
             if structure.get("p") is not None:
@@ -830,23 +796,14 @@ def _model_estimation_configs(
                     )
                 if structure.get("reference_month") is not None:
                     reference = _safe_int(
-                        structure["reference_month"],
-                        "electricity reference month",
+                        structure["reference_month"], "electricity reference month"
                     )
                     if reference not in range(1, 13):
-                        raise ValueError(
-                            "Electricity reference month must lie in 1..12."
-                        )
+                        raise ValueError("Electricity reference month must lie in 1..12.")
                     spec_overrides["reference_month"] = reference
 
-    prior = _prior_from_mapping(
-        shared_prior,
-        frequency=spec.frequency,
-    )
-    sampler = _sampler_from_mapping(
-        shared_sampler,
-        seed_fallback=spec.seed,
-    )
+    prior = _prior_from_mapping(shared_prior, frequency=spec.frequency)
+    sampler = _sampler_from_mapping(shared_sampler, seed_fallback=spec.seed)
     return prior, sampler, spec_overrides
 
 
@@ -1113,7 +1070,6 @@ def _anchor_fan_line(block: pd.DataFrame, date, value) -> pd.DataFrame:
             anchor[column] = float(value)
     return pd.concat([pd.DataFrame([anchor]), block], ignore_index=True).sort_values("date")
 
-# GRAPH_EXPORT_READABILITY_G3_FORECAST_V1
 def forecast_figure(
     frame: pd.DataFrame,
     *,
@@ -1207,7 +1163,7 @@ def forecast_figure(
         hoverlabel={"bgcolor": "white", "bordercolor": "#e5e7eb", "font": {"color": "#111827"}},
         legend={"orientation": "h", "y": 1.13, "x": 1, "xanchor": "right", "font": {"size": 11}},
         uirevision=f"{context.get('model_id')}::{series}::{metric}",
-        paper_bgcolor="white", plot_bgcolor="white",
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
     )
     fig.update_xaxes(showgrid=False, linecolor="#e5e7eb", tickfont={"color": "#6b7280"})
     fig.update_yaxes(gridcolor="#eef0f3", zerolinecolor="#d1d5db", tickfont={"color": "#6b7280"})
@@ -1229,8 +1185,8 @@ def _empty_forecast_figure(message: str = "Select a run to display its forecast"
         template="plotly_white",
         height=520,
         margin={"l": 40, "r": 20, "t": 30, "b": 30},
-        paper_bgcolor="white",
-        plot_bgcolor="white",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
         xaxis={"visible": False},
         yaxis={"visible": False},
     )
@@ -1273,107 +1229,6 @@ def _stat_card(title: str, value_id: str, subtitle_id: str | None = None) -> htm
     if subtitle_id:
         children.append(html.Div("", id=subtitle_id, className="stat-subtitle"))
     return html.Div(children, className="stat-card")
-
-_RESULT_BLOCK_STATES = frozenset({"fresh", "computing", "stale"})
-
-
-def _result_block(
-    *,
-    eyebrow: Any,
-    value: Any = None,
-    unit_date: Any = None,
-    uncertainty: Any = None,
-    provenance: Any,
-    state: str = "fresh",
-    state_text: str | None = None,
-) -> html.Div:
-    """Canonical compact result card for scenario propagation outputs.
-
-    The helper is intentionally id-less. Dynamic IDs/stores are introduced only
-    by the owning layout/callback block. ``provenance`` is mandatory so every
-    materialised result carries its source contract on screen.
-
-    States
-    ------
-    fresh
-        Current result for the active scenario.
-    computing
-        Stable card geometry. If a previous value exists it remains visible in
-        soft ink; otherwise a same-height skeleton occupies the value slot.
-    stale
-        Previous result retained with reduced emphasis and an explicit stale
-        message until the user requests a recomputation.
-    """
-    state = str(state or "fresh").strip().lower()
-    if state not in _RESULT_BLOCK_STATES:
-        raise ValueError(
-            f"Unknown result-block state {state!r}; "
-            f"expected one of {sorted(_RESULT_BLOCK_STATES)}."
-        )
-    if provenance is None or (
-        isinstance(provenance, str) and not provenance.strip()
-    ):
-        raise ValueError("result-block provenance is mandatory.")
-
-    has_value = not (
-        value is None
-        or (isinstance(value, str) and not value.strip())
-    )
-    value_classes = ["result-block-value"]
-    if state == "computing" and has_value:
-        value_classes.append("result-block-value--previous")
-
-    if state == "computing" and not has_value:
-        value_node = html.Div(
-            html.Span(className="result-block-skeleton-bar"),
-            className="result-block-value-frame",
-        )
-    else:
-        value_node = html.Div(
-            value if has_value else "—",
-            className=" ".join(value_classes),
-        )
-
-    status_node = None
-    if state == "computing":
-        status_node = html.Div(
-            state_text or "Updating…",
-            className="result-block-state-text",
-        )
-    elif state == "stale":
-        status_node = html.Div(
-            state_text or "Stale — scenario changed",
-            className="result-block-state-text",
-        )
-
-    children = [
-        html.Div(eyebrow, className="result-block-eyebrow"),
-        value_node,
-        html.Div(
-            unit_date if unit_date not in (None, "") else "—",
-            className="result-block-unit-date",
-        ),
-        html.Div(
-            uncertainty if uncertainty not in (None, "") else "—",
-            className="result-block-uncertainty",
-        ),
-    ]
-    if status_node is not None:
-        children.append(status_node)
-    children.extend(
-        [
-            html.Div(className="result-block-rule"),
-            html.Div(provenance, className="result-block-provenance"),
-        ]
-    )
-    return html.Div(
-        children,
-        className=f"result-block result-block--{state}",
-        **{
-            "data-result-state": state,
-            "aria-live": "polite",
-        },
-    )
 
 
 _GRAPH_CONFIG: dict = {
@@ -1608,110 +1463,6 @@ def aggregate_page() -> html.Div:
             ),
             html.Div(
                 [dcc.Loading(dcc.Graph(id="agg-graph", config=_AGG_GRAPH_CONFIG, style={"height": "680px"}), type="circle")],
-                className="panel chart-panel",
-            ),
-            html.Div(
-                [
-                    html.Div(
-                        [
-                            html.Div(
-                                [
-                                    html.Div("HEADLINE LINK", className="eyebrow"),
-                                    html.H3(
-                                        "Selected HICP Energy contribution to Headline",
-                                        className="panel-title",
-                                    ),
-                                    html.P(
-                                        "Condition the saved Headline posterior on the selected "
-                                        "bottom-up HICP Energy baseline. The selected aggregate "
-                                        "posterior-mean growth path is transferred onto the "
-                                        "Headline Energy scale; all remaining DK months stay latent.",
-                                        className="panel-subtitle",
-                                    ),
-                                ]
-                            ),
-                            html.Div(
-                                [
-                                    html.Button(
-                                        "Calculate Headline contribution (~13 s)",
-                                        id="agg-headline-contribution-run",
-                                        n_clicks=0,
-                                        className="estimation-run-button",
-                                    ),
-                                    html.Div(
-                                        id="agg-headline-contribution-status",
-                                        className="propagation-headline-status",
-                                    ),
-                                ],
-                                className="propagation-headline-column",
-                            ),
-                        ],
-                        className="panel-heading",
-                        style={
-                            "display": "flex",
-                            "justifyContent": "space-between",
-                            "gap": "20px",
-                            "alignItems": "flex-start",
-                            "flexWrap": "wrap",
-                        },
-                    ),
-                    html.Div(
-                        [
-                            html.Div(
-                                _result_block(
-                                    eyebrow="Contribution · selected Energy path",
-                                    value="Not calculated",
-                                    unit_date="Last conditioned month",
-                                    uncertainty=(
-                                        "Explicit saved-posterior conditional run required."
-                                    ),
-                                    provenance=(
-                                        "source · agg-select · selected aggregate result "
-                                        "not materialized"
-                                    ),
-                                ),
-                                id="agg-headline-contribution-conditioned-result",
-                            ),
-                            html.Div(
-                                _result_block(
-                                    eyebrow="Contribution · H=12 terminal",
-                                    value="Not calculated",
-                                    unit_date="Terminal DK month",
-                                    uncertainty=(
-                                        "Later months remain latent after the selected Energy "
-                                        "path ends."
-                                    ),
-                                    provenance=(
-                                        "source · agg-select · selected aggregate result "
-                                        "not materialized"
-                                    ),
-                                ),
-                                id="agg-headline-contribution-terminal-result",
-                            ),
-                        ],
-                        style={
-                            "display": "grid",
-                            "gridTemplateColumns": "repeat(auto-fit, minmax(300px, 1fr))",
-                            "gap": "12px",
-                            "marginBottom": "12px",
-                        },
-                    ),
-                    dcc.Loading(
-                        dcc.Graph(
-                            id="agg-headline-contribution-graph",
-                            config=_AGG_GRAPH_CONFIG,
-                        ),
-                        type="circle",
-                    ),
-                    html.P(
-                        "Uncertainty contract: the selected aggregate contributes one "
-                        "deterministic posterior-mean Energy path. Its upstream Energy "
-                        "draws are not propagated through Headline; any non-degenerate "
-                        "band comes only from saved Headline posterior draws conditional "
-                        "on that path.",
-                        className="panel-subtitle",
-                    ),
-                ],
                 className="panel chart-panel",
             ),
             html.Div(
@@ -2643,131 +2394,6 @@ def scenario_page() -> html.Div:
                         [
                             html.Div(
                                 [
-                                    html.Div(
-                                        "INTER-DOMAIN PROPAGATION",
-                                        className="eyebrow",
-                                    ),
-                                    html.H3(
-                                        "Propagation to HICP Energy and Headline",
-                                        className="panel-title",
-                                    ),
-                                    html.P(
-                                        "HICP Energy is read from the already materialized aggregate "
-                                        "scenario store. Headline is intentionally not recomputed "
-                                        "automatically; Core is zero by construction because the Core "
-                                        "definition excludes Energy.",
-                                        className="panel-subtitle",
-                                    ),
-                                ]
-                            ),
-                        ],
-                        className="panel-heading",
-                    ),
-                    html.Div(
-                        [
-                            dcc.Loading(
-                                html.Div(
-                                    _result_block(
-                                        eyebrow="HICP Energy impact",
-                                        value=None,
-                                        unit_date="Awaiting propagated aggregate scenario",
-                                        uncertainty=(
-                                            "Posterior mean and 68% interval appear after "
-                                            "agg-scenario-store is materialized."
-                                        ),
-                                        provenance=(
-                                            "source · agg-scenario-store · no materialized "
-                                            "propagation"
-                                        ),
-                                    ),
-                                    id="scenario-propagation-energy-result",
-                                ),
-                                type="circle",
-                            ),
-                            html.Div(
-                                [
-                                    dcc.Loading(
-                                        html.Div(
-                                            _result_block(
-                                                eyebrow="Headline impact",
-                                                value="Not calculated",
-                                                unit_date=(
-                                                    "Explicit conditional run required · "
-                                                    "~23 s warm / ~40 s cold"
-                                                ),
-                                                uncertainty=(
-                                                    "Point estimate and bands withheld until "
-                                                    "paired Energy-baseline/scenario Headline run."
-                                                ),
-                                                provenance=(
-                                                    "source · agg-scenario-store · Headline result "
-                                                    "not materialized"
-                                                ),
-                                            ),
-                                            id="scenario-propagation-headline-result",
-                                        ),
-                                        type="circle",
-                                    ),
-                                    html.Button(
-                                        "Calculate Headline impact (~23–40 s)",
-                                        id="scenario-propagation-headline-run",
-                                        n_clicks=0,
-                                        className="estimation-run-button",
-                                    ),
-                                    html.Div(
-                                        "Contract · Energy conditioned 3m, then freely propagated "
-                                        "9m inside the 12m DK horizon. Build an HICP Energy scenario "
-                                        "first, then calculate explicitly.",
-                                        id="scenario-propagation-headline-status",
-                                        className="propagation-headline-status",
-                                    ),
-                                ],
-                                className="propagation-headline-column",
-                            ),
-                            html.Div(
-                                _result_block(
-                                    eyebrow="Core impact",
-                                    value="0.00 pp",
-                                    unit_date="All horizons",
-                                    uncertainty=(
-                                        "Null by construction · Core excludes Energy."
-                                    ),
-                                    provenance=(
-                                        "definition · TOT_X_NRG_FOOD excludes Energy"
-                                    ),
-                                ),
-                                className="propagation-core-static",
-                            ),
-                        ],
-                        className="propagation-result-grid",
-                    ),
-                    dcc.Loading(
-                        dcc.Graph(
-                            id="scenario-propagation-headline-graph",
-                            figure=empty_scenario_figure(
-                                "Calculate Headline impact explicitly to materialize the B−A path."
-                            ),
-                            config=_GRAPH_CONFIG,
-                        ),
-                        type="circle",
-                    ),
-                    html.P(
-                        "Headline values are an explicit conditional-forecast calculation, "
-                        "not an automatic continuation of the fast component/HICP Energy "
-                        "scenario update. The future Headline result will use paired "
-                        "Energy-baseline/scenario draws before posterior summaries.",
-                        className="panel-subtitle propagation-contract-note",
-                    ),
-                ],
-                className="panel",
-                style={"marginTop": "24px", "marginBottom": "24px"},
-            ),
-            html.Div(
-                [
-                    html.Div(
-                        [
-                            html.Div(
-                                [
                                     html.Div("JOINT ENERGY SCENARIO", className="eyebrow"),
                                     html.H3(
                                         "All active Energy assumptions — one HICP Energy distribution",
@@ -3374,7 +3000,7 @@ def _vintage_display_text(vintage: str | None) -> str:
 
 def _production_vintage_label(item: Mapping[str, Any]) -> str:
     if item.get("linked_ready"):
-        suffix = "processed data ready"
+        suffix = "linked ready"
     elif item.get("energy_ready"):
         suffix = "Energy ready"
     elif item.get("headline_ready"):
@@ -4406,27 +4032,6 @@ def estimation_page() -> html.Div:
                         className="panel-heading est-config-heading",
                     ),
                     html.Div(
-                        [
-                            html.Label("Missing values", className="control-label"),
-                            dcc.Dropdown(
-                                id="est-missing-method",
-                                options=[
-                                    {"label": "Model baseline", "value": "baseline"},
-                                    {"label": "Linear interpolation · fast approximation", "value": "linear"},
-                                    {"label": "Durbin–Koopman · exact augmentation", "value": "dk"},
-                                ],
-                                value="baseline",
-                                clearable=False,
-                                className="compact-dropdown",
-                            ),
-                            html.Div(
-                                "Independent of the prior profile. Model baseline keeps each model's native treatment; Linear or Durbin–Koopman applies to every model in suite runs. Per-model scope uses the table below.",
-                                className="est-editor-note",
-                            ),
-                        ],
-                        className="control-block",
-                    ),
-                    html.Div(
                         id="est-profile-message",
                         className="est-profile-message",
                     ),
@@ -4467,8 +4072,8 @@ def estimation_page() -> html.Div:
                                             html.Label(["Outlier interval", html.Span("Mean calendar years")], className="est-field-label"),
                                             dcc.Input(id="est-outlier-years", type="number", value=4.0, step=0.25, min=0.05, className="est-number-input"),
                                             html.Div(id="est-outlier-effective", className="est-editor-note"),
-                                            html.Label(["Prior confidence", html.Span("Equivalent calendar years of prior information")], className="est-field-label"),
-                                            dcc.Input(id="est-outlier-prior-years", type="number", value=10.0, step=0.5, min=0.1, className="est-number-input"),
+                                            html.Label(["Prior obs.", html.Span("Outlier-frequency prior strength")], className="est-field-label"),
+                                            dcc.Input(id="est-outlier-prior-obs", type="number", value=120.0, step=10, min=0.000001, className="est-number-input"),
                                         ],
                                         className="est-field-grid",
                                     ),
@@ -4579,7 +4184,7 @@ def estimation_page() -> html.Div:
                                 [
                                     html.Div("Per-model overrides", className="eyebrow"),
                                     html.Div(
-                                        "Editable when scope is Per-model overrides. These rows control λ1–λ4, p, missing-value treatment and the core MCMC settings; SV/outlier/numerical settings remain shared above.",
+                                        "Editable when scope is Per-model overrides. These rows control λ1–λ4, p and the core MCMC settings; SV/outlier/numerical settings remain the shared values above.",
                                         className="est-editor-note",
                                     ),
                                 ],
@@ -4591,7 +4196,6 @@ def estimation_page() -> html.Div:
                                 columns=[
                                     {"name": "Model", "id": "model", "editable": False},
                                     {"name": "p", "id": "p", "type": "numeric"},
-                                    {"name": "Missing", "id": "missing_data_method", "presentation": "dropdown"},
                                     {"name": "λ1", "id": "lambda1", "type": "numeric"},
                                     {"name": "λ2", "id": "lambda2", "type": "numeric"},
                                     {"name": "λ3", "id": "lambda3", "type": "numeric"},
@@ -4602,14 +4206,6 @@ def estimation_page() -> html.Div:
                                     {"name": "Seed", "id": "seed", "type": "numeric"},
                                 ],
                                 editable=True,
-                                dropdown={
-                                    "missing_data_method": {
-                                        "options": [
-                                            {"label": "Linear", "value": "linear"},
-                                            {"label": "DK", "value": "dk"},
-                                        ]
-                                    }
-                                },
                                 row_deletable=False,
                                 sort_action="none",
                                 page_action="none",
@@ -4948,225 +4544,6 @@ def placeholder_page(title: str, description: str, next_slice: str) -> html.Div:
     )
 
 
-def _domain_section_href(section: str, domain: str) -> str:
-    section = str(section).strip().lower()
-    domain = str(domain).strip().lower()
-    if section not in {"forecast", "scenarios", "structural", "estimation"}:
-        raise ValueError(f"Unknown dashboard section {section!r}.")
-    if domain == "energy":
-        return f"/{section}"
-    if domain in {"headline", "core"}:
-        return f"/{section}/{domain}"
-    raise ValueError(f"Unknown dashboard domain {domain!r}.")
-
-
-def _domain_switch(section: str) -> html.Div:
-    """Id-less, URL-driven domain segmented control shared by all domain pages."""
-    core_unavailable = section in {"structural", "estimation"}
-    core_title = (
-        f"{section.title()} is not yet available for Core. "
-        "Use Core Forecast or Scenarios instead."
-        if core_unavailable
-        else None
-    )
-    return html.Div(
-        [
-            dcc.Link(
-                "Energy",
-                href=_domain_section_href(section, "energy"),
-                className="domain-pill",
-            ),
-            dcc.Link(
-                "Headline HICP",
-                href=_domain_section_href(section, "headline"),
-                className="domain-pill",
-            ),
-            dcc.Link(
-                "Core",
-                href=_domain_section_href(section, "core"),
-                className=(
-                    "domain-pill domain-pill-disabled"
-                    if core_unavailable
-                    else "domain-pill"
-                ),
-                title=core_title,
-                style=(
-                    {"opacity": "0.45", "cursor": "help"}
-                    if core_unavailable
-                    else None
-                ),
-            ),
-        ],
-        className="domain-switch page-domain-switch",
-        style={"width": "420px", "maxWidth": "100%", "margin": "8px 0 14px"},
-    )
-
-
-def _forecast_view_switch(active_view: str) -> html.Div:
-    """Energy Forecast view toggle; URL-driven, id-less, callback-free."""
-    base_style = {
-        "display": "block",
-        "padding": "7px 10px",
-        "border": "1px solid #d1d5db",
-        "borderRadius": "8px",
-        "textAlign": "center",
-        "textDecoration": "none",
-        "fontSize": "13px",
-    }
-
-    def _style(active: bool) -> dict:
-        style = dict(base_style)
-        style.update({
-            "fontWeight": 700 if active else 500,
-            "background": "#f3f4f6" if active else "transparent",
-        })
-        return style
-
-    return html.Div(
-        [
-            dcc.Link(
-                "Composantes",
-                href="/forecast",
-                className="forecast-view-pill",
-                style=_style(active_view == "components"),
-            ),
-            dcc.Link(
-                "Agrégat HICP Energy",
-                href="/forecast/aggregate",
-                className="forecast-view-pill",
-                style=_style(active_view == "aggregate"),
-            ),
-        ],
-        className="forecast-view-switch",
-        style={
-            "display": "grid",
-            "gridTemplateColumns": "1fr 1fr",
-            "gap": "4px",
-            "width": "420px",
-            "maxWidth": "100%",
-            "margin": "0 0 16px",
-        },
-    )
-
-
-def _insert_page_navigation(
-    component,
-    additions: list,
-    *,
-    audit_branch: list[int] | None = None,
-) -> bool:
-    """Insert after the principal page heading using three strictly bounded shapes."""
-    children = getattr(component, "children", None)
-    if isinstance(children, tuple):
-        children = list(children)
-        component.children = children
-    if not isinstance(children, list):
-        return False
-
-    # Branch 1: a direct page-heading-row child owns the title/subtitle.
-    for index, child in enumerate(children):
-        class_name = str(getattr(child, "className", "") or "")
-        if "page-heading-row" in class_name.split():
-            children[index + 1:index + 1] = additions
-            if audit_branch is not None:
-                audit_branch.append(1)
-            return True
-
-    # Branch 2: compact pages expose H2.page-title + optional P.page-subtitle directly.
-    for index, child in enumerate(children):
-        class_name = str(getattr(child, "className", "") or "")
-        if type(child).__name__ == "H2" and "page-title" in class_name.split():
-            insert_at = index + 1
-            if insert_at < len(children):
-                next_child = children[insert_at]
-                next_class = str(getattr(next_child, "className", "") or "")
-                if (
-                    type(next_child).__name__ == "P"
-                    and "page-subtitle" in next_class.split()
-                ):
-                    insert_at += 1
-            children[insert_at:insert_at] = additions
-            if audit_branch is not None:
-                audit_branch.append(2)
-            return True
-
-    # Branch 3: exactly one bounded level for an anonymous Div heading wrapper.
-    # This covers core_scenarios_page without reopening recursive H2 discovery.
-    for index, child in enumerate(children):
-        if type(child).__name__ != "Div":
-            continue
-        class_name = str(getattr(child, "className", "") or "").strip()
-        if class_name:
-            continue
-        inner = getattr(child, "children", None)
-        if isinstance(inner, tuple):
-            inner = list(inner)
-            child.children = inner
-        if not isinstance(inner, list) or not inner:
-            continue
-        first = inner[0]
-        first_class = str(getattr(first, "className", "") or "")
-        if type(first).__name__ == "H2" and "page-title" in first_class.split():
-            children[index + 1:index + 1] = additions
-            if audit_branch is not None:
-                audit_branch.append(3)
-            return True
-
-    # No recursion beyond one anonymous heading wrapper: nested H2s may be sub-cards.
-    return False
-
-
-def _with_page_navigation(
-    page,
-    *,
-    section: str,
-    domain: str,
-    forecast_view: str | None = None,
-):
-    additions = [_domain_switch(section)]
-    if section == "forecast" and domain == "energy":
-        additions.append(_forecast_view_switch(forecast_view or "components"))
-    if not _insert_page_navigation(page, additions):
-        raise RuntimeError(
-            f"Could not find a page title for section={section!r}, domain={domain!r}."
-        )
-    return page
-
-
-def _core_unavailable_page(section: str) -> html.Div:
-    title = section.title()
-    return html.Div(
-        [
-            html.H2(title, className="page-title"),
-            html.P(
-                f"{title} is not yet available for Core.",
-                className="page-subtitle",
-            ),
-            html.Div(
-                [
-                    html.Div("Core", className="eyebrow"),
-                    html.H3(
-                        f"{title} is not yet available for Core",
-                        className="placeholder-title",
-                    ),
-                    html.P(
-                        "No redirect is performed. Core Forecast and Scenarios remain "
-                        "available from the section-first shell.",
-                        className="placeholder-text",
-                    ),
-                    dcc.Link(
-                        "Open Core → Forecast",
-                        href="/forecast/core",
-                        className="refresh-button",
-                    ),
-                ],
-                className="panel placeholder-panel",
-            ),
-        ],
-        className="page-body",
-    )
-
-
 def sidebar() -> html.Aside:
     return html.Aside(
         [
@@ -5190,9 +4567,26 @@ def sidebar() -> html.Aside:
                 id="global-nav",
                 className="nav-stack",
             ),
+            html.Div(
+                [
+                    dcc.Link("Energy", href="/forecast", className="domain-pill"),
+                    dcc.Link(
+                        "Headline HICP",
+                        href="/headline/forecast",
+                        className="domain-pill",
+                    ),
+                    dcc.Link(
+                        "Core",
+                        href="/core/forecast",
+                        className="domain-pill",
+                    ),
+                ],
+                className="domain-switch",
+            ),
             html.Nav(
                 [
                     _nav_link("Forecast", "/forecast", "↗"),
+                    _nav_link("Aggregate", "/aggregate", "Σ"),
                     _nav_link("Scenarios", "/scenarios", "△"),
                     _nav_link("Structural", "/structural", "ψ"),
                     _nav_link("Estimation", "/estimation", "⚙"),
@@ -5202,10 +4596,10 @@ def sidebar() -> html.Aside:
             ),
             html.Nav(
                 [
-                    _nav_link("Forecast", "/forecast/headline", "↗"),
-                    _nav_link("Scenarios", "/scenarios/headline", "△"),
-                    _nav_link("Structural", "/structural/headline", "ψ"),
-                    _nav_link("Estimation", "/estimation/headline", "⚙"),
+                    _nav_link("Forecast & Contributions", "/headline/forecast", "↗"),
+                    _nav_link("Scenarios", "/headline/scenarios", "△"),
+                    _nav_link("Structural", "/headline/structural", "ψ"),
+                    _nav_link("Estimation", "/headline/estimation", "⚙"),
                 ],
                 id="headline-nav",
                 className="nav-stack nav-stack-headline",
@@ -5213,10 +4607,8 @@ def sidebar() -> html.Aside:
             ),
             html.Nav(
                 [
-                    _nav_link("Forecast", "/forecast/core", "↗"),
-                    _nav_link("Scenarios", "/scenarios/core", "△"),
-                    _nav_link("Structural", "/structural/core", "ψ"),
-                    _nav_link("Estimation", "/estimation/core", "⚙"),
+                    _nav_link("Forecast & Contributions", "/core/forecast", "↗"),
+                    _nav_link("Scenarios", "/core/scenarios", "△"),
                 ],
                 id="core-nav",
                 className="nav-stack nav-stack-core",
@@ -5232,7 +4624,6 @@ def sidebar() -> html.Aside:
         ],
         className="sidebar",
     )
-
 
 
 def topbar() -> html.Div:
@@ -5284,13 +4675,11 @@ app.layout = html.Div(
         html.Div(id="xlsx-export-vintage", style={"display": "none"}),
         dcc.Store(id="data-store", storage_type="memory"),
         dcc.Store(id="agg-store", storage_type="memory"),
-        dcc.Store(id="agg-headline-contribution-store", storage_type="memory"),
         dcc.Store(id="scenario-store", storage_type="memory"),
         dcc.Store(id="conditional-store", storage_type="memory"),
         dcc.Store(id="joint-energy-scenario-store", storage_type="memory"),
         dcc.Store(id="scenario-tax-selected-agg-store", storage_type="memory"),
         dcc.Store(id="agg-scenario-store", storage_type="memory"),
-        dcc.Store(id="scenario-propagation-headline-store", storage_type="memory"),
         dcc.Store(id="estimation-result-store", storage_type="memory"),
         dcc.Store(id="dataset-build-result-store", storage_type="memory"),
         dcc.Store(id="structural-volatility-store", storage_type="memory"),
@@ -5307,11 +4696,6 @@ app.layout = html.Div(
         html.Main(
             [
                 topbar(),
-                html.Div(
-                    id="global-production-results-warning",
-                    className="selection-banner global-production-results-warning",
-                    style={"display": "none"},
-                ),
                 html.Div(id="selection-banner", className="selection-banner"),
                 html.Div(
                     [
@@ -5327,49 +4711,49 @@ app.layout = html.Div(
                             id="page-economic-data",
                             style={"display": "none"},
                         ),
-                        html.Div(_with_page_navigation(forecast_page(), section="forecast", domain="energy", forecast_view="components"), id="page-forecast"),
+                        html.Div(forecast_page(), id="page-forecast"),
                         html.Div(
-                            _with_page_navigation(aggregate_page(), section="forecast", domain="energy", forecast_view="aggregate"),
+                            aggregate_page(),
                             id="page-aggregate",
                             style={"display": "none"},
                         ),
                         html.Div(
-                            _with_page_navigation(scenario_page(), section="scenarios", domain="energy"),
+                            scenario_page(),
                             id="page-scenarios",
                             style={"display": "none"},
                         ),
                         html.Div(
-                            _with_page_navigation(structural_page(), section="structural", domain="energy"),
+                            structural_page(),
                             id="page-structural",
                             style={"display": "none"},
                         ),
                         html.Div(
-                            _with_page_navigation(estimation_page(), section="estimation", domain="energy"),
+                            estimation_page(),
                             id="page-estimation",
                             style={"display": "none"},
                         ),
                     html.Div(
-                        _with_page_navigation(headline_forecast_v2_page(), section="forecast", domain="headline"),
+                        headline_forecast_v2_page(),
                         id="page-headline-forecast",
                         style={"display": "none"},
                     ),
                     html.Div(
-                        _with_page_navigation(headline_scenarios_page(), section="scenarios", domain="headline"),
+                        headline_scenarios_page(),
                         id="page-headline-scenarios",
                         style={"display": "none"},
                     ),
                     html.Div(
-                        _with_page_navigation(core_forecast_page(), section="forecast", domain="core"),
+                        core_forecast_page(),
                         id="page-core-forecast",
                         style={"display": "none"},
                     ),
                     html.Div(
-                        _with_page_navigation(core_scenarios_page(), section="scenarios", domain="core"),
+                        core_scenarios_page(),
                         id="page-core-scenarios",
                         style={"display": "none"},
                     ),
                         html.Div(
-                            _with_page_navigation(headline_structural_page(), section="structural", domain="headline"),
+                            headline_structural_page(),
                             id="page-headline-structural",
                             style={"display": "none"},
                         ),
@@ -5383,30 +4767,11 @@ app.layout = html.Div(
                                 ],
                                 className="selection-banner",
                             ),
-                            _with_page_navigation(headline_estimation_v2_page(), section="estimation", domain="headline"),
+                            headline_estimation_v2_page(),
                         ],
                         id="page-headline-diagnostics",
                         style={"display": "none"},
                     )
-,
-                        html.Div(
-                            _with_page_navigation(
-                                _core_unavailable_page("structural"),
-                                section="structural",
-                                domain="core",
-                            ),
-                            id="page-core-structural",
-                            style={"display": "none"},
-                        ),
-                        html.Div(
-                            _with_page_navigation(
-                                _core_unavailable_page("estimation"),
-                                section="estimation",
-                                domain="core",
-                            ),
-                            id="page-core-estimation",
-                            style={"display": "none"},
-                        ),
                     ],
                     className="page-container",
                 ),
@@ -5460,150 +4825,6 @@ def refresh_registry(
     return _scan_registry()
 
 
-# GLOBAL_PRODUCTION_RESULTS_WARNING_V1
-
-def _production_results_warning_state(
-    production_store: dict | None,
-) -> dict:
-    """Summarise saved-result readiness from the frozen registry snapshot only."""
-    vintage = str((production_store or {}).get("vintage") or "").strip()
-    if not vintage:
-        return {
-            "show": False,
-            "vintage": None,
-            "energy_ready_count": 0,
-            "energy_expected": len(ENERGY_SUITE_MODEL_IDS),
-            "aggregate_ready": False,
-            "headline_ready": False,
-            "completed_run_count": 0,
-            "usable_forecast_count": 0,
-        }
-
-    runs = _registry_table("runs")
-    forecasts = _registry_table("forecasts")
-
-    if runs.empty or "vintage" not in runs.columns:
-        complete_runs = runs.iloc[0:0].copy()
-    else:
-        complete_runs = runs.loc[
-            runs["vintage"].astype(str).eq(vintage)
-        ].copy()
-        if "status" in complete_runs.columns:
-            complete_runs = complete_runs.loc[
-                complete_runs["status"].astype(str).eq("complete")
-            ].copy()
-        else:
-            complete_runs = complete_runs.iloc[0:0].copy()
-
-    complete_run_ids = (
-        set(complete_runs["run_id"].astype(str))
-        if not complete_runs.empty and "run_id" in complete_runs.columns
-        else set()
-    )
-
-    if forecasts.empty or "vintage" not in forecasts.columns:
-        usable_forecasts = forecasts.iloc[0:0].copy()
-    else:
-        usable_forecasts = forecasts.loc[
-            forecasts["vintage"].astype(str).eq(vintage)
-        ].copy()
-        if "run_id" in usable_forecasts.columns:
-            usable_forecasts = usable_forecasts.loc[
-                usable_forecasts["run_id"].astype(str).isin(complete_run_ids)
-            ].copy()
-        else:
-            usable_forecasts = usable_forecasts.iloc[0:0].copy()
-
-    ready_model_ids = (
-        set(usable_forecasts["model_id"].astype(str))
-        if not usable_forecasts.empty and "model_id" in usable_forecasts.columns
-        else set()
-    )
-    energy_ready_count = sum(
-        1
-        for model_id in ENERGY_SUITE_MODEL_IDS
-        if str(model_id) in ready_model_ids
-    )
-    headline_ready = str(HEADLINE_MODEL_ID) in ready_model_ids
-
-    aggregates = _registry_table("aggregates")
-    aggregate_ready = False
-    if not aggregates.empty and "vintage" in aggregates.columns:
-        here = aggregates.loc[
-            aggregates["vintage"].astype(str).eq(vintage)
-        ].copy()
-        if not here.empty:
-            if "status" in here.columns:
-                aggregate_ready = bool(
-                    here["status"].astype(str).eq("complete").any()
-                )
-            else:
-                aggregate_ready = True
-
-    all_ready = bool(
-        energy_ready_count == len(ENERGY_SUITE_MODEL_IDS)
-        and aggregate_ready
-        and headline_ready
-    )
-    return {
-        "show": not all_ready,
-        "vintage": vintage,
-        "energy_ready_count": int(energy_ready_count),
-        "energy_expected": int(len(ENERGY_SUITE_MODEL_IDS)),
-        "aggregate_ready": bool(aggregate_ready),
-        "headline_ready": bool(headline_ready),
-        "completed_run_count": int(len(complete_runs)),
-        "usable_forecast_count": int(len(usable_forecasts)),
-    }
-
-
-def _production_results_warning_component(
-    production_store: dict | None,
-):
-    state = _production_results_warning_state(production_store)
-    if not state["show"] or not state["vintage"]:
-        return "", {"display": "none"}
-
-    vintage = str(state["vintage"])
-    energy = (
-        f"Energy saved results {state['energy_ready_count']}/"
-        f"{state['energy_expected']}"
-    )
-    aggregate = (
-        "HICP Energy aggregate ready"
-        if state["aggregate_ready"]
-        else "HICP Energy aggregate pending"
-    )
-    headline = (
-        "Headline saved result ready"
-        if state["headline_ready"]
-        else "Headline saved result pending"
-    )
-
-    if state["completed_run_count"] == 0:
-        lead = (
-            f" · vintage {vintage} is processed, but no completed model run exists yet."
-        )
-    elif state["usable_forecast_count"] == 0:
-        lead = (
-            f" · vintage {vintage} has completed run metadata, "
-            "but no usable saved forecast is available yet."
-        )
-    else:
-        lead = f" · vintage {vintage} has only a partial saved result set."
-
-    children = [
-        html.Strong("Production data ready; results pending"),
-        html.Span(lead),
-        html.Span(f" · {energy} · {aggregate} · {headline}."),
-        html.Span(
-            " Navigation remains available. Result-dependent panels will populate "
-            "after the missing estimations/forecasts complete and the registry "
-            "snapshot refreshes."
-        ),
-    ]
-    return children, {}
-
 @callback(Output("registry-status", "children"), Input("registry-store", "data"))
 def registry_status(store: dict | None):
     if not store:
@@ -5620,20 +4841,6 @@ def registry_status(store: dict | None):
         )
     return html.Div(children)
 
-
-@callback(
-    Output("global-production-results-warning", "children"),
-    Output("global-production-results-warning", "style"),
-    Input("production-vintage-store", "data"),
-    Input("registry-store", "data"),
-)
-def global_production_results_warning(
-    production_store: dict | None,
-    _registry: dict | None,
-):
-    # registry-store is only a re-trigger after explicit/successful refreshes.
-    # The lookup itself stays on the already-frozen in-memory snapshot.
-    return _production_results_warning_component(production_store)
 
 @callback(
     Output("vintage-select", "options"),
@@ -6615,7 +5822,7 @@ def estimation_profile_options(_revision):
     Output("est-phi-df", "value"),
     Output("est-h0-var", "value"),
     Output("est-outlier-years", "value"),
-    Output("est-outlier-prior-years", "value"),
+    Output("est-outlier-prior-obs", "value"),
     Output("est-reps", "value"),
     Output("est-burn", "value"),
     Output("est-thin", "value"),
@@ -6678,7 +5885,7 @@ def load_estimation_profile(profile_value):
         prior["phi_prior_df"],
         prior["h0_var"],
         prior["outlier_interval_years"],
-        prior["outlier_prior_strength_years"],
+        prior["outlier_prior_observations"],
         sampler["reps"],
         sampler["burn"],
         sampler["thin"],
@@ -6702,30 +5909,6 @@ def load_estimation_profile(profile_value):
 
 
 @callback(
-    Output("est-missing-method", "value"),
-    Input("est-profile-select", "value"),
-)
-def load_estimation_missing_method(profile_value):
-    if profile_value in (None, "paper_baseline", "custom"):
-        return "baseline"
-    try:
-        payload = _load_saved_profile(profile_value)
-        value = str(payload.get("missing_data_method", "baseline")).lower()
-        return value if value in {"baseline", "linear", "dk"} else "baseline"
-    except Exception:
-        return "baseline"
-
-
-@callback(
-    Output("est-missing-method", "disabled"),
-    Input("est-profile-select", "value"),
-)
-def estimation_missing_method_editability(profile_value):
-    # Missing-data treatment is independent from the prior/MCMC profile.
-    return False
-
-
-@callback(
     Output("est-lambda1", "disabled"),
     Output("est-lambda2", "disabled"),
     Output("est-lambda3", "disabled"),
@@ -6735,7 +5918,7 @@ def estimation_missing_method_editability(profile_value):
     Output("est-phi-df", "disabled"),
     Output("est-h0-var", "disabled"),
     Output("est-outlier-years", "disabled"),
-    Output("est-outlier-prior-years", "disabled"),
+    Output("est-outlier-prior-obs", "disabled"),
     Output("est-reps", "disabled"),
     Output("est-burn", "disabled"),
     Output("est-thin", "disabled"),
@@ -6773,24 +5956,19 @@ def estimation_profile_editability(profile_value):
     Output("est-outlier-effective", "children"),
     Input("est-model-select", "value"),
     Input("est-outlier-years", "value"),
-    Input("est-outlier-prior-years", "value"),
 )
-def estimation_outlier_calendar_note(model_id, interval_years, prior_strength_years):
+def estimation_outlier_calendar_note(model_id, interval_years):
     if not model_id or interval_years in (None, ""):
         return "Select a model to see the frequency conversion."
     try:
         spec = model_spec(model_id)
         years = float(interval_years)
         periods = years * periods_per_year(spec.frequency)
+        probability = outlier_mean_frequency_from_years(years, spec.frequency)
         unit = "months" if spec.frequency == "monthly" else "weeks"
-        strength_years = float(prior_strength_years)
-        prior_periods = outlier_prior_observations_from_years(
-            strength_years, spec.frequency
-        )
         return (
-            f"{spec.frequency.capitalize()} model · mean interval {years:g} years "
-            f"= {periods:g} {unit} · prior confidence {strength_years:g} years "
-            f"= {prior_periods:g} {unit}."
+            f"{spec.frequency.capitalize()} model · {years:g} years = "
+            f"{periods:g} {unit} · prior mean p={probability:.6f} per {unit[:-1]}."
         )
     except Exception as exc:
         return f"Invalid outlier interval: {exc}"
@@ -6841,8 +6019,7 @@ def estimation_per_model_visibility(scope):
     Input("est-phi-df", "value"),
     Input("est-h0-var", "value"),
     Input("est-outlier-years", "value"),
-    Input("est-outlier-prior-years", "value"),
-    Input("est-missing-method", "value"),
+    Input("est-outlier-prior-obs", "value"),
     Input("est-reps", "value"),
     Input("est-burn", "value"),
     Input("est-thin", "value"),
@@ -6876,8 +6053,7 @@ def compile_estimation_configuration(
     phi_df,
     h0_var,
     outlier_interval_years,
-    outlier_prior_strength_years,
-    missing_data_method,
+    outlier_prior_obs,
     reps,
     burn,
     thin,
@@ -6914,7 +6090,7 @@ def compile_estimation_configuration(
             "phi_prior_df": phi_df,
             "h0_var": h0_var,
             "outlier_interval_years": outlier_interval_years,
-            "outlier_prior_strength_years": outlier_prior_strength_years,
+            "outlier_prior_observations": outlier_prior_obs,
             "outlier_grid_min": outlier_grid_min,
             "outlier_grid_max": outlier_grid_max,
             "outlier_grid_step": outlier_grid_step,
@@ -6934,7 +6110,6 @@ def compile_estimation_configuration(
             "dk_catastrophic_level_relative_gate": dk_cat_level_gate,
             "dk_catastrophic_difference_relative_gate": dk_cat_difference_gate,
         },
-        "missing_data_method": str(missing_data_method or "baseline").lower(),
         "selected_structure": {
             "p": custom_p,
             "exog_prior_scale": exog_prior_scale,
@@ -6960,10 +6135,6 @@ def compile_estimation_configuration(
                 raise ValueError("lag order must be positive.")
     except Exception as exc:
         errors.append(f"Structure: {exc}")
-    try:
-        _missing_method_override(payload.get("missing_data_method", "baseline"))
-    except Exception as exc:
-        errors.append(f"Missing values: {exc}")
 
     if payload["scope"] == "per_model":
         for row in payload["per_model"]:
@@ -6971,11 +6142,6 @@ def compile_estimation_configuration(
             try:
                 if _safe_int(row.get("p"), f"{model_id} p") < 1:
                     raise ValueError("p must be positive")
-                row_method = str(
-                    row.get("missing_data_method", model_spec(model_id).missing_data_method)
-                ).lower()
-                if row_method not in {"linear", "dk"}:
-                    raise ValueError("missing_data_method must be linear or dk")
                 row_prior = dict(payload["prior"])
                 for key in ("lambda1", "lambda2", "lambda3", "lambda4"):
                     row_prior[key] = row.get(key)
@@ -9068,7 +8234,6 @@ def _valid_structural_payload(payload: object, context: dict, kind: str) -> bool
     )
 
 
-# GRAPH_EXPORT_READABILITY_G2_ENERGY_STRUCTURAL_HD_PLACEHOLDER_V1
 def _structural_hd_placeholder(message: str) -> go.Figure:
     fig = go.Figure()
     fig.add_annotation(
@@ -9086,8 +8251,8 @@ def _structural_hd_placeholder(message: str) -> go.Figure:
         margin={"l": 48, "r": 24, "t": 40, "b": 48},
         xaxis={"visible": False},
         yaxis={"visible": False},
-        paper_bgcolor="white",
-        plot_bgcolor="white",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
     )
     return fig
 
@@ -9730,16 +8895,13 @@ def structural_hd_graph(hd_state, response, window, relayout_data):
 def domain_navigation_styles(pathname: str | None):
     path = pathname or ""
     hidden = {"display": "none"}
-    if path in {"/", "/overview", "/data", "/economic-data"}:
-        # Global pages have no domain of their own; keep the section tabs visible.
-        return {}, hidden, hidden
-    domain = domain_from_path(pathname)
-    if domain == "headline":
-        return hidden, {}, hidden
-    if domain == "core":
+    if path in {"/", "/data", "/overview"}:
+        return hidden, hidden, hidden
+    if path.startswith("/core"):
         return hidden, hidden, {}
+    if domain_from_path(pathname) == "headline":
+        return hidden, {}, hidden
     return {}, hidden, hidden
-
 
 
 
@@ -9749,15 +8911,17 @@ def domain_navigation_styles(pathname: str | None):
     Input("url", "pathname"),
 )
 def data_shell_visibility(pathname: str | None):
-    path = pathname or ""
-    if path in {
-        "/", "/overview", "/data", "/economic-data",
-        "/estimation", "/estimation/headline", "/estimation/core",
-        "/headline/estimation", "/headline/diagnostics", "/core/estimation",
+    if (pathname or "") in {
+        "/",
+        "/overview",
+        "/data",
+        "/economic-data",
+        "/estimation",
+        "/headline/estimation",
+        "/headline/diagnostics",
     }:
         return {"display": "none"}, {"display": "none"}
     return {}, {}
-
 
 
 
@@ -9776,8 +8940,6 @@ def data_shell_visibility(pathname: str | None):
     Output("page-headline-diagnostics", "style"),
     Output("page-core-forecast", "style"),
     Output("page-core-scenarios", "style"),
-    Output("page-core-structural", "style"),
-    Output("page-core-estimation", "style"),
     Input("url", "pathname"),
 )
 def route(pathname: str | None):
@@ -9789,28 +8951,11 @@ def route(pathname: str | None):
         "/economic-data": (
             "economic-data" if ECONOMIC_DATA_ENABLED else "overview"
         ),
-
-        # Canonical section-first Energy routes.
         "/forecast": "forecast",
-        "/forecast/aggregate": "aggregate",
+        "/aggregate": "aggregate",
         "/scenarios": "scenarios",
         "/structural": "structural",
         "/estimation": "estimation",
-
-        # Canonical section-first Headline routes.
-        "/forecast/headline": "headline-forecast",
-        "/scenarios/headline": "headline-scenarios",
-        "/structural/headline": "headline-structural",
-        "/estimation/headline": "headline-estimation",
-
-        # Canonical section-first Core routes.
-        "/forecast/core": "core-forecast",
-        "/scenarios/core": "core-scenarios",
-        "/structural/core": "core-structural",
-        "/estimation/core": "core-estimation",
-
-        # Existing aliases remain functional.
-        "/aggregate": "aggregate",
         "/headline": "headline-forecast",
         "/headline/overview": "headline-forecast",
         "/headline/forecast": "headline-forecast",
@@ -9823,33 +8968,27 @@ def route(pathname: str | None):
         "/core": "core-forecast",
         "/core/forecast": "core-forecast",
         "/core/scenarios": "core-scenarios",
-        "/core/structural": "core-structural",
-        "/core/estimation": "core-estimation",
     }.get(pathname, "overview")
 
     visible = {"display": "block"}
     hidden = {"display": "none"}
-    # Positional order MUST stay aligned with the Output list above.
     names = (
-        "overview",             # 1  page-overview
-        "data",                 # 2  page-data
-        "economic-data",        # 3  page-economic-data
-        "forecast",             # 4  page-forecast
-        "aggregate",            # 5  page-aggregate
-        "scenarios",            # 6  page-scenarios
-        "structural",           # 7  page-structural
-        "estimation",           # 8  page-estimation
-        "headline-forecast",    # 9  page-headline-forecast
-        "headline-scenarios",   # 10 page-headline-scenarios
-        "headline-structural",  # 11 page-headline-structural
-        "headline-estimation",  # 12 page-headline-diagnostics
-        "core-forecast",        # 13 page-core-forecast
-        "core-scenarios",       # 14 page-core-scenarios
-        "core-structural",      # 15 page-core-structural
-        "core-estimation",      # 16 page-core-estimation
+        "overview",
+        "data",
+        "economic-data",
+        "forecast",
+        "aggregate",
+        "scenarios",
+        "structural",
+        "estimation",
+        "headline-forecast",
+        "headline-scenarios",
+        "headline-structural",
+        "headline-estimation",
+        "core-forecast",
+        "core-scenarios",
     )
     return tuple(visible if name == route_name else hidden for name in names)
-
 
 
 # Forecast-page callbacks: all downstream of data-store, no filesystem I/O
@@ -11307,7 +10446,6 @@ def scenario_component_options(vintage, forecast_name, _, current):
     return options, value
 
 
-# VAT_SCENARIO_EDITOR_TRIGGER_POLICY_V1
 @callback(
     Output("scenario-start-date","date"),
     Output("scenario-start-date","min_date_allowed"),
@@ -11325,56 +10463,8 @@ def scenario_component_options(vintage, forecast_name, _, current):
     Input("forecast-select","value"),
     Input("registry-store","data"),
     Input("scenario-store","data"),
-    State("scenario-start-date","date"),
-    State("scenario-vat-delta","value"),
-    State("scenario-excise-delta","value"),
 )
-def scenario_control_defaults(
-    model_id,
-    vintage,
-    forecast_name,
-    _registry,
-    scenario_store,
-    current_start_date,
-    current_vat_delta,
-    current_excise_delta_display,
-):
-    # Use the complete trigger set; do not rely on a single-trigger shortcut.
-    # more than one Input can change in the same Dash resolution cycle.
-    try:
-        triggered_props = {
-            str(item.get("prop_id") or "")
-            for item in (ctx.triggered or [])
-            if str(item.get("prop_id") or "") not in {"", "."}
-        }
-    except Exception:
-        # Direct unit/audit calls have no Dash callback context.  Preserve the
-        # historical behaviour: load committed/default values.
-        triggered_props = set()
-
-    context_props = {
-        "scenario-component-select.value",
-        "vintage-select.value",
-        "forecast-select.value",
-    }
-    context_changed = bool(triggered_props & context_props)
-    scenario_store_changed = "scenario-store.data" in triggered_props
-    registry_changed = "registry-store.data" in triggered_props
-
-    # Ranked causes, evaluated from the full set:
-    # context > explicit scenario-store commit > passive registry refresh.
-    trigger_mode = next(
-        mode
-        for mode, active in (
-            ("context", context_changed),
-            ("commit", scenario_store_changed),
-            ("registry", registry_changed),
-            ("initial", True),
-        )
-        if active
-    )
-    preserve_registry_draft = trigger_mode == "registry"
-
+def scenario_control_defaults(model_id, vintage, forecast_name, _, scenario_store):
     if not model_id or not vintage or not forecast_name:
         return (
             None, None, None, 0.0, 0.0, "Excise change (− = cut)", 0.1,
@@ -11402,100 +10492,27 @@ def scenario_control_defaults(
             True, True, True,
         )
 
-    # Resolve committed state only for the EXACT model/vintage/forecast
-    # context.  scenario_set_payload() intentionally falls back to the first
-    # component when a requested component is absent, which is unsuitable for
-    # an editor default callback after a component switch.
-    store_item = dict(scenario_store or {})
-    legacy_meta = dict(store_item.get("meta", {}) or {})
-    store_vintage = store_item.get("vintage", legacy_meta.get("vintage"))
-    store_forecast = store_item.get(
-        "forecast_name", legacy_meta.get("forecast_name")
-    )
-    store_context_matches = (
-        store_vintage in (None, "", str(vintage))
-        and store_forecast in (None, "", str(forecast_name))
-    )
-    components = (
-        scenario_set_components(scenario_store)
-        if store_context_matches
-        else {}
-    )
-    existing = components.get(str(model_id))
+    existing = scenario_set_payload(scenario_store, model_id)
     em = dict((existing or {}).get("meta", {}) or {})
-
     frequency = str(contract.get("frequency", "monthly"))
     min_start = _normalise_scenario_period(contract["min_start"], frequency)
     max_start = _normalise_scenario_period(contract["max_start"], frequency)
-    default_start = _normalise_scenario_period(
-        contract["default_start"], frequency
-    )
-
-    committed_start = _normalise_scenario_period(
+    default_start = _normalise_scenario_period(contract["default_start"], frequency)
+    start = _normalise_scenario_period(
         em.get("scenario_start") or default_start,
         frequency,
     )
-    if committed_start < min_start or committed_start > max_start:
-        committed_start = default_start
-
-    start = committed_start
-    date_output = committed_start.date()
-
-    # A registry-only refresh is passive.  Keep the user's unsaved date exactly
-    # as typed/displayed when its model-period normalisation remains admissible.
-    if preserve_registry_draft and current_start_date not in (None, ""):
-        try:
-            draft_start = _normalise_scenario_period(
-                current_start_date, frequency
-            )
-        except Exception:
-            draft_start = None
-        if (
-            draft_start is not None
-            and min_start <= draft_start <= max_start
-        ):
-            start = draft_start
-            date_output = current_start_date
-
-    committed_vat = float(em.get("vat_delta_pp", 0.0) or 0.0)
-    if preserve_registry_draft and current_vat_delta is not None:
-        try:
-            vat_output = float(current_vat_delta)
-        except (TypeError, ValueError):
-            vat_output = committed_vat
-    else:
-        vat_output = committed_vat
-
-    pre_source_unit = str(contract.get("excise_unit", "source unit"))
-    pre_display = _scenario_excise_display_spec(pre_source_unit)
-    stored_source_delta = float(em.get("excise_delta", 0.0) or 0.0)
-    committed_excise_display = _scenario_excise_to_display(
-        stored_source_delta, pre_source_unit
-    )
-    if preserve_registry_draft and current_excise_delta_display is not None:
-        try:
-            excise_output = float(current_excise_delta_display)
-        except (TypeError, ValueError):
-            excise_output = committed_excise_display
-    else:
-        excise_output = committed_excise_display
+    if start < min_start or start > max_start:
+        start = default_start
 
     try:
         contract = _scenario_component_contract_for_row(
             str(vintage), model_id, row, start_date=start
         )
     except Exception as exc:
-        # On a passive registry refresh, do not replace valid numeric draft
-        # inputs by zeros merely because the refreshed contract cannot currently
-        # be evaluated at the chosen period.
         return (
-            date_output,
-            min_start.date(),
-            max_start.date(),
-            vat_output,
-            excise_output,
-            f"Excise change ({pre_display['display_unit']}; − = cut)",
-            float(pre_display["step"]),
+            start.date(), min_start.date(), max_start.date(), 0.0, 0.0,
+            "Excise change (− = cut)", 0.1,
             f"Scenario controls unavailable at {start.date()}: {exc}",
             False, True, True,
         )
@@ -11504,14 +10521,8 @@ def scenario_control_defaults(
     display = _scenario_excise_display_spec(source_unit)
     source_baseline = float(contract["baseline_excise_at_start"])
     display_baseline = _scenario_excise_to_display(source_baseline, source_unit)
-
-    # Commit/context/initial modes render the committed source-unit value using
-    # the current display unit. Registry-only mode keeps the browser draft.
-    if not preserve_registry_draft:
-        excise_output = _scenario_excise_to_display(
-            stored_source_delta, source_unit
-        )
-
+    stored_source_delta = float(em.get("excise_delta", 0.0) or 0.0)
+    display_delta = _scenario_excise_to_display(stored_source_delta, source_unit)
     min_excise_display = _scenario_excise_to_display(
         float(contract["excise_delta_min"]), source_unit
     )
@@ -11547,11 +10558,11 @@ def scenario_control_defaults(
     )
 
     return (
-        date_output,
+        start.date(),
         min_start.date(),
         max_start.date(),
-        vat_output,
-        excise_output,
+        float(em.get("vat_delta_pp", 0.0) or 0.0),
+        display_delta,
         f"Excise change ({display['display_unit']}; − = cut)",
         float(display["step"]),
         note,
@@ -11683,7 +10694,8 @@ def scenario_tax_input_preview(
                 style={"color": "#067647", "fontWeight": "700"},
             )
         )
-    return pieces, None, None, None
+    return pieces, vat_min, vat_max, excise_min_display
+
 @callback(
     Output("scenario-store","data"),
     Output("scenario-banner","children"),
@@ -11750,14 +10762,9 @@ def mutate_scenario_set(
             className="banner-error",
         )
 
-    if vat_delta is None or excise_delta_display is None:
-        return no_update, html.Div(
-            "VAT or excise input was rejected by the browser as an invalid number. "
-            "Re-enter both values.",
-            className="banner-error",
-        )
-    vat_delta = float(vat_delta)
-    excise_delta_display = float(excise_delta_display)
+    vat_delta = float(vat_delta or 0.0)
+    excise_delta_display = float(excise_delta_display or 0.0)
+
     try:
         from energy_bvar_io import load_energy_bvar_forecast
 
@@ -12025,496 +11032,6 @@ def scenario_figures(store,model_id,fan_mode):
     return scenario_main_figure(payload,fan_mode=mode,uirevision=revision+"::main"),scenario_impact_figure(payload,metric="level",fan_mode=mode,uirevision=revision+"::level"),scenario_impact_figure(payload,metric="yoy",fan_mode=mode,uirevision=revision+"::yoy"),scenario_tax_figure(payload,uirevision=revision+"::tax")
 
 
-def _scenario_propagation_provenance(store: dict | None) -> str:
-    """Compact exact lineage for the inter-domain propagation cards."""
-    meta = dict((store or {}).get("meta", {}) or {})
-    bridge = dict((store or {}).get("headline_bridge", {}) or {})
-
-    vintage = bridge.get("vintage") or meta.get("vintage") or "—"
-    source_aggregate_run_id = meta.get("aggregate_run_id") or "—"
-    scenario_aggregate_run_id = bridge.get("aggregate_run_id") or "—"
-    bridge_contract = bridge.get("contract") or "—"
-
-    signature = (
-        meta.get("scenario_signature")
-        or bridge.get("scenario_signature")
-        or []
-    )
-    component_runs: list[str] = []
-    if isinstance(signature, list):
-        for item in signature:
-            if not isinstance(item, dict):
-                continue
-            model_id = str(item.get("model_id") or "").strip()
-            run_id = str(item.get("run_id") or "").strip()
-            if run_id:
-                component_runs.append(
-                    f"{model_id}:{run_id}" if model_id else run_id
-                )
-    component_run_text = (
-        ", ".join(component_runs)
-        if component_runs
-        else "—"
-    )
-
-    return (
-        f"vintage {vintage} · component run {component_run_text} · "
-        f"aggregate source run {source_aggregate_run_id} · "
-        f"scenario aggregate {scenario_aggregate_run_id} · "
-        f"bridge contract {bridge_contract}"
-    )
-
-
-@callback(
-    Output("scenario-propagation-energy-result", "children"),
-    Input("agg-scenario-store", "data"),
-)
-def scenario_propagation_result_cards(store: dict | None):
-    """Render HICP Energy strictly from the already-computed aggregate store."""
-    if not store:
-        return _result_block(
-            eyebrow="HICP Energy impact",
-            value=None,
-            unit_date="Awaiting propagated aggregate scenario",
-            uncertainty=(
-                "Posterior mean and 68% interval appear after "
-                "agg-scenario-store is materialized."
-            ),
-            provenance=(
-                "source · agg-scenario-store · no materialized propagation"
-            ),
-        )
-
-    provenance = _scenario_propagation_provenance(store)
-    values = aggregate_live_scenario_kpis(store)
-    terminal_date = values.get("date")
-
-    if terminal_date is None:
-        return _result_block(
-            eyebrow="HICP Energy impact",
-            value=None,
-            unit_date="No tax aggregate impact fan in current store",
-            uncertainty=(
-                "No statistic fabricated. Conditional HICP Energy results remain "
-                "in the conditional scenario block above."
-            ),
-            provenance=provenance,
-        )
-
-    date = pd.Timestamp(terminal_date).date().isoformat()
-    impact = float(values["impact"])
-    low = float(values["low"])
-    high = float(values["high"])
-    draws = values.get("n_draws")
-    draw_text = (
-        f"{int(draws):,} paired aggregate draws"
-        if draws is not None
-        else "paired aggregate draws"
-    )
-    return _result_block(
-        eyebrow="HICP Energy impact",
-        value=f"{impact:+.2f} pp",
-        unit_date=f"{date} · posterior mean",
-        uncertainty=f"68% [{low:+.2f}, {high:+.2f}] pp · {draw_text}",
-        provenance=provenance,
-    )
-
-
-_HEADLINE_PROPAGATION_CONDITION_HORIZON = 3
-_HEADLINE_PROPAGATION_STATISTIC = "mean"
-
-
-def _scenario_headline_source_contract(store: dict | None) -> dict[str, str]:
-    """Resolve the exact Energy scenario identity consumed by Headline."""
-    item = dict(store or {})
-    meta = dict(item.get("meta") or {})
-    bridge = dict(item.get("headline_bridge") or {})
-    if not item:
-        raise ValueError("No agg-scenario-store is materialized.")
-    if not bool(bridge.get("scenario_active", False)):
-        raise ValueError("The current HICP Energy aggregate has no active scenario.")
-
-    vintage = str(bridge.get("vintage") or meta.get("vintage") or "").strip()
-    source_aggregate_run_id = str(meta.get("aggregate_run_id") or "").strip()
-    scenario_aggregate_run_id = str(bridge.get("aggregate_run_id") or "").strip()
-    forecast_name = str(bridge.get("forecast_name") or "").strip()
-    bridge_contract = str(bridge.get("contract") or "").strip()
-    missing = [
-        name
-        for name, value in (
-            ("vintage", vintage),
-            ("source_aggregate_run_id", source_aggregate_run_id),
-            ("scenario_aggregate_run_id", scenario_aggregate_run_id),
-            ("forecast_name", forecast_name),
-            ("bridge_contract", bridge_contract),
-        )
-        if not value
-    ]
-    if missing:
-        raise ValueError(
-            "agg-scenario-store lacks Headline propagation lineage: "
-            + ", ".join(missing)
-        )
-    source_key = "|".join(
-        (
-            vintage,
-            source_aggregate_run_id,
-            scenario_aggregate_run_id,
-            forecast_name,
-            bridge_contract,
-        )
-    )
-    return {
-        "vintage": vintage,
-        "source_aggregate_run_id": source_aggregate_run_id,
-        "scenario_aggregate_run_id": scenario_aggregate_run_id,
-        "forecast_name": forecast_name,
-        "bridge_contract": bridge_contract,
-        "source_key": source_key,
-    }
-
-
-def _compute_scenario_headline_propagation(store: dict | None) -> dict:
-    """Run the explicit saved-posterior Headline B−A calculation once."""
-    source = _scenario_headline_source_contract(store)
-    headline_state = _headline_run_artifact_state(source["vintage"])
-    if str(headline_state.get("status") or "") != "COMPLETE":
-        raise RuntimeError(
-            "Headline saved-run selection is not production-complete: "
-            + str(headline_state.get("note") or headline_state.get("status") or "unknown")
-        )
-    run_directory = headline_state.get("directory")
-    headline_run_id = str(headline_state.get("run_id") or "").strip()
-    if run_directory is None or not headline_run_id:
-        raise RuntimeError("Resolved Headline run has no directory/run_id.")
-
-    started = time.perf_counter()
-    payload = run_saved_headline_energy_marginal(
-        run_directory,
-        energy_store=store,
-        source_aggregate_run_id=source["source_aggregate_run_id"],
-        forecast_name=source["forecast_name"],
-        H=_HEADLINE_PROPAGATION_CONDITION_HORIZON,
-        statistic=_HEADLINE_PROPAGATION_STATISTIC,
-        lineage={
-            "source_type": "energy_scenario",
-            "impact_definition": "energy_scenario_minus_energy_baseline",
-            "impact_baseline_label": "Energy baseline-conditioned",
-            "impact_scenario_label": "Energy scenario-conditioned",
-            "impact_interpretation": "conditional-forecast effect",
-            "dashboard_surface": "energy_scenarios_inter_domain_propagation",
-        },
-        project_root=PROJECT_ROOT,
-        persist=False,
-    )
-    elapsed = float(time.perf_counter() - started)
-    computed_at = datetime.now(timezone.utc).isoformat()
-    meta = dict(payload.get("meta") or {})
-    if meta.get("bvar_reestimated") is not False:
-        raise RuntimeError("Headline propagation violated bvar_reestimated=False.")
-    if meta.get("paired_energy_baseline_scenario") is not True:
-        raise RuntimeError("Headline propagation is not paired Energy B−A.")
-    if int(meta.get("conditioned_horizon_months", -1)) != _HEADLINE_PROPAGATION_CONDITION_HORIZON:
-        raise RuntimeError("Headline conditioned-horizon contract changed.")
-    if int(meta.get("free_propagation_horizon_months", -1)) != (
-        int(meta.get("computational_horizon", 0))
-        - _HEADLINE_PROPAGATION_CONDITION_HORIZON
-    ):
-        raise RuntimeError("Headline free-propagation horizon contract changed.")
-
-    meta.update(
-        {
-            "dashboard_computed_at_utc": computed_at,
-            "dashboard_elapsed_seconds": elapsed,
-            "dashboard_source_key": source["source_key"],
-            "dashboard_source_aggregate_run_id": source["source_aggregate_run_id"],
-            "dashboard_scenario_aggregate_run_id": source["scenario_aggregate_run_id"],
-            "dashboard_bridge_contract": source["bridge_contract"],
-        }
-    )
-    payload = dict(payload)
-    payload["meta"] = meta
-    return {
-        "state": "fresh",
-        "source_key": source["source_key"],
-        "computed_at_utc": computed_at,
-        "elapsed_seconds": elapsed,
-        "headline_run_id": headline_run_id,
-        "provenance": _scenario_propagation_provenance(store),
-        "payload": payload,
-    }
-
-
-def _scenario_headline_terminal_summary(payload: dict | None) -> dict | None:
-    """Terminal Headline B−A posterior summary; no statistic substitution."""
-    item = dict(payload or {})
-    dates = pd.DatetimeIndex(pd.to_datetime(item.get("dates") or []))
-    impact = dict(item.get("headline_yoy_impact") or {})
-    arrays = {}
-    for key in ("mean", "q16", "q84"):
-        values = np.asarray(impact.get(key) or [], dtype=float)
-        arrays[key] = values
-    n = min([len(dates), *(len(values) for values in arrays.values())])
-    if n < 1:
-        return None
-    finite = np.isfinite(arrays["mean"][:n])
-    if not finite.any():
-        return None
-    i = int(np.where(finite)[0][-1])
-    if not all(np.isfinite(arrays[key][i]) for key in arrays):
-        return None
-    return {
-        "date": pd.Timestamp(dates[i]),
-        "mean": float(arrays["mean"][i]),
-        "q16": float(arrays["q16"][i]),
-        "q84": float(arrays["q84"][i]),
-    }
-
-
-def _format_small_pp(value: float) -> str:
-    """Keep tiny economically meaningful Headline effects visible."""
-    value = float(value)
-    precision = 4 if abs(value) < 0.01 else 2
-    return f"{value:+.{precision}f}"
-
-
-def _scenario_headline_result_card(
-    result_store: dict | None,
-    *,
-    stale: bool,
-) -> html.Div:
-    result = dict(result_store or {})
-    payload = dict(result.get("payload") or {})
-    meta = dict(payload.get("meta") or {})
-    summary = _scenario_headline_terminal_summary(payload)
-    if summary is None:
-        raise ValueError("Headline propagation payload has no terminal YoY impact.")
-
-    date = pd.Timestamp(summary["date"]).date().isoformat()
-    draws = meta.get("n_draws")
-    conditioned = int(meta.get("conditioned_horizon_months", 0))
-    propagated = int(meta.get("free_propagation_horizon_months", 0))
-    computed_at = str(
-        result.get("computed_at_utc")
-        or meta.get("dashboard_computed_at_utc")
-        or "—"
-    )
-    elapsed = float(
-        result.get("elapsed_seconds")
-        or meta.get("dashboard_elapsed_seconds")
-        or 0.0
-    )
-    headline_run_id = str(
-        result.get("headline_run_id")
-        or meta.get("headline_run_id")
-        or "—"
-    )
-    provenance = (
-        str(result.get("provenance") or "source · agg-scenario-store")
-        + f" · headline run {headline_run_id}"
-        + f" · computed {computed_at}"
-    )
-    uncertainty = (
-        f"68% [{_format_small_pp(summary['q16'])}, "
-        f"{_format_small_pp(summary['q84'])}] pp"
-        + (
-            f" · {int(draws):,} paired Headline draws"
-            if draws is not None
-            else " · paired Headline draws"
-        )
-        + f" · conditioned {conditioned}m / freely propagated {propagated}m"
-        + " · conditional-forecast effect (B − A)"
-        + " · Energy input = posterior-mean path; full Energy path uncertainty not propagated"
-    )
-    return _result_block(
-        eyebrow="Headline impact",
-        value=f"{_format_small_pp(summary['mean'])} pp",
-        unit_date=(
-            f"{date} · posterior mean · {elapsed:.1f} s"
-        ),
-        uncertainty=uncertainty,
-        provenance=provenance,
-        state="stale" if stale else "fresh",
-    )
-
-
-@callback(
-    Output("scenario-propagation-headline-store", "data"),
-    Input("scenario-propagation-headline-run", "n_clicks"),
-    State("agg-scenario-store", "data"),
-    prevent_initial_call=True,
-    running=[
-        (
-            Output("scenario-propagation-headline-run", "disabled"),
-            True,
-            False,
-        ),
-        (
-            Output("scenario-propagation-headline-run", "children"),
-            "Calculating Headline impact…",
-            "Calculate Headline impact (~23–40 s)",
-        ),
-    ],
-)
-def compute_scenario_headline_propagation(
-    run_clicks: int | None,
-    aggregate_store: dict | None,
-):
-    """Explicit expensive Headline calculation; never triggered by scenario edits."""
-    if not run_clicks:
-        raise PreventUpdate
-    source_key = ""
-    try:
-        source_key = _scenario_headline_source_contract(aggregate_store)["source_key"]
-        return _compute_scenario_headline_propagation(aggregate_store)
-    except TimeoutError as exc:
-        return {
-            "state": "timeout",
-            "source_key": source_key,
-            "computed_at_utc": datetime.now(timezone.utc).isoformat(),
-            "error": f"Headline conditional calculation timed out: {exc}",
-        }
-    except Exception as exc:
-        return {
-            "state": "error",
-            "source_key": source_key,
-            "computed_at_utc": datetime.now(timezone.utc).isoformat(),
-            "error": str(exc),
-        }
-
-
-@callback(
-    Output("scenario-propagation-headline-result", "children"),
-    Output("scenario-propagation-headline-graph", "figure"),
-    Output("scenario-propagation-headline-status", "children"),
-    Input("scenario-propagation-headline-store", "data"),
-    Input("agg-scenario-store", "data"),
-)
-def render_scenario_headline_propagation(
-    result_store: dict | None,
-    aggregate_store: dict | None,
-):
-    """Render fresh/stale/error Headline state without launching computation."""
-    try:
-        current_source = _scenario_headline_source_contract(aggregate_store)
-        current_key = current_source["source_key"]
-        current_provenance = _scenario_propagation_provenance(aggregate_store)
-    except Exception as exc:
-        return (
-            _result_block(
-                eyebrow="Headline impact",
-                value="Not calculated",
-                unit_date="Build or refresh the HICP Energy scenario first",
-                uncertainty=(
-                    "No Headline conditional run is launched automatically."
-                ),
-                provenance=(
-                    "source · agg-scenario-store · Headline result unavailable"
-                ),
-            ),
-            empty_scenario_figure(
-                "Build an HICP Energy scenario before calculating Headline."
-            ),
-            str(exc),
-        )
-
-    result = dict(result_store or {})
-    if not result:
-        return (
-            _result_block(
-                eyebrow="Headline impact",
-                value="Not calculated",
-                unit_date=(
-                    "Explicit conditional run required · ~23 s warm / ~40 s cold"
-                ),
-                uncertainty=(
-                    "Point estimate and bands withheld until paired "
-                    "Energy-baseline/scenario Headline run."
-                ),
-                provenance=current_provenance + " · Headline A/B not materialized",
-            ),
-            empty_scenario_figure(
-                "Calculate Headline impact explicitly to materialize the B−A path."
-            ),
-            (
-                "Ready · click Calculate Headline impact · Energy conditioned 3m, "
-                "then freely propagated 9m inside the 12m DK horizon · "
-                "conditional-forecast effect, not a causal IRF."
-            ),
-        )
-
-    result_key = str(result.get("source_key") or "")
-    stale = bool(result_key and result_key != current_key)
-    state = str(result.get("state") or "")
-    if state in {"error", "timeout"}:
-        label = "Timed out" if state == "timeout" else "Calculation failed"
-        suffix = (
-            " · result belongs to a previous Energy scenario"
-            if stale
-            else ""
-        )
-        return (
-            _result_block(
-                eyebrow="Headline impact",
-                value=label,
-                unit_date=str(result.get("computed_at_utc") or "—"),
-                uncertainty=str(result.get("error") or "Unknown error"),
-                provenance=current_provenance + suffix,
-                state="stale" if stale else "fresh",
-            ),
-            empty_scenario_figure(str(result.get("error") or label)),
-            str(result.get("error") or label),
-        )
-
-    payload = dict(result.get("payload") or {})
-    if not payload:
-        return (
-            _result_block(
-                eyebrow="Headline impact",
-                value="Not calculated",
-                unit_date="Stored Headline result is incomplete",
-                uncertainty="No point estimate fabricated.",
-                provenance=current_provenance,
-            ),
-            empty_scenario_figure("Stored Headline result is incomplete."),
-            "Stored Headline result is incomplete; recalculate.",
-        )
-
-    card = _scenario_headline_result_card(result, stale=stale)
-    fig = headline_scenario_impact_figure(payload, horizon=12)
-    for trace in fig.data:
-        if str(getattr(trace, "name", "") or "") == "68% interval":
-            trace.name = (
-                "68% Headline A/B paired-draw interval · "
-                "Energy input fixed at posterior mean; upstream Energy uncertainty not propagated"
-            )
-    if stale:
-        fig.add_annotation(
-            x=0,
-            y=1.20,
-            xref="paper",
-            yref="paper",
-            text="STALE · Energy scenario changed; recalculate.",
-            showarrow=False,
-            xanchor="left",
-            yanchor="bottom",
-        )
-    meta = dict(payload.get("meta") or {})
-    status = (
-        "Stale · current scenario aggregate differs from the computed result; "
-        "the previous result is shown only for reference."
-        if stale
-        else (
-            f"Fresh · computed {result.get('computed_at_utc', '—')} · "
-            f"{float(result.get('elapsed_seconds') or 0.0):.1f} s · "
-            f"baseline cache hit={bool(meta.get('baseline_cache_hit'))} · "
-            f"conditioned {int(meta.get('conditioned_horizon_months', 0))}m / "
-            f"freely propagated {int(meta.get('free_propagation_horizon_months', 0))}m."
-        )
-    )
-    return card, fig, status
-
-
 @callback(
     Output("scenario-tax-selected-agg-store", "data"),
     Input("scenario-store", "data"),
@@ -12762,594 +11279,6 @@ def _tax_scenarios_from_payload(payload: dict | None) -> dict[str, dict]:
 # ---------------------------------------------------------------------------
 # Aggregate page callbacks
 # ---------------------------------------------------------------------------
-
-
-_AGG_HEADLINE_CONTRIBUTION_STATISTIC = "mean"
-
-
-def _aggregate_headline_contribution_source_contract(
-    aggregate_run_id: str | None,
-    vintage: str | None,
-) -> dict[str, str]:
-    """Resolve the exact baseline Aggregate -> Headline calculation identity."""
-    aggregate_run_id = str(aggregate_run_id or "").strip()
-    vintage = str(vintage or "").strip()
-    if not vintage:
-        raise ValueError("Select a vintage before calculating Headline contribution.")
-    if not aggregate_run_id:
-        raise ValueError("Select an HICP Energy aggregate run first.")
-
-    row = _selected_aggregate_row(vintage, aggregate_run_id)
-    if row is None:
-        raise ValueError("The selected HICP Energy aggregate is unavailable.")
-    if str(row.get("status") or "") != "complete":
-        raise ValueError(
-            "The selected HICP Energy aggregate is not production-complete."
-        )
-    aggregate_directory = Path(str(row["directory"])).resolve()
-    metadata = _aggregate_metadata(aggregate_directory)
-    stored_vintage = str(metadata.get("vintage") or vintage).strip()
-    if stored_vintage != vintage:
-        raise ValueError(
-            "Selected aggregate vintage mismatch: "
-            f"metadata={stored_vintage}, selected={vintage}."
-        )
-    stored_run = str(
-        metadata.get("aggregate_run_id") or aggregate_directory.name
-    ).strip()
-    if stored_run != aggregate_run_id or aggregate_directory.name != aggregate_run_id:
-        raise ValueError(
-            "Selected aggregate directory/metadata/run identity mismatch."
-        )
-    forecast_name = str(metadata.get("forecast_name") or "unconditional").strip()
-
-    headline_state = _headline_run_artifact_state(vintage)
-    if str(headline_state.get("status") or "") != "COMPLETE":
-        raise ValueError(
-            "Headline saved-run selection is not production-complete: "
-            + str(
-                headline_state.get("note")
-                or headline_state.get("status")
-                or "unknown"
-            )
-        )
-    headline_run_id = str(headline_state.get("run_id") or "").strip()
-    headline_directory = headline_state.get("directory")
-    if not headline_run_id or headline_directory is None:
-        raise ValueError("Resolved Headline run has no run_id/directory.")
-
-    source_key = "|".join(
-        (
-            vintage,
-            aggregate_run_id,
-            headline_run_id,
-            forecast_name,
-            SELECTED_ENERGY_BASELINE_CONTRACT_VERSION,
-        )
-    )
-    return {
-        "vintage": vintage,
-        "aggregate_run_id": aggregate_run_id,
-        "aggregate_directory": str(aggregate_directory),
-        "forecast_name": forecast_name,
-        "headline_run_id": headline_run_id,
-        "headline_directory": str(Path(headline_directory).resolve()),
-        "contract": SELECTED_ENERGY_BASELINE_CONTRACT_VERSION,
-        "source_key": source_key,
-    }
-
-
-def _aggregate_headline_contribution_provenance(
-    source: Mapping[str, Any],
-    payload: Mapping[str, Any] | None = None,
-) -> str:
-    meta = dict((payload or {}).get("meta") or {})
-    conditioned = int(meta.get("conditioned_horizon_months") or 0)
-    free = int(meta.get("free_propagation_horizon_months") or 0)
-    return (
-        f"vintage {source.get('vintage', '—')} · "
-        f"aggregate run {source.get('aggregate_run_id', '—')} · "
-        f"headline run {source.get('headline_run_id', '—')} · "
-        f"forecast {source.get('forecast_name', '—')} · "
-        f"contract {source.get('contract', '—')}"
-        + (f" · conditioned {conditioned}m / free {free}m" if conditioned else "")
-    )
-
-
-def _compute_aggregate_headline_contribution(
-    aggregate_run_id: str | None,
-    vintage: str | None,
-) -> dict[str, Any]:
-    """Run one explicit selected-Aggregate baseline Headline contribution."""
-    source = _aggregate_headline_contribution_source_contract(
-        aggregate_run_id, vintage
-    )
-    started = time.perf_counter()
-    payload = run_saved_headline_selected_energy_contribution(
-        source["headline_directory"],
-        aggregate_directory=source["aggregate_directory"],
-        source_aggregate_run_id=source["aggregate_run_id"],
-        forecast_name=source["forecast_name"],
-        statistic=_AGG_HEADLINE_CONTRIBUTION_STATISTIC,
-        lineage={
-            "dashboard_surface": "energy_aggregate_headline_contribution",
-            "dashboard_source": "agg-select",
-        },
-        project_root=PROJECT_ROOT,
-    )
-    elapsed = float(time.perf_counter() - started)
-    computed_at = datetime.now(timezone.utc).isoformat()
-
-    if str(payload.get("contract") or "") != SELECTED_ENERGY_BASELINE_CONTRACT_VERSION:
-        raise RuntimeError("Selected-Energy contribution contract changed.")
-    meta = dict(payload.get("meta") or {})
-    required = {
-        "source_aggregate_run_id": source["aggregate_run_id"],
-        "headline_run_id": source["headline_run_id"],
-        "forecast_name": source["forecast_name"],
-        "condition_statistic": _AGG_HEADLINE_CONTRIBUTION_STATISTIC,
-    }
-    for key, expected in required.items():
-        if str(meta.get(key) or "") != str(expected):
-            raise RuntimeError(
-                f"Selected-Energy contribution lineage mismatch for {key}: "
-                f"{meta.get(key)!r} != {expected!r}."
-            )
-    conditioned = int(meta.get("conditioned_horizon_months") or 0)
-    computational = int(meta.get("computational_horizon") or 0)
-    free = int(meta.get("free_propagation_horizon_months") or -1)
-    if conditioned < 1 or computational != 12 or free != computational - conditioned:
-        raise RuntimeError("Selected-Energy contribution horizon contract changed.")
-    if meta.get("scenario_bridge_used") is not False:
-        raise RuntimeError("Aggregate baseline contribution invoked a scenario bridge.")
-    if int(meta.get("upstream_energy_draws_propagated") or 0) != 0:
-        raise RuntimeError("Upstream Energy aggregate draws were unexpectedly propagated.")
-    if meta.get("bvar_reestimated") is not False:
-        raise RuntimeError("Selected-Energy contribution re-estimated the BVAR.")
-    additivity = float(meta.get("contribution_additivity_max_abs_error") or 0.0)
-    if not np.isfinite(additivity) or additivity > 1e-9:
-        raise RuntimeError(
-            "Selected-Energy contribution additivity gate failed: "
-            f"{additivity:.3e} pp."
-        )
-
-    payload = dict(payload)
-    meta.update(
-        {
-            "dashboard_computed_at_utc": computed_at,
-            "dashboard_elapsed_seconds": elapsed,
-            "dashboard_source_key": source["source_key"],
-        }
-    )
-    payload["meta"] = meta
-    return {
-        "state": "fresh",
-        "source_key": source["source_key"],
-        "computed_at_utc": computed_at,
-        "elapsed_seconds": elapsed,
-        "provenance": _aggregate_headline_contribution_provenance(source, payload),
-        "payload": payload,
-    }
-
-
-def _aggregate_headline_contribution_summaries(
-    payload: Mapping[str, Any] | None,
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    item = dict(payload or {})
-    dates = pd.DatetimeIndex(pd.to_datetime(item.get("dates") or []))
-    conditioned = np.asarray(item.get("conditioned") or [], dtype=bool)
-    summary = dict(item.get("energy_contribution_yoy") or {})
-    arrays = {
-        key: np.asarray(summary.get(key) or [], dtype=float)
-        for key in ("mean", "q16", "q50", "q84")
-    }
-    n = min(
-        [len(dates), len(conditioned), *(len(values) for values in arrays.values())]
-    )
-    if n < 1:
-        raise ValueError("Selected-Energy contribution payload has no usable path.")
-    dates = dates[:n]
-    conditioned = conditioned[:n]
-    arrays = {key: values[:n] for key, values in arrays.items()}
-    complete = np.ones(n, dtype=bool)
-    for values in arrays.values():
-        complete &= np.isfinite(values)
-    if not complete.any():
-        raise ValueError("Selected-Energy contribution payload has no finite summary.")
-    conditioned_idx = np.where(complete & conditioned)[0]
-    if len(conditioned_idx) < 1:
-        raise ValueError("Selected-Energy contribution has no finite conditioned month.")
-    terminal_idx = np.where(complete)[0][-1]
-    last_conditioned_idx = conditioned_idx[-1]
-
-    def _row(i: int) -> dict[str, Any]:
-        return {
-            "date": pd.Timestamp(dates[i]),
-            "mean": float(arrays["mean"][i]),
-            "q16": float(arrays["q16"][i]),
-            "q50": float(arrays["q50"][i]),
-            "q84": float(arrays["q84"][i]),
-            "conditioned": bool(conditioned[i]),
-            "index": int(i),
-        }
-
-    return _row(last_conditioned_idx), _row(terminal_idx)
-
-
-def _aggregate_headline_contribution_card(
-    result_store: Mapping[str, Any],
-    *,
-    row: Mapping[str, Any],
-    terminal: bool,
-    stale: bool,
-) -> html.Div:
-    result = dict(result_store or {})
-    payload = dict(result.get("payload") or {})
-    meta = dict(payload.get("meta") or {})
-    date = pd.Timestamp(row["date"]).date().isoformat()
-    elapsed = float(result.get("elapsed_seconds") or 0.0)
-    upstream = meta.get("upstream_energy_draws_available")
-    headline_draws = meta.get("headline_conditional_draws")
-    conditioned = int(meta.get("conditioned_horizon_months") or 0)
-    band_width = abs(float(row["q84"]) - float(row["q16"]))
-
-    if terminal:
-        uncertainty = (
-            f"68% [{float(row['q16']):+.2f}, {float(row['q84']):+.2f}] pp · "
-            f"{int(headline_draws):,} Headline draws"
-            if headline_draws is not None
-            else f"68% [{float(row['q16']):+.2f}, {float(row['q84']):+.2f}] pp"
-        )
-        uncertainty += (
-            f" · Energy free after {conditioned} conditioned months"
-            f" · upstream Energy uncertainty excluded"
-        )
-        eyebrow = "Contribution · H=12 terminal"
-    else:
-        if band_width <= 1e-12:
-            uncertainty = (
-                "Degenerate across Headline draws while Energy is conditioned"
-                " · deterministic selected-aggregate posterior-mean input"
-            )
-        else:
-            uncertainty = (
-                f"68% [{float(row['q16']):+.2f}, {float(row['q84']):+.2f}] pp"
-            )
-        uncertainty += " · upstream Energy uncertainty excluded"
-        eyebrow = "Contribution · selected Energy path"
-
-    provenance = str(result.get("provenance") or "source · agg-select")
-    if upstream is not None:
-        provenance += f" · upstream Energy draws {int(upstream):,} available / 0 propagated"
-    return _result_block(
-        eyebrow=eyebrow,
-        value=f"{float(row['mean']):+.2f} pp",
-        unit_date=f"{date} · posterior mean · {elapsed:.1f} s",
-        uncertainty=uncertainty,
-        provenance=provenance,
-        state="stale" if stale else "fresh",
-    )
-
-
-def _aggregate_headline_contribution_figure(
-    payload: Mapping[str, Any] | None,
-    *,
-    source_key: str,
-    stale: bool,
-) -> go.Figure:
-    item = dict(payload or {})
-    dates = pd.DatetimeIndex(pd.to_datetime(item.get("dates") or []))
-    conditioned = np.asarray(item.get("conditioned") or [], dtype=bool)
-    summary = dict(item.get("energy_contribution_yoy") or {})
-    meta = dict(item.get("meta") or {})
-    q16 = np.asarray(summary.get("q16") or [], dtype=float)
-    q50 = np.asarray(summary.get("q50") or [], dtype=float)
-    q84 = np.asarray(summary.get("q84") or [], dtype=float)
-    mean = np.asarray(summary.get("mean") or [], dtype=float)
-    n = min(len(dates), len(conditioned), len(q16), len(q50), len(q84), len(mean))
-    if n < 1:
-        return empty_aggregate_figure(
-            "Calculate the selected HICP Energy contribution to Headline."
-        )
-    dates = dates[:n]
-    conditioned = conditioned[:n]
-    q16, q50, q84, mean = q16[:n], q50[:n], q84[:n], mean[:n]
-    if not (
-        np.isfinite(q16).all()
-        and np.isfinite(q50).all()
-        and np.isfinite(q84).all()
-        and np.isfinite(mean).all()
-    ):
-        return empty_aggregate_figure(
-            "Selected-Energy Headline contribution contains non-finite summaries."
-        )
-
-    figure = go.Figure()
-    for trace in fan_traces(
-        dates,
-        {"q16": q16, "q84": q84, "q50": q50},
-        bands=("68",),
-        name="Headline conditional",
-        show_median=False,
-    ):
-        if str(getattr(trace, "name", "") or "") == "68% interval":
-            upstream = meta.get("upstream_energy_draws_available")
-            trace.name = (
-                "68% Headline draws · upstream Energy uncertainty excluded"
-                + (
-                    f" (0/{int(upstream):,} Energy draws propagated)"
-                    if upstream is not None
-                    else ""
-                )
-            )
-        figure.add_trace(trace)
-    figure.add_trace(
-        go.Scatter(
-            x=dates,
-            y=mean,
-            mode="lines+markers",
-            line={"color": TOKENS["cyan"], "width": 2.2},
-            marker={"size": 5},
-            name="Selected HICP Energy contribution · posterior mean",
-            hovertemplate="%{x|%b %Y}<br>%{y:+.3f} pp<extra></extra>",
-        )
-    )
-    conditioned_idx = np.where(conditioned)[0]
-    if len(conditioned_idx):
-        boundary = pd.Timestamp(dates[conditioned_idx[-1]])
-        figure.add_vline(
-            x=boundary,
-            line_width=1,
-            line_dash="dot",
-            line_color=TOKENS["hairline"],
-        )
-        figure.add_annotation(
-            x=boundary,
-            y=1.02,
-            xref="x",
-            yref="paper",
-            text="Selected Energy conditioning ends",
-            showarrow=False,
-            xanchor="left",
-            yanchor="bottom",
-            font={"size": 10, "color": TOKENS["muted"]},
-        )
-    if stale:
-        figure.add_annotation(
-            x=0,
-            y=1.15,
-            xref="paper",
-            yref="paper",
-            text="STALE · Aggregate/Headline source changed; recalculate.",
-            showarrow=False,
-            xanchor="left",
-            yanchor="bottom",
-            font={"size": 10, "color": TOKENS["warning"]},
-        )
-    figure.update_layout(
-        title="Selected HICP Energy contribution to Headline YoY",
-        legend={"orientation": "h", "y": 1.10, "x": 0},
-    )
-    return apply_theme(
-        figure,
-        uirevision=f"{source_key}::selected-energy-headline-contribution",
-        height=460,
-        y_title="pp contribution to Headline YoY",
-    )
-
-
-@callback(
-    Output("agg-headline-contribution-store", "data"),
-    Input("agg-headline-contribution-run", "n_clicks"),
-    State("agg-select", "value"),
-    State("vintage-select", "value"),
-    prevent_initial_call=True,
-    running=[
-        (
-            Output("agg-headline-contribution-run", "disabled"),
-            True,
-            False,
-        ),
-        (
-            Output("agg-headline-contribution-run", "children"),
-            "Calculating Headline contribution…",
-            "Calculate Headline contribution (~13 s)",
-        ),
-    ],
-)
-def compute_aggregate_headline_contribution(
-    run_clicks: int | None,
-    aggregate_run_id: str | None,
-    vintage: str | None,
-):
-    """Explicit expensive calculation; agg-select/vintage are States only."""
-    if not run_clicks:
-        raise PreventUpdate
-    source_key = ""
-    try:
-        source_key = _aggregate_headline_contribution_source_contract(
-            aggregate_run_id, vintage
-        )["source_key"]
-        return _compute_aggregate_headline_contribution(
-            aggregate_run_id, vintage
-        )
-    except TimeoutError as exc:
-        return {
-            "state": "timeout",
-            "source_key": source_key,
-            "computed_at_utc": datetime.now(timezone.utc).isoformat(),
-            "error": f"Headline contribution calculation timed out: {exc}",
-        }
-    except Exception as exc:
-        return {
-            "state": "error",
-            "source_key": source_key,
-            "computed_at_utc": datetime.now(timezone.utc).isoformat(),
-            "error": str(exc),
-        }
-
-
-@callback(
-    Output("agg-headline-contribution-conditioned-result", "children"),
-    Output("agg-headline-contribution-terminal-result", "children"),
-    Output("agg-headline-contribution-graph", "figure"),
-    Output("agg-headline-contribution-status", "children"),
-    Input("agg-headline-contribution-store", "data"),
-    Input("agg-select", "value"),
-    Input("vintage-select", "value"),
-    Input("registry-store", "data"),
-)
-def render_aggregate_headline_contribution(
-    result_store: dict | None,
-    aggregate_run_id: str | None,
-    vintage: str | None,
-    _registry: dict | None,
-):
-    """Render fresh/stale/error state without launching a conditional forecast."""
-    try:
-        source = _aggregate_headline_contribution_source_contract(
-            aggregate_run_id, vintage
-        )
-        current_key = source["source_key"]
-        current_provenance = _aggregate_headline_contribution_provenance(source)
-    except Exception as exc:
-        placeholder = _result_block(
-            eyebrow="Contribution · selected Energy path",
-            value="Not calculated",
-            unit_date="Select a production-complete aggregate",
-            uncertainty="No Headline conditional run is launched automatically.",
-            provenance="source · agg-select · contribution unavailable",
-        )
-        terminal = _result_block(
-            eyebrow="Contribution · H=12 terminal",
-            value="Not calculated",
-            unit_date="Terminal DK month",
-            uncertainty="No point estimate fabricated.",
-            provenance="source · agg-select · contribution unavailable",
-        )
-        return (
-            placeholder,
-            terminal,
-            empty_aggregate_figure(
-                "Select a production-complete HICP Energy aggregate first."
-            ),
-            str(exc),
-        )
-
-    result = dict(result_store or {})
-    if not result:
-        return (
-            _result_block(
-                eyebrow="Contribution · selected Energy path",
-                value="Not calculated",
-                unit_date="Last conditioned month",
-                uncertainty=(
-                    "Explicit saved-posterior conditional run required · "
-                    "selected Energy input = posterior mean."
-                ),
-                provenance=current_provenance,
-            ),
-            _result_block(
-                eyebrow="Contribution · H=12 terminal",
-                value="Not calculated",
-                unit_date="Terminal DK month",
-                uncertainty=(
-                    "Remaining DK months are freely propagated after the "
-                    "selected Energy path ends."
-                ),
-                provenance=current_provenance,
-            ),
-            empty_aggregate_figure(
-                "Calculate Headline contribution explicitly to materialize the path."
-            ),
-            (
-                "Ready · click Calculate Headline contribution · all consecutive "
-                "selected-aggregate future months will be conditioned; remaining "
-                "months stay latent through H=12 · upstream Energy draws are excluded."
-            ),
-        )
-
-    result_key = str(result.get("source_key") or "")
-    stale = bool(result_key and result_key != current_key)
-    state = str(result.get("state") or "")
-    if state in {"error", "timeout"}:
-        label = "Timed out" if state == "timeout" else "Calculation failed"
-        provenance = current_provenance
-        if stale:
-            provenance += " · error belongs to a previous source selection"
-        error_card = _result_block(
-            eyebrow="Contribution · selected Energy path",
-            value=label,
-            unit_date=str(result.get("computed_at_utc") or "—"),
-            uncertainty=str(result.get("error") or "Unknown error"),
-            provenance=provenance,
-            state="stale" if stale else "fresh",
-        )
-        return (
-            error_card,
-            _result_block(
-                eyebrow="Contribution · H=12 terminal",
-                value=label,
-                unit_date="No valid contribution path",
-                uncertainty="No point estimate fabricated.",
-                provenance=provenance,
-                state="stale" if stale else "fresh",
-            ),
-            empty_aggregate_figure(str(result.get("error") or label)),
-            str(result.get("error") or label),
-        )
-
-    payload = dict(result.get("payload") or {})
-    if not payload:
-        return (
-            _result_block(
-                eyebrow="Contribution · selected Energy path",
-                value="Not calculated",
-                unit_date="Stored result is incomplete",
-                uncertainty="No point estimate fabricated.",
-                provenance=current_provenance,
-            ),
-            _result_block(
-                eyebrow="Contribution · H=12 terminal",
-                value="Not calculated",
-                unit_date="Stored result is incomplete",
-                uncertainty="No point estimate fabricated.",
-                provenance=current_provenance,
-            ),
-            empty_aggregate_figure("Stored Headline contribution result is incomplete."),
-            "Stored Headline contribution result is incomplete; recalculate.",
-        )
-
-    last_conditioned, terminal = _aggregate_headline_contribution_summaries(payload)
-    conditioned_card = _aggregate_headline_contribution_card(
-        result, row=last_conditioned, terminal=False, stale=stale
-    )
-    terminal_card = _aggregate_headline_contribution_card(
-        result, row=terminal, terminal=True, stale=stale
-    )
-    figure = _aggregate_headline_contribution_figure(
-        payload, source_key=result_key or current_key, stale=stale
-    )
-    meta = dict(payload.get("meta") or {})
-    conditioned = int(meta.get("conditioned_horizon_months") or 0)
-    free = int(meta.get("free_propagation_horizon_months") or 0)
-    upstream = meta.get("upstream_energy_draws_available")
-    status = (
-        "Stale · selected aggregate or Headline source changed; previous result "
-        "is shown only for reference. Recalculate explicitly."
-        if stale
-        else (
-            f"Fresh · computed {result.get('computed_at_utc', '—')} · "
-            f"{float(result.get('elapsed_seconds') or 0.0):.1f} s · "
-            f"conditioned {conditioned}m / freely propagated {free}m · "
-            + (
-                f"0/{int(upstream):,} upstream Energy draws propagated."
-                if upstream is not None
-                else "upstream Energy path uncertainty not propagated."
-            )
-        )
-    )
-    return conditioned_card, terminal_card, figure, status
 
 
 @callback(

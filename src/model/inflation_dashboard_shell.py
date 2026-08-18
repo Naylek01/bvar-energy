@@ -26,19 +26,25 @@ HEADLINE_ROUTES = {
 
 
 def domain_from_path(pathname: str | None) -> str:
-    path = str(pathname or "/forecast")
-    return (
-        "headline"
-        if path == "/headline" or path.startswith("/headline/")
-        else "energy"
-    )
+    """Resolve section-first canonical URLs and legacy domain-first aliases."""
+    parts = [
+        part.lower()
+        for part in str(pathname or "").split("?")[0].split("/")
+        if part
+    ]
+    if not parts:
+        return "energy"
+    if parts[0] in {"headline", "core"}:
+        return parts[0]
+    if len(parts) >= 2 and parts[1] in {"headline", "core"}:
+        return parts[1]
+    return "energy"
+
 
 
 def models_for_domain(model_ids, domain: str) -> list[str]:
     allowed = (
-        set(HEADLINE_MODEL_IDS)
-        if str(domain) == "headline"
-        else set(ENERGY_MODEL_IDS)
+        set(HEADLINE_MODEL_IDS) if str(domain) in {"headline", "core"} else set(ENERGY_MODEL_IDS)
     )
     return sorted(
         str(model_id)
