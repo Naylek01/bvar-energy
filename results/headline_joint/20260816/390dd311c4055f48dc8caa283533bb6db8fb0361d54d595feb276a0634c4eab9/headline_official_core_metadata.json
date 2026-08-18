@@ -1,0 +1,21 @@
+{
+  "provider": "Eurostat",
+  "api": "statistics/1.0",
+  "dataset": "prc_hicp_minr",
+  "code": "TOT_X_NRG_FOOD",
+  "label": "Overall index excluding energy, food, alcohol and tobacco",
+  "unit": "I25",
+  "geo": "EA",
+  "request_url": "https://ec.europa.eu/eurostat/api/dissemination/statistics/1.0/data/prc_hicp_minr?format=JSON&lang=EN&freq=M&unit=I25&coicop18=TOT_X_NRG_FOOD&geo=EA&sinceTimePeriod=1999-11",
+  "retrieved_at_utc": "2026-08-16T15:11:13.539836+00:00",
+  "first_date": "1999-12-01",
+  "last_date": "2026-07-01",
+  "n_observations": 320,
+  "dimension_order_returned": [
+    "freq",
+    "unit",
+    "coicop18",
+    "geo",
+    "time"
+  ]
+}

@@ -1,0 +1,9 @@
+metric,value
+n_level_months,307.0
+level_mae,0.003472889989035403
+level_rmse,0.004175976199429877
+level_max_abs_error,0.010893455406247199
+n_yoy_months,295.0
+yoy_mae_pp,0.0055685802722530865
+yoy_rmse_pp,0.006790119741518334
+yoy_max_abs_error_pp,0.01897079355164255

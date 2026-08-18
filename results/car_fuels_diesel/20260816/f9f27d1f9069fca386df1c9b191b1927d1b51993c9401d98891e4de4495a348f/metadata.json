@@ -1,0 +1,52 @@
+{
+  "model_id": "car_fuels_diesel",
+  "vintage": "20260816",
+  "data_hash": "014a647ca2af98e3dcde83c7941c8b594947cb7ee08b7fdb89f5137bd0ad9ae7",
+  "config_hash": "460be4c69193c3a9d6c2e0b6ffab5ef35707c1d0a68bca265dec749545e97323",
+  "code_version": "energy_bvar_model-v2",
+  "seed": 42,
+  "run_id": "f9f27d1f9069fca386df1c9b191b1927d1b51993c9401d98891e4de4495a348f",
+  "result_schema_version": "1.2",
+  "frequency": "weekly",
+  "calendar_rule": "W-MON",
+  "missing_data_method": "dk",
+  "missing_treatment_exact": true,
+  "source_data_hash": "014a647ca2af98e3dcde83c7941c8b594947cb7ee08b7fdb89f5137bd0ad9ae7",
+  "effective_estimation_data_hash": "014a647ca2af98e3dcde83c7941c8b594947cb7ee08b7fdb89f5137bd0ad9ae7",
+  "variables": [
+    "wob_diesel_pre_tax",
+    "crude_oil_eur",
+    "refined_diesel_eur"
+  ],
+  "exog_names": [],
+  "exog_prior_scale": null,
+  "p": 24,
+  "n_observations": 1128,
+  "created_at_utc": "2026-08-16T04:52:50.769922+00:00",
+  "data_augmentation": "durbin_koopman_interior_levels",
+  "missing_data_approximation_used": false,
+  "interpolated_level_cells": 0,
+  "interpolated_dates": 0,
+  "requires_data_augmentation": true,
+  "interior_missing_dates": 48,
+  "interior_missing_level_cells": 48,
+  "dk_projection_mode": "strict",
+  "dk_projection_diagnostics": {
+    "n_sweeps": 6000,
+    "mode": "strict",
+    "level_error": {
+      "max": 1.3835812945626406e-10,
+      "sweep_of_maximum": 2324,
+      "argmax_date": "2022-03-07 00:00:00",
+      "argmax_variable": "crude_oil_eur",
+      "argmax_near_missing": false
+    },
+    "difference_adjustment": {
+      "max": 6.544792726471546e-09,
+      "sweep_of_maximum": 2324,
+      "argmax_date": "2022-03-07 00:00:00",
+      "argmax_variable": "crude_oil_eur",
+      "argmax_near_missing": false
+    }
+  }
+}

@@ -1,0 +1,37 @@
+{
+  "hicp_schema_version": "1.0",
+  "n_draws": 1000,
+  "n_path_dates": 6,
+  "path_dates": [
+    "2026-07-01T00:00:00",
+    "2026-08-01T00:00:00",
+    "2026-09-01T00:00:00",
+    "2026-10-01T00:00:00",
+    "2026-11-01T00:00:00",
+    "2026-12-01T00:00:00"
+  ],
+  "future_dates": [
+    "2026-09-01T00:00:00",
+    "2026-10-01T00:00:00",
+    "2026-11-01T00:00:00",
+    "2026-12-01T00:00:00"
+  ],
+  "tail_length": 2,
+  "model_id": "electricity",
+  "vintage": "20260816",
+  "run_id": "decc641d36f36af22dfe502f837ae1f4dcecd719d5f3a4228dd8652aa35297a0",
+  "forecast_name": "unconditional",
+  "hicp_series": "hicp_electricity",
+  "hicp_label": "HICP Electricity",
+  "frequency": "monthly",
+  "source_frequency": "monthly",
+  "inflation_unit": "% y/y",
+  "level_unit": "HICP index",
+  "transformation_method": "forecast_to_hicp_electricity",
+  "gamma": 0.0032257919613912145,
+  "price_unit": "EUR/kWh",
+  "excise_unit": "EUR/kWh",
+  "tax_assumption": "latest published VAT/excise carried forward",
+  "missing_data_method": "linear",
+  "missing_treatment_exact": true
+}

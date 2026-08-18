@@ -1,0 +1,124 @@
+{
+  "scenario_contract_version": "headline-conditional-v2",
+  "headline_vintage": "20260816",
+  "headline_run_id": "390dd311c4055f48dc8caa283533bb6db8fb0361d54d595feb276a0634c4eab9",
+  "condition_variables": [
+    "hicp_energy"
+  ],
+  "condition_dates": [
+    "2026-08-01T00:00:00",
+    "2026-09-01T00:00:00",
+    "2026-10-01T00:00:00"
+  ],
+  "condition_values": {
+    "hicp_energy": [
+      112.83358240504225,
+      114.09401956259083,
+      114.3410105686892
+    ]
+  },
+  "condition_horizon": 3,
+  "computational_horizon": 12,
+  "n_draws": 1000,
+  "forecast_seed": 2026,
+  "simulate_future_outliers": true,
+  "paired_baseline_conditional": true,
+  "persisted_baseline_bit_identical": true,
+  "bvar_reestimated": false,
+  "lineage_verification_status": "verified_at_estimation",
+  "publication_horizon_max_months": 12,
+  "source_type": "joint_energy_scenario",
+  "energy_vintage": "20260816",
+  "energy_aggregate_run_id": "f83d1b28a3ad4ee8dcca",
+  "energy_forecast_name": "unconditional",
+  "energy_scenario_signature": {
+    "conditional": [
+      {
+        "model_id": "car_fuels_petrol",
+        "condition_variable": "refined_petroleum_eur",
+        "path_mode": "percent",
+        "path_value": 30
+      },
+      {
+        "model_id": "gas",
+        "condition_variable": "natural_gas_wholesale",
+        "path_mode": "percent",
+        "path_value": 10
+      }
+    ],
+    "tax": []
+  },
+  "energy_scenario_components": [
+    "car_fuels_petrol",
+    "gas"
+  ],
+  "condition_statistic": "mean",
+  "condition_statistic_label": "Posterior mean",
+  "energy_percentile_contract": "pointwise_direct_from_energy_aggregate_draws",
+  "energy_path_uncertainty_propagated": false,
+  "energy_transfer_method": "mom_growth_reanchored_on_headline_energy",
+  "headline_energy_anchor_date": "2026-07-01T00:00:00",
+  "headline_energy_anchor_level": 109.55,
+  "energy_gross_growth": [
+    1.0299733674581675,
+    1.0111707625574091,
+    1.002164802388813
+  ],
+  "energy_headline_ratio_diagnostic": {
+    "windows": {
+      "12": {
+        "available": true,
+        "observations": 12,
+        "start": "2025-07-01T00:00:00",
+        "end": "2026-06-01T00:00:00",
+        "median_ratio": 1.0000131118718205,
+        "max_relative_ratio_drift": 4.964767795079261e-05,
+        "max_relative_ratio_drift_percent": 0.004964767795079261
+      },
+      "24": {
+        "available": true,
+        "observations": 24,
+        "start": "2024-07-01T00:00:00",
+        "end": "2026-06-01T00:00:00",
+        "median_ratio": 1.0000022707326053,
+        "max_relative_ratio_drift": 5.994665728858983e-05,
+        "max_relative_ratio_drift_percent": 0.005994665728858983
+      },
+      "36": {
+        "available": true,
+        "observations": 36,
+        "start": "2023-07-01T00:00:00",
+        "end": "2026-06-01T00:00:00",
+        "median_ratio": 1.0000022707326053,
+        "max_relative_ratio_drift": 6.124189320799722e-05,
+        "max_relative_ratio_drift_percent": 0.006124189320799722
+      }
+    },
+    "max_drift_across_available_windows": 6.124189320799722e-05,
+    "pathological_threshold": 0.02,
+    "pathological_flag": false
+  },
+  "energy_application_mode": "joint",
+  "energy_joint_scenario_count": 2,
+  "energy_joint_scenario_labels": [
+    {
+      "kind": "Conditional",
+      "component": "Car fuels - petrol",
+      "detail": "+30.00% vs last observed"
+    },
+    {
+      "kind": "Conditional",
+      "component": "Natural gas",
+      "detail": "+10.00% vs last observed"
+    }
+  ],
+  "energy_joint_contract": "energy-joint-scenario-v1",
+  "energy_marginal_effects_summed": false,
+  "energy_joint_source": "prebuilt_energy_scenarios_workspace",
+  "energy_headline_bridge_rebuilt_on_apply": false,
+  "condition_metric": "level",
+  "condition_variable": "hicp_energy",
+  "headline_observed_anchor_date": "2026-07-01T00:00:00",
+  "headline_observed_anchor_yoy": 2.921527570046867,
+  "scenario_id": "78fc3025d49ac2e781d1"
+}

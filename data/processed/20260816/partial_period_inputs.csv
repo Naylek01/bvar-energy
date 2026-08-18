@@ -1,0 +1,9 @@
+series,panel_column,panel_label_date,frequency,input_date,input_value
+ttf_eur_mwh,natural_gas_eur_mwh,2026-08-01,monthly,2026-08-03,57.4
+ttf_eur_mwh,natural_gas_eur_mwh,2026-08-01,monthly,2026-08-04,55.63
+ttf_eur_mwh,natural_gas_eur_mwh,2026-08-01,monthly,2026-08-05,52.21
+ttf_eur_mwh,natural_gas_eur_mwh,2026-08-01,monthly,2026-08-06,55.75
+eurusd,,2026-08-01,monthly,2026-08-03,1.1509
+eurusd,,2026-08-01,monthly,2026-08-04,1.1531
+eurusd,,2026-08-01,monthly,2026-08-05,1.1553
+eurusd,,2026-08-01,monthly,2026-08-06,1.1525

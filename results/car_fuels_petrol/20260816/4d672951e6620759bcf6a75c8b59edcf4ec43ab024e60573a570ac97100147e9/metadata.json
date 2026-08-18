@@ -1,0 +1,52 @@
+{
+  "model_id": "car_fuels_petrol",
+  "vintage": "20260816",
+  "data_hash": "b08bcfa9509d4441c8582df6242e60dd6b823bcd6cbcfcebf021daad9963c20e",
+  "config_hash": "65a541935c80ce5ebcb156786deb113b5a9e2d07362f5da989d4bdc456a09bab",
+  "code_version": "energy_bvar_model-v2",
+  "seed": 42,
+  "run_id": "4d672951e6620759bcf6a75c8b59edcf4ec43ab024e60573a570ac97100147e9",
+  "result_schema_version": "1.2",
+  "frequency": "weekly",
+  "calendar_rule": "W-MON",
+  "missing_data_method": "dk",
+  "missing_treatment_exact": true,
+  "source_data_hash": "b08bcfa9509d4441c8582df6242e60dd6b823bcd6cbcfcebf021daad9963c20e",
+  "effective_estimation_data_hash": "b08bcfa9509d4441c8582df6242e60dd6b823bcd6cbcfcebf021daad9963c20e",
+  "variables": [
+    "wob_petrol_pre_tax",
+    "crude_oil_eur",
+    "refined_petroleum_eur"
+  ],
+  "exog_names": [],
+  "exog_prior_scale": null,
+  "p": 24,
+  "n_observations": 1128,
+  "created_at_utc": "2026-08-16T02:28:22.491657+00:00",
+  "data_augmentation": "durbin_koopman_interior_levels",
+  "missing_data_approximation_used": false,
+  "interpolated_level_cells": 0,
+  "interpolated_dates": 0,
+  "requires_data_augmentation": true,
+  "interior_missing_dates": 35,
+  "interior_missing_level_cells": 35,
+  "dk_projection_mode": "strict",
+  "dk_projection_diagnostics": {
+    "n_sweeps": 6000,
+    "mode": "strict",
+    "level_error": {
+      "max": 2.0210684259505648e-10,
+      "sweep_of_maximum": 247,
+      "argmax_date": "2022-03-21 00:00:00",
+      "argmax_variable": "crude_oil_eur",
+      "argmax_near_missing": false
+    },
+    "difference_adjustment": {
+      "max": 1.0564912852485924e-08,
+      "sweep_of_maximum": 247,
+      "argmax_date": "2022-03-21 00:00:00",
+      "argmax_variable": "wob_petrol_pre_tax",
+      "argmax_near_missing": false
+    }
+  }
+}

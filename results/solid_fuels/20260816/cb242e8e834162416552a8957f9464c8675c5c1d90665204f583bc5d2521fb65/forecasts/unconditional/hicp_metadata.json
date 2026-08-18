@@ -1,0 +1,34 @@
+{
+  "hicp_schema_version": "1.0",
+  "n_draws": 1000,
+  "n_path_dates": 6,
+  "path_dates": [
+    "2026-07-01T00:00:00",
+    "2026-08-01T00:00:00",
+    "2026-09-01T00:00:00",
+    "2026-10-01T00:00:00",
+    "2026-11-01T00:00:00",
+    "2026-12-01T00:00:00"
+  ],
+  "future_dates": [
+    "2026-09-01T00:00:00",
+    "2026-10-01T00:00:00",
+    "2026-11-01T00:00:00",
+    "2026-12-01T00:00:00"
+  ],
+  "tail_length": 2,
+  "model_id": "solid_fuels",
+  "vintage": "20260816",
+  "run_id": "cb242e8e834162416552a8957f9464c8675c5c1d90665204f583bc5d2521fb65",
+  "forecast_name": "unconditional",
+  "hicp_series": "hicp_solid_fuels",
+  "hicp_label": "HICP Solid Fuels",
+  "frequency": "monthly",
+  "source_frequency": "monthly",
+  "inflation_unit": "% y/y",
+  "level_unit": "HICP index",
+  "transformation_method": "forecast_hicp_component",
+  "tax_assumption": "not applicable; BVAR target is the HICP index",
+  "missing_data_method": "linear",
+  "missing_treatment_exact": true
+}

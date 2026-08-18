@@ -1,0 +1,41 @@
+{
+  "scenario_contract_version": "headline-conditional-v2",
+  "headline_vintage": "20260816",
+  "headline_run_id": "390dd311c4055f48dc8caa283533bb6db8fb0361d54d595feb276a0634c4eab9",
+  "condition_variables": [
+    "hicp_neig"
+  ],
+  "condition_dates": [
+    "2026-08-01T00:00:00",
+    "2026-09-01T00:00:00",
+    "2026-10-01T00:00:00"
+  ],
+  "condition_values": {
+    "hicp_neig": [
+      103.446,
+      105.7035,
+      106.2705
+    ]
+  },
+  "condition_horizon": 3,
+  "computational_horizon": 12,
+  "n_draws": 1000,
+  "forecast_seed": 2026,
+  "simulate_future_outliers": true,
+  "paired_baseline_conditional": true,
+  "persisted_baseline_bit_identical": true,
+  "bvar_reestimated": false,
+  "lineage_verification_status": "verified_at_estimation",
+  "publication_horizon_max_months": 12,
+  "source_type": "core_manual",
+  "condition_metric": "yoy",
+  "core_condition_variables": [
+    "hicp_neig"
+  ],
+  "core_derived_from": [
+    "hicp_neig",
+    "hicp_services"
+  ],
+  "core_aggregation": "draw_wise_neig_services",
+  "scenario_id": "692cdf8117da400a3730"
+}

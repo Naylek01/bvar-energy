@@ -1,0 +1,141 @@
+{
+  "aggregate_module_version": "2026-08-09-pre-post-admissibility",
+  "aggregate_pipeline_version": "2026-08-09-seven-model-hicp-auto-v2",
+  "component_forecast_stores": {
+    "diesel": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\results\\car_fuels_diesel\\20260816\\f9f27d1f9069fca386df1c9b191b1927d1b51993c9401d98891e4de4495a348f\\forecasts\\unconditional",
+    "electricity": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\results\\electricity\\20260816\\807c431b2aae4abbec1f2ad3f4b0c4cc19a80ace27293f1ab1cccf4afd4aa13d\\forecasts\\unconditional",
+    "gas": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\results\\gas\\20260816\\9ce26b46de996d7f3682685b96e765c300696ddeeac6fb4450ef36de6333c4e2\\forecasts\\unconditional",
+    "heat_energy": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\results\\heat_energy\\20260816\\556eebd7a1779923f8310fb9b507264bac0cfcd25da9da634ec2c3b0841137ce\\forecasts\\unconditional",
+    "liquid_fuels": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\results\\liquid_fuels\\20260816\\1f1aa9e776b20347fe85fe11fcabe6019a63e269769b4e4b54208fba474b39ad\\forecasts\\unconditional",
+    "petrol": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\results\\car_fuels_petrol\\20260816\\4d672951e6620759bcf6a75c8b59edcf4ec43ab024e60573a570ac97100147e9\\forecasts\\unconditional",
+    "solid_fuels": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\results\\solid_fuels\\20260816\\cb242e8e834162416552a8957f9464c8675c5c1d90665204f583bc5d2521fb65\\forecasts\\unconditional"
+  },
+  "cross_model_dependence": "independent random pairing of marginal component predictive paths; this is not a joint posterior across the seven separately estimated BVARs",
+  "final_component_pool_sizes": {
+    "car_fuels": 484,
+    "electricity": 1000,
+    "gas": 1000,
+    "heat_energy": 1000,
+    "liquid_fuels": 481,
+    "solid_fuels": 1000
+  },
+  "forecast_name": "unconditional",
+  "n_aggregate_draws_effective": 481,
+  "n_aggregate_draws_requested": 500,
+  "other_transport_fuels_forecast": "latest published HICP level held constant over the forecast horizon",
+  "pairing_seed": 2026,
+  "predictive_distribution_interpretation": "posterior predictive conditional on finite, strictly positive weekly pre-tax and after-tax consumer-price paths for the weekly fuel models",
+  "tax_scenarios": {},
+  "transport_draws_effective": 484,
+  "transport_pool_sizes": {
+    "diesel": 487,
+    "petrol": 484
+  },
+  "vintage": "20260816",
+  "weekly_price_admissibility": {
+    "diesel": {
+      "distribution_interpretation": "posterior predictive conditional on all supplied price paths being finite and strictly positive",
+      "invalid_draws_baseline_after_tax_weekly": 1,
+      "invalid_draws_baseline_output": 1,
+      "invalid_draws_pre_tax_weekly": 13,
+      "invalid_draws_scenario_after_tax_weekly": 1,
+      "invalid_draws_scenario_output": 1,
+      "rejected_draws": 13,
+      "rejection_rate": 0.026,
+      "retained_draws": 487,
+      "total_draws": 500
+    },
+    "liquid_fuels": {
+      "distribution_interpretation": "posterior predictive conditional on all supplied price paths being finite and strictly positive",
+      "invalid_draws_baseline_after_tax_weekly": 10,
+      "invalid_draws_baseline_output": 5,
+      "invalid_draws_pre_tax_weekly": 19,
+      "invalid_draws_scenario_after_tax_weekly": 10,
+      "invalid_draws_scenario_output": 5,
+      "rejected_draws": 19,
+      "rejection_rate": 0.038,
+      "retained_draws": 481,
+      "total_draws": 500
+    },
+    "petrol": {
+      "distribution_interpretation": "posterior predictive conditional on all supplied price paths being finite and strictly positive",
+      "invalid_draws_baseline_after_tax_weekly": 5,
+      "invalid_draws_baseline_output": 4,
+      "invalid_draws_pre_tax_weekly": 16,
+      "invalid_draws_scenario_after_tax_weekly": 5,
+      "invalid_draws_scenario_output": 4,
+      "rejected_draws": 16,
+      "rejection_rate": 0.032,
+      "retained_draws": 484,
+      "total_draws": 500
+    }
+  },
+  "weekly_price_to_hicp_method": "proportional WOB price-relative rebasing to latest common HICP month",
+  "weekly_rejection_rates": {
+    "diesel": 0.026,
+    "liquid_fuels": 0.038,
+    "petrol": 0.032
+  },
+  "weekly_tax_mode_effective": "official_wob_tax_reattribution",
+  "weekly_tax_mode_requested": "strict",
+  "weight_policy": "latest published annual weights carried forward",
+  "wob_hicp_proxy_diagnostics": {
+    "diesel": {
+      "absolute_diff_beta": 0.061672564456426875,
+      "absolute_level_residual_drift": 1.8926854051717328,
+      "absolute_level_residual_range": 5.107279425503364,
+      "first_date": "2016-12-01",
+      "full_sample_ratio_change_percent": 0.8004577273368119,
+      "label": "diesel: after-tax WOB consumer price vs HICP",
+      "last_date": "2026-06-01",
+      "log_diff_beta": 0.9757150248435278,
+      "log_diff_correlation": 0.9927796057502137,
+      "log_diff_rmse": 0.004644515793267158,
+      "observations": 115,
+      "proxy_quality_note": "proxy diagnostics pass",
+      "proxy_quality_pass": true,
+      "recent_ratio_change_percent": 0.9075764467492364,
+      "recent_ratio_cv": 0.002872770839184174,
+      "recent_ratio_mean": 0.06330176353033688,
+      "recent_window_months": 36
+    },
+    "liquid_fuels": {
+      "absolute_diff_beta": 0.0788471585639097,
+      "absolute_level_residual_drift": 17.28284159834874,
+      "absolute_level_residual_range": 23.368354778774354,
+      "first_date": "2005-01-01",
+      "full_sample_ratio_change_percent": -0.12634560053642607,
+      "label": "liquid_fuels: after-tax WOB consumer price vs HICP",
+      "last_date": "2026-06-01",
+      "log_diff_beta": 0.7900266731197934,
+      "log_diff_correlation": 0.9549689095059966,
+      "log_diff_rmse": 0.01411068629217921,
+      "observations": 258,
+      "proxy_quality_note": "proxy diagnostics pass",
+      "proxy_quality_pass": true,
+      "recent_ratio_change_percent": -0.23664853168334776,
+      "recent_ratio_cv": 0.026977389338762155,
+      "recent_ratio_mean": 0.1006129462394972,
+      "recent_window_months": 36
+    },
+    "petrol": {
+      "absolute_diff_beta": 0.060415533216337636,
+      "absolute_level_residual_drift": 1.2475141669327598,
+      "absolute_level_residual_range": 5.116373183059565,
+      "first_date": "2016-12-01",
+      "full_sample_ratio_change_percent": 2.1908599859588485,
+      "label": "petrol: after-tax WOB consumer price vs HICP",
+      "last_date": "2026-06-01",
+      "log_diff_beta": 1.021464531498861,
+      "log_diff_correlation": 0.9909795774321835,
+      "log_diff_rmse": 0.004188532621608758,
+      "observations": 115,
+      "proxy_quality_note": "proxy diagnostics pass",
+      "proxy_quality_pass": true,
+      "recent_ratio_change_percent": 0.779467951761692,
+      "recent_ratio_cv": 0.004084463296377666,
+      "recent_ratio_mean": 0.059325858277137905,
+      "recent_window_months": 36
+    }
+  }
+}

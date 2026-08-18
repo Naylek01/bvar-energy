@@ -1,0 +1,16 @@
+series,coicop18,geo,index_dataset,index_unit,index_first_date,index_last_date,index_observations,weight_dataset,weight_statinfo,weight_first_year,weight_last_year,weight_observations,index_flag_codes,weight_flag_codes,break_dates,expected_index_start,actual_index_start,index_start_status,expected_weight_start_year,actual_weight_start_year,weight_start_status,actual_break_dates,expected_break_dates,break_status
+hicp_total,TOTAL,EA,prc_hicp_minr,I25,1996-01-01,2026-07-01,367,prc_hicp_iw,IW,1996,2026,31,e,,,1996-01-01,1996-01-01,match,1996,1996,match,,,no_break_contract
+hicp_energy,NRG,EA,prc_hicp_minr,I25,1996-01-01,2026-07-01,367,prc_hicp_iw,IW,1996,2026,31,b|d|e,d,2017-01-01,1996-01-01,1996-01-01,match,1996,1996,match,2017-01-01,2017-01-01,match
+hicp_electricity_gas_solid_heat,ELC_GAS,EA,prc_hicp_minr,I25,1996-01-01,2026-06-01,366,prc_hicp_iw,IW,1996,2026,31,b|d,d,2017-01-01,1996-01-01,1996-01-01,match,1996,1996,match,2017-01-01,2017-01-01,match
+hicp_fuel_special_aggregate,FUEL,EA,prc_hicp_minr,I25,1996-01-01,2026-06-01,366,prc_hicp_iw,IW,1996,2026,31,b|d,d,2017-01-01,1996-01-01,1996-01-01,match,1996,1996,match,2017-01-01,2017-01-01,match
+hicp_household_energy,CP045,EA,prc_hicp_minr,I25,1996-01-01,2026-06-01,366,prc_hicp_iw,IW,1996,2026,31,,,,1996-01-01,1996-01-01,match,1996,1996,match,,,no_break_contract
+hicp_electricity,CP0451,EA,prc_hicp_minr,I25,1996-01-01,2026-06-01,366,prc_hicp_iw,IW,1996,2026,31,,,,1996-01-01,1996-01-01,match,1996,1996,match,,,no_break_contract
+hicp_gas,CP0452,EA,prc_hicp_minr,I25,1996-01-01,2026-06-01,366,prc_hicp_iw,IW,1996,2026,31,,,,1996-01-01,1996-01-01,match,1996,1996,match,,,no_break_contract
+hicp_liquid_fuels,CP0453,EA,prc_hicp_minr,I25,1996-01-01,2026-06-01,366,prc_hicp_iw,IW,1996,2026,31,,,,1996-01-01,1996-01-01,match,1996,1996,match,,,no_break_contract
+hicp_solid_fuels,CP0454,EA,prc_hicp_minr,I25,1996-01-01,2026-06-01,366,prc_hicp_iw,IW,1996,2026,31,,,,1996-01-01,1996-01-01,match,1996,1996,match,,,no_break_contract
+hicp_heat_cooling_energy,CP0455,EA,prc_hicp_minr,I25,1996-01-01,2026-06-01,366,prc_hicp_iw,IW,1996,2026,31,,,,1996-01-01,1996-01-01,match,1996,1996,match,,,no_break_contract
+hicp_fuels_lubricants_personal_transport,CP0722,EA,prc_hicp_minr,I25,1996-01-01,2026-06-01,366,prc_hicp_iw,IW,1996,2026,31,,,,1996-01-01,1996-01-01,match,1996,1996,match,,,no_break_contract
+hicp_diesel,CP07221,EA,prc_hicp_minr,I25,2016-12-01,2026-06-01,115,prc_hicp_iw,IW,2016,2026,11,,,,2016-12-01,2016-12-01,match,2016,2016,match,,,no_break_contract
+hicp_petrol,CP07222,EA,prc_hicp_minr,I25,2016-12-01,2026-06-01,115,prc_hicp_iw,IW,2016,2026,11,,,,2016-12-01,2016-12-01,match,2016,2016,match,,,no_break_contract
+hicp_other_transport_fuels,CP07223,EA,prc_hicp_minr,I25,2016-12-01,2026-06-01,115,prc_hicp_iw,IW,2016,2026,11,,,,2016-12-01,2016-12-01,match,2016,2016,match,,,no_break_contract
+hicp_lubricants,CP07224,EA,prc_hicp_minr,I25,2016-12-01,2026-06-01,115,prc_hicp_iw,IW,2016,2026,11,,,,2016-12-01,2016-12-01,match,2016,2016,match,,,no_break_contract

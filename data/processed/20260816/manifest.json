@@ -1,0 +1,1013 @@
+{
+  "project": "ECB energy STIP six-model dataset build + final joint Headline-HICP BVAR input",
+  "script_version": "2026-08-15-v14.1-final-dashboard-contract",
+  "built_at_utc": "2026-08-16T00:13:05.300527+00:00",
+  "python_executable": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\.venv\\Scripts\\python.exe",
+  "python_version": "3.11.0",
+  "pandas_version": "3.0.5",
+  "numpy_version": "2.4.6",
+  "build_vintage": "20260816",
+  "input_architecture": "single_excel_workbook_xlsm_or_xlsx",
+  "raw_workbook": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\data\\raw\\bvar_energy_raw_data.xlsm",
+  "raw_workbook_sha256": "b7187b4acbcac15f6aaf84ad2f314e08fab46c1ad5627880213ec1f772817764",
+  "raw_workbook_bytes": 1746253,
+  "snapshot_vintage": "unversioned_workbook",
+  "sheet_mapping": {
+    "haver": "Haver",
+    "bloomberg": "Bloomberg_copy",
+    "european_commission": "European_Commission",
+    "world_bank": "World_Bank",
+    "eurostat": "Eurostat",
+    "eurostat_hicp": "Eurostat_HICP",
+    "headline_hicp": "EUROSTAT_HEADLINE_HICP_VIEW",
+    "metadata": "Metadata"
+  },
+  "source_files": {
+    "haver": "source_context_haver.csv",
+    "european_commission": "source_context_european_commission.csv",
+    "eurostat": "source_context_eurostat_energy.csv"
+  },
+  "source_context_contract": {
+    "mode": "immutable_processed_vintage_sidecars",
+    "sources": [
+      "european_commission",
+      "eurostat",
+      "haver"
+    ],
+    "note": "Tax/HICP/fitted/scenario adapters must prefer these files over the living Excel workbook. Legacy vintages without sidecars may use the workbook only when its SHA256 matches the manifest."
+  },
+  "deprecated_outputs_removed_on_overwrite": [],
+  "ignored_live_sheet": "Bloomberg_Live",
+  "workbook_requirement": "Production workbook may be .xlsm or .xlsx; .xlsm is preferred because it preserves Config/VBA. Python never executes VBA, Power Query, Haver or Bloomberg formulas. Refresh and save the workbook in Excel first. Bloomberg_copy is the values-only snapshot consumed by Python; Bloomberg_Live is intentionally ignored.",
+  "workbook_freshness_contract": {
+    "haver": "Refresh the Haver block in Excel and save before the build. Only H023HW51, H023HW52, H023HW54, H023HW55 and H025PP@G10 are hard Energy requirements; total/car-fuels/liquid-fuels Haver series are optional because the Eurostat HICP lineage owns them.",
+    "bloomberg": "Refresh Bloomberg_Live, copy values/number formats to Bloomberg_copy, then save before the build.",
+    "power_query": "Apply Config and refresh Power Query, wait for completion, then save. Python reads cached worksheet values and does not execute queries."
+  },
+  "source_read_statistics": {
+    "haver": {
+      "raw_rows": 8,
+      "retained_rows": 378,
+      "columns": 5,
+      "input_order": "ascending",
+      "invalid_date_rows": 0,
+      "duplicate_date_rows": 0,
+      "duplicate_dates": 0,
+      "all_missing_rows_dropped": 181,
+      "error_markers_coerced_to_nan": 0,
+      "first_date": "1995-01-01",
+      "last_date": "2026-06-01",
+      "energy_tickers_required": {
+        "H023HW51@EUDATA": "hicp_electricity",
+        "H023HW52@EUDATA": "hicp_gas",
+        "H023HW54@EUDATA": "hicp_solid_fuels",
+        "H023HW55@EUDATA": "hicp_heat_energy",
+        "H025PP@G10": "ppi_energy"
+      },
+      "energy_tickers_optional": {
+        "H023HICP@EUDATA": "hicp_total",
+        "H023HN22@EUDATA": "hicp_car_fuels",
+        "H023HW53@EUDATA": "hicp_liquid_fuels"
+      },
+      "energy_optional_tickers_found": [],
+      "energy_optional_tickers_missing": [
+        "H023HICP@EUDATA",
+        "H023HN22@EUDATA",
+        "H023HW53@EUDATA"
+      ],
+      "haver_contract": "monthly Energy inputs only"
+    },
+    "bloomberg": {
+      "raw_rows": 12165,
+      "retained_rows": 12158,
+      "columns": 5,
+      "input_order": "descending",
+      "invalid_date_rows": 1,
+      "duplicate_date_rows": 0,
+      "duplicate_dates": 0,
+      "all_missing_rows_dropped": 0,
+      "error_markers_coerced_to_nan": 0,
+      "first_date": "1980-01-01",
+      "last_date": "2026-08-06",
+      "ticker_row_excel": 5,
+      "field_row_excel": 6,
+      "tickers": {
+        "crude_oil_usd": "BCSL0018 Index",
+        "ttf_eur_mwh": "TTFGDAHD BCFV Index",
+        "eurusd": "EURUSD Curncy",
+        "refined_diesel_usd": "QS1 Comdty",
+        "refined_petroleum_usd": "GNEBM1 PVMO Index"
+      }
+    },
+    "european_commission": {
+      "raw_rows": 1079,
+      "retained_rows": 1079,
+      "columns": 19,
+      "input_order": "descending",
+      "invalid_date_rows": 0,
+      "duplicate_date_rows": 0,
+      "duplicate_dates": 0,
+      "all_missing_rows_dropped": 0,
+      "error_markers_coerced_to_nan": 0,
+      "first_date": "2005-01-03",
+      "last_date": "2026-08-10"
+    },
+    "world_bank": {
+      "raw_rows": 799,
+      "retained_rows": 799,
+      "columns": 1,
+      "input_order": "descending",
+      "invalid_date_rows": 0,
+      "duplicate_date_rows": 0,
+      "duplicate_dates": 0,
+      "all_missing_rows_dropped": 0,
+      "error_markers_coerced_to_nan": 0,
+      "first_date": "1960-01-01",
+      "last_date": "2026-07-01"
+    },
+    "eurostat": {
+      "raw_rows": 45,
+      "retained_rows": 45,
+      "columns": 8,
+      "input_order": "descending",
+      "invalid_date_rows": 0,
+      "duplicate_date_rows": 0,
+      "duplicate_dates": 0,
+      "all_missing_rows_dropped": 0,
+      "error_markers_coerced_to_nan": 0,
+      "first_date": "2003-07-01",
+      "last_date": "2025-07-01"
+    },
+    "eurostat_hicp": {
+      "raw_rows": 4873,
+      "retained_rows": 4873,
+      "columns": 14,
+      "input_order": "long_by_series",
+      "invalid_date_rows": 0,
+      "duplicate_date_rows": 0,
+      "duplicate_dates": 0,
+      "all_missing_rows_dropped": 0,
+      "error_markers_coerced_to_nan": 0,
+      "first_date": "1996-01-01",
+      "last_date": "2026-07-01",
+      "first_weight_year": 1996,
+      "last_weight_year": 2026,
+      "geo": "EA",
+      "index_unit": "I25",
+      "weight_statinfo": "IW",
+      "index_rows": 4488,
+      "weight_rows": 385,
+      "flagged_rows": 824,
+      "discovery_mode": false,
+      "empirical_contract_failures": 0
+    },
+    "headline_hicp": {
+      "raw_rows": 2651,
+      "retained_rows": 2651,
+      "columns": 14,
+      "input_order": "mixed_index_and_weight_blocks",
+      "invalid_date_rows": 0,
+      "duplicate_date_rows": 0,
+      "duplicate_dates": 0,
+      "all_missing_rows_dropped": 0,
+      "error_markers_coerced_to_nan": 0,
+      "first_date": "1996-01-01",
+      "last_date": "2026-07-01",
+      "first_weight_year": 1996,
+      "last_weight_year": 2026,
+      "geo": "EA",
+      "index_unit": "I25",
+      "food_index_source": "Eurostat prc_hicp_minr / FOOD / I25 / EA",
+      "food_weight_source": "Eurostat prc_hicp_iw / FOOD_NP + FOOD_P"
+    }
+  },
+  "metadata_sheet_records": [
+    {
+      "column_1": "RAW DATA REFRESH MAP",
+      "column_2": "",
+      "column_3": "",
+      "column_4": "",
+      "column_5": "",
+      "column_6": "",
+      "column_7": "",
+      "column_8": ""
+    },
+    {
+      "column_1": "Source",
+      "column_2": "Excel refresh",
+      "column_3": "Current role",
+      "column_4": "",
+      "column_5": "",
+      "column_6": "",
+      "column_7": "",
+      "column_8": "workbook_format xlsm"
+    },
+    {
+      "column_1": "Haver",
+      "column_2": "Existing Haver formulas / desk access",
+      "column_3": "HICP + PPI Energy",
+      "column_4": "",
+      "column_5": "",
+      "column_6": "",
+      "column_7": "",
+      "column_8": ""
+    },
+    {
+      "column_1": "Bloomberg",
+      "column_2": "Existing Bloomberg formulas",
+      "column_3": "Crude, TTF, EURUSD, QS1, GNEBM1 PVMO",
+      "column_4": "",
+      "column_5": "",
+      "column_6": "",
+      "column_7": "",
+      "column_8": "haver_scope energy_only"
+    },
+    {
+      "column_1": "European Commission",
+      "column_2": "Power Query",
+      "column_3": "Weekly Oil Bulletin raw source",
+      "column_4": "",
+      "column_5": "",
+      "column_6": "",
+      "column_7": "",
+      "column_8": "haver_frequency monthly"
+    },
+    {
+      "column_1": "Eurostat",
+      "column_2": "Power Query",
+      "column_3": "Gas/electricity household prices + tax states",
+      "column_4": "",
+      "column_5": "",
+      "column_6": "",
+      "column_7": "",
+      "column_8": "haver_series_count 5"
+    },
+    {
+      "column_1": "Eurostat_HICP",
+      "column_2": "Power Query",
+      "column_3": "HICP weight and aggregate energy hicp",
+      "column_4": "",
+      "column_5": "",
+      "column_6": "",
+      "column_7": "",
+      "column_8": "haver_electricity H023HW51@EUDATA"
+    },
+    {
+      "column_1": "World Bank",
+      "column_2": "Power Query",
+      "column_3": "Natural Gas Europe proxy",
+      "column_4": "",
+      "column_5": "",
+      "column_6": "",
+      "column_7": "",
+      "column_8": "haver_gas H023HW52@EUDATA"
+    },
+    {
+      "column_1": "Python builder",
+      "column_2": "",
+      "column_3": "Transforms / merges / model assignment",
+      "column_4": "",
+      "column_5": "",
+      "column_6": "",
+      "column_7": "",
+      "column_8": "haver_solid_fuels H023HW54@EUDATA"
+    },
+    {
+      "column_1": "",
+      "column_2": "",
+      "column_3": "",
+      "column_4": "",
+      "column_5": "",
+      "column_6": "",
+      "column_7": "",
+      "column_8": "haver_heat_energy H023HW55@EUDATA"
+    },
+    {
+      "column_1": "",
+      "column_2": "",
+      "column_3": "",
+      "column_4": "",
+      "column_5": "",
+      "column_6": "",
+      "column_7": "",
+      "column_8": "haver_ppi H025PP@G10"
+    },
+    {
+      "column_1": "",
+      "column_2": "",
+      "column_3": "",
+      "column_4": "",
+      "column_5": "",
+      "column_6": "",
+      "column_7": "",
+      "column_8": "headline_hicp_provider Eurostat"
+    },
+    {
+      "column_1": "",
+      "column_2": "",
+      "column_3": "",
+      "column_4": "",
+      "column_5": "",
+      "column_6": "",
+      "column_7": "",
+      "column_8": "headline_energy_code NRG"
+    },
+    {
+      "column_1": "",
+      "column_2": "",
+      "column_3": "",
+      "column_4": "",
+      "column_5": "",
+      "column_6": "",
+      "column_7": "",
+      "column_8": "headline_food_code FOOD"
+    },
+    {
+      "column_1": "",
+      "column_2": "",
+      "column_3": "",
+      "column_4": "",
+      "column_5": "",
+      "column_6": "",
+      "column_7": "",
+      "column_8": "headline_neig_code IGD_NNRG"
+    },
+    {
+      "column_1": "",
+      "column_2": "",
+      "column_3": "",
+      "column_4": "",
+      "column_5": "",
+      "column_6": "",
+      "column_7": "",
+      "column_8": "headline_services_code SERV"
+    },
+    {
+      "column_1": "",
+      "column_2": "",
+      "column_3": "",
+      "column_4": "",
+      "column_5": "",
+      "column_6": "",
+      "column_7": "",
+      "column_8": "headline_food_weight FOOD_NP + FOOD_P"
+    },
+    {
+      "column_1": "",
+      "column_2": "",
+      "column_3": "",
+      "column_4": "",
+      "column_5": "",
+      "column_6": "",
+      "column_7": "",
+      "column_8": "world_bank_policy static_snapshot"
+    },
+    {
+      "column_1": "",
+      "column_2": "",
+      "column_3": "",
+      "column_4": "",
+      "column_5": "",
+      "column_6": "",
+      "column_7": "",
+      "column_8": "world_bank_role pre-TTF backcast proxy"
+    },
+    {
+      "column_1": "",
+      "column_2": "",
+      "column_3": "",
+      "column_4": "",
+      "column_5": "",
+      "column_6": "",
+      "column_7": "",
+      "column_8": "headline_decomposition disabled"
+    }
+  ],
+  "hicp_aggregation_inputs": {
+    "status": "available",
+    "source_sheet": "Eurostat_HICP",
+    "index_dataset": "prc_hicp_minr",
+    "weight_dataset": "prc_hicp_iw",
+    "geo": "EA",
+    "index_unit": "I25",
+    "weight_statinfo": "IW",
+    "weight_unit": "per thousand of total HICP; raw published weights, not renormalized",
+    "latest_weight_year": 2026,
+    "weight_identity_tolerance_per_thousand": 0.05,
+    "empirical_contract_failures": 0,
+    "wob_hicp_mapping_pass": true,
+    "known_break_contract": {
+      "hicp_energy": [
+        "2017-01-01"
+      ],
+      "hicp_electricity_gas_solid_heat": [
+        "2017-01-01"
+      ],
+      "hicp_fuel_special_aggregate": [
+        "2017-01-01"
+      ]
+    },
+    "future_weight_policy_for_aggregation_module": "If a forecast crosses into a calendar year whose weights are not yet published, carry forward the latest published annual weights.",
+    "refresh_timestamp_evidence": {
+      "status": "unavailable_in_current_metadata_sheet",
+      "note": "The current Metadata sheet contains refresh methods but no per-query UTC timestamps. A common workbook hash proves a common saved file, not identical Power Query refresh times."
+    },
+    "files": {
+      "hicp_indices_monthly": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\data\\processed\\20260816\\hicp_indices_monthly.csv",
+      "hicp_weights_annual": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\data\\processed\\20260816\\hicp_weights_annual.csv",
+      "hicp_series_metadata": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\data\\processed\\20260816\\hicp_series_metadata.csv",
+      "hicp_flags": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\data\\processed\\20260816\\hicp_flags.csv",
+      "hicp_weight_identity_diagnostics": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\data\\processed\\20260816\\hicp_weight_identity_diagnostics.csv",
+      "hicp_validation_failures": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\data\\processed\\20260816\\hicp_validation_failures.csv",
+      "wob_hicp_mapping_diagnostics": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\data\\processed\\20260816\\wob_hicp_mapping_diagnostics.csv"
+    }
+  },
+  "headline_inputs": {
+    "production_model": "headline_joint",
+    "status": "complete",
+    "source_sheet": "EUROSTAT_HEADLINE_HICP_VIEW",
+    "joint_model": {
+      "ready": true,
+      "spec": {
+        "file": "headline_joint_monthly.csv",
+        "frequency": "monthly",
+        "lags": 12,
+        "comparison_lags": [
+          6,
+          12
+        ],
+        "columns": [
+          "hicp_energy",
+          "hicp_food",
+          "hicp_neig",
+          "hicp_services"
+        ],
+        "equations": {
+          "headline_joint": [
+            "hicp_energy",
+            "hicp_food",
+            "hicp_neig",
+            "hicp_services"
+          ]
+        },
+        "target_columns": [
+          "hicp_energy",
+          "hicp_food",
+          "hicp_neig",
+          "hicp_services"
+        ],
+        "transformations": {
+          "hicp_energy": "logdiff",
+          "hicp_food": "logdiff",
+          "hicp_neig": "logdiff",
+          "hicp_services": "logdiff"
+        },
+        "baseline": "dense BVAR(12)",
+        "sensitivity": "dense BVAR(6) only",
+        "source_contract": {
+          "hicp_energy": "Eurostat NRG",
+          "hicp_food": "Eurostat FOOD",
+          "hicp_neig": "Eurostat IGD_NNRG",
+          "hicp_services": "Eurostat SERV",
+          "food_weight": "Eurostat FOOD_NP + FOOD_P"
+        }
+      },
+      "food_index_source": {
+        "provider": "Eurostat",
+        "dataset": "prc_hicp_minr",
+        "code": "FOOD",
+        "unit": "I25",
+        "geo": "EA",
+        "series": "hicp_food"
+      },
+      "food_weight_construction": "Eurostat FOOD_NP + FOOD_P annual item weights",
+      "blockers": [],
+      "path": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\data\\processed\\20260816\\headline_joint_monthly.csv",
+      "annual_weights_path": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\data\\processed\\20260816\\headline_joint_weights_annual.csv"
+    },
+    "headline_hicp_start_policy": "No forced common start. The joint BVAR model layer determines the first jointly usable transformed observation.",
+    "files": {
+      "headline_hicp_indices_monthly": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\data\\processed\\20260816\\headline_hicp_indices_monthly.csv",
+      "headline_hicp_weights_annual": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\data\\processed\\20260816\\headline_hicp_weights_annual.csv",
+      "headline_hicp_weight_identity_diagnostics": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\data\\processed\\20260816\\headline_hicp_weight_identity_diagnostics.csv",
+      "headline_joint_weights_annual": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\data\\processed\\20260816\\headline_joint_weights_annual.csv",
+      "headline_joint_weight_identity_diagnostics": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\data\\processed\\20260816\\headline_joint_weight_identity_diagnostics.csv"
+    }
+  },
+  "bloomberg_mapping": {
+    "crude_oil_usd": "BCSL0018 Index",
+    "ttf_eur_mwh": "TTFGDAHD BCFV Index",
+    "eurusd": "EURUSD Curncy",
+    "refined_diesel_usd": "QS1 Comdty",
+    "refined_petroleum_usd": "GNEBM1 PVMO Index"
+  },
+  "bloomberg_units": {
+    "crude_oil_usd": {
+      "ticker": "BCSL0018 Index",
+      "input_unit": "USD/barrel",
+      "output_unit": "EUR/barrel",
+      "barrels_per_metric_tonne": null
+    },
+    "refined_petroleum_usd": {
+      "ticker": "GNEBM1 PVMO Index",
+      "input_unit": "USD/metric tonne",
+      "output_unit": "EUR/metric tonne",
+      "barrels_per_metric_tonne": null,
+      "note": "Eurobob oxygenated gasoline FOB Rotterdam barges. The project retains the source tonne unit after FX conversion; no density-based tonne-to-barrel conversion is invented."
+    },
+    "refined_diesel_usd": {
+      "ticker": "QS1 Comdty",
+      "input_unit": "USD/metric tonne",
+      "output_unit": "EUR/barrel",
+      "barrels_per_metric_tonne": 7.44,
+      "note": "Gasoil/diesel conversion used in the paper: 7.44 barrels/tonne."
+    },
+    "ttf_eur_mwh": {
+      "ticker": "TTFGDAHD BCFV Index",
+      "input_unit": "EUR/MWh",
+      "output_unit": "EUR/MWh",
+      "barrels_per_metric_tonne": null
+    },
+    "eurusd": {
+      "ticker": "EURUSD Curncy",
+      "input_unit": "USD per EUR",
+      "output_unit": "USD per EUR",
+      "barrels_per_metric_tonne": null
+    }
+  },
+  "refined_petroleum_policy": "GNEBM1 PVMO is converted only from USD/metric tonne to EUR/metric tonne using EURUSD. No tonne-to-barrel factor is applied.",
+  "known_approximations_vs_paper": [
+    "World Bank Natural gas, Europe substitutes for the paid Energy Intelligence European border-gas series; the pre-TTF history is chain-linked to TTF.",
+    "GNEBM1 PVMO (Eurobob oxygenated gasoline FOB Rotterdam barges) is used for refined petroleum; its EUR/metric-tonne unit is retained rather than inventing a gasoline tonne-to-barrel conversion.",
+    "QS1 is a Low Sulphur Gas Oil future rather than the paper's Refinitiv spot assessment; 7.44 barrels/tonne is applied only to this gasoil/diesel series.",
+    "The available WOB workbook starts in 2005, later than the paper's full historical sample.",
+    "Eurostat household bands are the gas GJ20-199/D2 and electricity KWH2500-4999/DC contracts selected in the workbook Power Query."
+  ],
+  "construction": {
+    "excel_date_order": "Source sheets may be newest-first. Every source is sorted ascending in memory before differencing, lags or aggregation.",
+    "weekly_calendar": {
+      "week_definition": "Monday-Sunday, labelled by Monday",
+      "commodity_shift_weeks": 1,
+      "alignment": "shift=1 aligns WOB Monday t with the preceding completed Monday-Sunday commodity week; shift=0 uses the same week."
+    },
+    "commodity_units": {
+      "crude_oil_eur": "EUR/barrel",
+      "refined_petroleum_eur": "EUR/metric tonne",
+      "refined_diesel_eur": "EUR/barrel"
+    },
+    "pre_tax": {
+      "gas": {
+        "formula": "pre_tax_EUR_MWh = gamma_EUR_MWh * HICP / (1 + VAT/100) - EXC_EUR_MWh",
+        "source_price_unit": "EUR/kWh",
+        "output_price_unit": "EUR/MWh",
+        "price_unit_multiplier": 1000.0,
+        "gamma": 1.1985489786514016,
+        "gamma_unit": "EUR/MWh per HICP index point",
+        "ols_observations": 45,
+        "after_tax_fit_rmse": 6.560218707874738,
+        "after_tax_fit_rmse_unit": "EUR/MWh",
+        "tax_months_carried_forward": {
+          "vat": 6,
+          "excise": 6
+        },
+        "first_valid": "2003-07-01",
+        "last_valid": "2026-06-01"
+      },
+      "electricity": {
+        "formula": "pre_tax_EUR_kWh = gamma_EUR_kWh * HICP / (1 + VAT/100) - EXC_EUR_kWh",
+        "source_price_unit": "EUR/kWh",
+        "output_price_unit": "EUR/kWh",
+        "price_unit_multiplier": 1.0,
+        "gamma": 0.0032257919613912145,
+        "gamma_unit": "EUR/kWh per HICP index point",
+        "ols_observations": 45,
+        "after_tax_fit_rmse": 0.015976957008228102,
+        "after_tax_fit_rmse_unit": "EUR/kWh",
+        "tax_months_carried_forward": {
+          "vat": 6,
+          "excise": 6
+        },
+        "first_valid": "2003-07-01",
+        "last_valid": "2026-06-01"
+      }
+    },
+    "natural_gas": {
+      "method": "Bloomberg TTF monthly mean; pre-TTF months are backcast with World Bank Natural gas, Europe via backward chain-linking.",
+      "formula": "backcast_t = TTF_anchor * proxy_EUR_t / proxy_EUR_anchor",
+      "proxy_input_unit": "USD/MMBtu",
+      "proxy_currency_conversion": "USD/MMBtu divided by USD-per-EUR",
+      "output_unit": "EUR/MWh (set by TTF anchor)",
+      "anchor_date": "2011-02-01",
+      "anchor_ratio": 3.174628605769231,
+      "anchor_fallback_used": false,
+      "first_ttf_date": "2011-02-01",
+      "first_proxy_date": "1980-01-01",
+      "mmbtu_per_mwh_reference": 3.412,
+      "implied_ttf_over_proxy_level_ratio": 0.9304304237307243,
+      "overlap_months": 186,
+      "overlap_log_growth_correlation": 0.8686788569687763,
+      "overlap_log_growth_rmse": 0.08394921776092353,
+      "backcast_observations": 373,
+      "unresolved_pre_ttf_missing": 0
+    },
+    "transformations": "Outputs contain levels. Apply ordinary absolute differences in the BVAR model layer.",
+    "ragged_edge": "Regular calendars are retained with NaN for unreleased cells. The builder never drops the ragged edge merely because one series is missing.",
+    "partial_final_period": "aggregation_coverage.csv records the final weekly/monthly Bloomberg aggregation coverage; partial_period_inputs.csv stores the raw daily observations backing incomplete periods.",
+    "aggregation_coverage": [
+      {
+        "series": "crude_oil_eur",
+        "frequency": "weekly",
+        "aggregation": "Monday-Sunday mean of daily Bloomberg snapshot values",
+        "final_period_start": "2026-08-03",
+        "final_period_end": "2026-08-09",
+        "panel_label_date": "2026-08-10",
+        "label_shift_weeks": 1,
+        "final_period_input_observations": 4,
+        "expected_input_observations": 5,
+        "coverage_ratio": 0.8,
+        "final_period_complete": true,
+        "first_input_date": "2026-08-03",
+        "last_input_date": "2026-08-06",
+        "partial_mean": 70.32368789294138,
+        "last_input_value": 71.86117136659435,
+        "daily_innovation_var": 10.311670288647507,
+        "daily_logreturn_var": 0.0015593044543443734,
+        "reference_periods_used": 24,
+        "panel_column": "crude_oil_eur",
+        "affected_models": "car_fuels|liquid_fuels",
+        "affected_files": "car_fuels_weekly.csv|liquid_fuels_weekly.csv",
+        "present_in_panels": 2,
+        "panel_targets": 2
+      },
+      {
+        "series": "refined_petroleum_eur",
+        "frequency": "weekly",
+        "aggregation": "Monday-Sunday mean of daily Bloomberg snapshot values",
+        "final_period_start": "2026-08-03",
+        "final_period_end": "2026-08-09",
+        "panel_label_date": "2026-08-10",
+        "label_shift_weeks": 1,
+        "final_period_input_observations": 4,
+        "expected_input_observations": 5,
+        "coverage_ratio": 0.8,
+        "final_period_complete": true,
+        "first_input_date": "2026-08-03",
+        "last_input_date": "2026-08-06",
+        "partial_mean": 771.2352938771265,
+        "last_input_value": 781.4663774403471,
+        "daily_innovation_var": 876.7685093437774,
+        "daily_logreturn_var": 0.00128482638938375,
+        "reference_periods_used": 24,
+        "panel_column": "refined_petroleum_eur",
+        "affected_models": "car_fuels",
+        "affected_files": "car_fuels_weekly.csv",
+        "present_in_panels": 1,
+        "panel_targets": 1
+      },
+      {
+        "series": "refined_diesel_eur",
+        "frequency": "weekly",
+        "aggregation": "Monday-Sunday mean of daily Bloomberg snapshot values",
+        "final_period_start": "2026-08-03",
+        "final_period_end": "2026-08-09",
+        "panel_label_date": "2026-08-10",
+        "label_shift_weeks": 1,
+        "final_period_input_observations": 4,
+        "expected_input_observations": 5,
+        "coverage_ratio": 0.8,
+        "final_period_complete": true,
+        "first_input_date": "2026-08-03",
+        "last_input_date": "2026-08-06",
+        "partial_mean": 136.55154797937854,
+        "last_input_value": 136.77022834884426,
+        "daily_innovation_var": 52.824636516023446,
+        "daily_logreturn_var": 0.002905136452386207,
+        "reference_periods_used": 24,
+        "panel_column": "refined_diesel_eur",
+        "affected_models": "car_fuels|liquid_fuels",
+        "affected_files": "car_fuels_weekly.csv|liquid_fuels_weekly.csv",
+        "present_in_panels": 2,
+        "panel_targets": 2
+      },
+      {
+        "series": "ttf_eur_mwh",
+        "frequency": "monthly",
+        "aggregation": "calendar-month mean of daily Bloomberg snapshot values",
+        "final_period_start": "2026-08-01",
+        "final_period_end": "2026-08-31",
+        "panel_label_date": "2026-08-01",
+        "label_shift_weeks": 0,
+        "final_period_input_observations": 4,
+        "expected_input_observations": 22,
+        "coverage_ratio": 0.1818,
+        "final_period_complete": false,
+        "first_input_date": "2026-08-03",
+        "last_input_date": "2026-08-06",
+        "partial_mean": 55.2475,
+        "last_input_value": 55.75,
+        "daily_innovation_var": 2.88652990123448,
+        "daily_logreturn_var": 0.001564962081375313,
+        "reference_periods_used": 24,
+        "panel_column": "natural_gas_eur_mwh",
+        "affected_models": "gas|electricity|heat_energy|solid_fuels",
+        "affected_files": "gas_monthly.csv|electricity_monthly.csv|heat_energy_monthly.csv|solid_fuels_monthly.csv",
+        "present_in_panels": 4,
+        "panel_targets": 4
+      },
+      {
+        "series": "eurusd",
+        "frequency": "monthly",
+        "aggregation": "calendar-month mean of daily Bloomberg snapshot values",
+        "final_period_start": "2026-08-01",
+        "final_period_end": "2026-08-31",
+        "panel_label_date": "2026-08-01",
+        "label_shift_weeks": 0,
+        "final_period_input_observations": 4,
+        "expected_input_observations": 22,
+        "coverage_ratio": 0.1818,
+        "final_period_complete": false,
+        "first_input_date": "2026-08-03",
+        "last_input_date": "2026-08-06",
+        "partial_mean": 1.1529500000000001,
+        "last_input_value": 1.1525,
+        "daily_innovation_var": 2.537709987662427e-05,
+        "daily_logreturn_var": 2.022335750489435e-05,
+        "reference_periods_used": 24,
+        "panel_column": null,
+        "affected_models": "",
+        "affected_files": "",
+        "present_in_panels": 0,
+        "panel_targets": 0
+      }
+    ]
+  },
+  "models": {
+    "car_fuels": {
+      "file": "car_fuels_weekly.csv",
+      "frequency": "weekly",
+      "lags": 24,
+      "columns": [
+        "wob_petrol_pre_tax",
+        "wob_diesel_pre_tax",
+        "crude_oil_eur",
+        "refined_petroleum_eur",
+        "refined_diesel_eur"
+      ],
+      "equations": {
+        "petrol": [
+          "wob_petrol_pre_tax",
+          "crude_oil_eur",
+          "refined_petroleum_eur"
+        ],
+        "diesel": [
+          "wob_diesel_pre_tax",
+          "crude_oil_eur",
+          "refined_diesel_eur"
+        ]
+      },
+      "target_columns": [
+        "wob_petrol_pre_tax",
+        "wob_diesel_pre_tax"
+      ],
+      "units": {
+        "wob_petrol_pre_tax": "EUR/1000L",
+        "wob_diesel_pre_tax": "EUR/1000L",
+        "crude_oil_eur": "EUR/barrel",
+        "refined_petroleum_eur": "EUR/metric tonne",
+        "refined_diesel_eur": "EUR/barrel"
+      },
+      "path": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\data\\processed\\20260816\\car_fuels_weekly.csv",
+      "rows": 1128,
+      "first_date": "2005-01-03",
+      "last_date": "2026-08-10"
+    },
+    "liquid_fuels": {
+      "file": "liquid_fuels_weekly.csv",
+      "frequency": "weekly",
+      "lags": 24,
+      "columns": [
+        "wob_heating_oil_pre_tax",
+        "crude_oil_eur",
+        "refined_diesel_eur"
+      ],
+      "equations": {
+        "liquid_fuels": [
+          "wob_heating_oil_pre_tax",
+          "crude_oil_eur",
+          "refined_diesel_eur"
+        ]
+      },
+      "target_columns": [
+        "wob_heating_oil_pre_tax"
+      ],
+      "units": {
+        "wob_heating_oil_pre_tax": "EUR/1000L",
+        "crude_oil_eur": "EUR/barrel",
+        "refined_diesel_eur": "EUR/barrel"
+      },
+      "path": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\data\\processed\\20260816\\liquid_fuels_weekly.csv",
+      "rows": 1128,
+      "first_date": "2005-01-03",
+      "last_date": "2026-08-10"
+    },
+    "gas": {
+      "file": "gas_monthly.csv",
+      "frequency": "monthly",
+      "lags": 12,
+      "columns": [
+        "gas_pre_tax",
+        "natural_gas_eur_mwh"
+      ],
+      "equations": {
+        "gas": [
+          "gas_pre_tax",
+          "natural_gas_eur_mwh"
+        ]
+      },
+      "target_columns": [
+        "gas_pre_tax"
+      ],
+      "units": {
+        "gas_pre_tax": "EUR/MWh",
+        "natural_gas_eur_mwh": "EUR/MWh"
+      },
+      "path": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\data\\processed\\20260816\\gas_monthly.csv",
+      "rows": 278,
+      "first_date": "2003-07-01",
+      "last_date": "2026-08-01"
+    },
+    "electricity": {
+      "file": "electricity_monthly.csv",
+      "frequency": "monthly",
+      "lags": 12,
+      "columns": [
+        "electricity_pre_tax",
+        "natural_gas_eur_mwh"
+      ],
+      "equations": {
+        "electricity": [
+          "electricity_pre_tax",
+          "natural_gas_eur_mwh"
+        ]
+      },
+      "seasonal_dummies": true,
+      "target_columns": [
+        "electricity_pre_tax"
+      ],
+      "units": {
+        "electricity_pre_tax": "EUR/kWh",
+        "natural_gas_eur_mwh": "EUR/MWh"
+      },
+      "path": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\data\\processed\\20260816\\electricity_monthly.csv",
+      "rows": 278,
+      "first_date": "2003-07-01",
+      "last_date": "2026-08-01"
+    },
+    "heat_energy": {
+      "file": "heat_energy_monthly.csv",
+      "frequency": "monthly",
+      "lags": 12,
+      "columns": [
+        "hicp_heat_energy",
+        "natural_gas_eur_mwh",
+        "ppi_energy"
+      ],
+      "equations": {
+        "heat_energy": [
+          "hicp_heat_energy",
+          "natural_gas_eur_mwh",
+          "ppi_energy"
+        ]
+      },
+      "target_columns": [
+        "hicp_heat_energy"
+      ],
+      "path": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\data\\processed\\20260816\\heat_energy_monthly.csv",
+      "rows": 368,
+      "first_date": "1996-01-01",
+      "last_date": "2026-08-01"
+    },
+    "solid_fuels": {
+      "file": "solid_fuels_monthly.csv",
+      "frequency": "monthly",
+      "lags": 12,
+      "columns": [
+        "hicp_solid_fuels",
+        "natural_gas_eur_mwh",
+        "ppi_energy"
+      ],
+      "equations": {
+        "solid_fuels": [
+          "hicp_solid_fuels",
+          "natural_gas_eur_mwh",
+          "ppi_energy"
+        ]
+      },
+      "target_columns": [
+        "hicp_solid_fuels"
+      ],
+      "path": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\data\\processed\\20260816\\solid_fuels_monthly.csv",
+      "rows": 380,
+      "first_date": "1995-01-01",
+      "last_date": "2026-08-01"
+    }
+  },
+  "headline_joint_model": {
+    "file": "headline_joint_monthly.csv",
+    "frequency": "monthly",
+    "lags": 12,
+    "comparison_lags": [
+      6,
+      12
+    ],
+    "columns": [
+      "hicp_energy",
+      "hicp_food",
+      "hicp_neig",
+      "hicp_services"
+    ],
+    "equations": {
+      "headline_joint": [
+        "hicp_energy",
+        "hicp_food",
+        "hicp_neig",
+        "hicp_services"
+      ]
+    },
+    "target_columns": [
+      "hicp_energy",
+      "hicp_food",
+      "hicp_neig",
+      "hicp_services"
+    ],
+    "transformations": {
+      "hicp_energy": "logdiff",
+      "hicp_food": "logdiff",
+      "hicp_neig": "logdiff",
+      "hicp_services": "logdiff"
+    },
+    "baseline": "dense BVAR(12)",
+    "sensitivity": "dense BVAR(6) only",
+    "source_contract": {
+      "hicp_energy": "Eurostat NRG",
+      "hicp_food": "Eurostat FOOD",
+      "hicp_neig": "Eurostat IGD_NNRG",
+      "hicp_services": "Eurostat SERV",
+      "food_weight": "Eurostat FOOD_NP + FOOD_P"
+    },
+    "path": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\data\\processed\\20260816\\headline_joint_monthly.csv",
+    "rows": 320,
+    "first_date": "1999-12-01",
+    "last_date": "2026-07-01",
+    "annual_weights_path": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\data\\processed\\20260816\\headline_joint_weights_annual.csv"
+  },
+  "auxiliary_outputs": {
+    "diagnostics": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\data\\processed\\20260816\\model_datasets_diagnostics.csv",
+    "source_vintages": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\data\\processed\\20260816\\source_vintages.csv",
+    "aggregation_coverage": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\data\\processed\\20260816\\aggregation_coverage.csv",
+    "partial_period_inputs": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\data\\processed\\20260816\\partial_period_inputs.csv",
+    "source_context_haver": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\data\\processed\\20260816\\source_context_haver.csv",
+    "source_context_european_commission": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\data\\processed\\20260816\\source_context_european_commission.csv",
+    "source_context_eurostat": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\data\\processed\\20260816\\source_context_eurostat_energy.csv",
+    "hicp_indices_monthly": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\data\\processed\\20260816\\hicp_indices_monthly.csv",
+    "hicp_weights_annual": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\data\\processed\\20260816\\hicp_weights_annual.csv",
+    "hicp_series_metadata": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\data\\processed\\20260816\\hicp_series_metadata.csv",
+    "hicp_flags": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\data\\processed\\20260816\\hicp_flags.csv",
+    "hicp_weight_identity_diagnostics": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\data\\processed\\20260816\\hicp_weight_identity_diagnostics.csv",
+    "hicp_validation_failures": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\data\\processed\\20260816\\hicp_validation_failures.csv",
+    "wob_hicp_mapping_diagnostics": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\data\\processed\\20260816\\wob_hicp_mapping_diagnostics.csv",
+    "headline_hicp_indices_monthly": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\data\\processed\\20260816\\headline_hicp_indices_monthly.csv",
+    "headline_hicp_weights_annual": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\data\\processed\\20260816\\headline_hicp_weights_annual.csv",
+    "headline_hicp_weight_identity_diagnostics": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\data\\processed\\20260816\\headline_hicp_weight_identity_diagnostics.csv",
+    "headline_joint_weights_annual": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\data\\processed\\20260816\\headline_joint_weights_annual.csv",
+    "headline_joint_weight_identity_diagnostics": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\data\\processed\\20260816\\headline_joint_weight_identity_diagnostics.csv"
+  },
+  "output_sha256": {
+    "car_fuels": "57c426a5d22a0a56a3f49adc6cdd7a5c50fff4e998308300b6d9f0d39b18cd6f",
+    "liquid_fuels": "a46a57d53e6b469b7d0d7bb85b5e39cec71ac2d3054cf2cd2f56b66f186df501",
+    "gas": "a905dec77abdafa15446205870f51c49dddc15c82319c8547d52f9bfc30321b4",
+    "electricity": "e1a3ba78cb1be887d590c4f66653bb7496a55c141e0790f08e3f344bbd793afc",
+    "heat_energy": "1b9a76057d9e8d24eb59faaf1676e405855306f57be1b2f57d1b77528f1c940b",
+    "solid_fuels": "339e05d310d4739dd46b7f089bdcd839b29368d909a0c56a2f06502c91a5d18b",
+    "headline_joint": "bf6777a7eba0e49f97b52af0f057ae1a6e24d538129ab469279457d2d5fc7ad1",
+    "diagnostics": "759b68f00a0989cf75fe6f13e7ed6a95c083ef5d01f54b933ad455037b9dae13",
+    "source_vintages": "c43472cc66640af744146546c3ae8deded873d3eb416e9451b9eee2ec2bcfa1e",
+    "aggregation_coverage": "1bd3b8976f047a82d51b177384e213014a7f22a6f1d890b98008e91af1cd8f63",
+    "partial_period_inputs": "400e785781218bcc24179d324f32050a613b59347bc95bf15a406ce496eefe22",
+    "source_context_haver": "1dab5dd2b7c30301a574fbc66baaa1367bcd441bf735c6a424bde58b2df683d5",
+    "source_context_european_commission": "577f7a244160c5e65980a1ca4fbf6372e95c0155ff1952b2c113e281057c7e4f",
+    "source_context_eurostat": "cf5e9cc28f8b1585792ab8ce3cb9b9805db9db87b6e2053d4bb6ac9db68900d5",
+    "hicp_indices_monthly": "1b76a01aa8d0518b413c8c17d68a1da3a36a20922e8ec484d0e1dffb77d8aa3b",
+    "hicp_weights_annual": "f3b35f74a245b569416176b1bde2226ebc84a8b7925110beb4f368f7916dc4b1",
+    "hicp_series_metadata": "3d6db93c1433208e5d0cb12a3bce7a7b3dbb75aef408232a625ab43e9136d784",
+    "hicp_flags": "0f351546e15a59cc0d1716f521130a20b8429e02b33ec8b21b61f73d2dd19f54",
+    "hicp_weight_identity_diagnostics": "b65be9aaf991476f855c2a6ea1130504c12fb7bbd74d8380f28965c48f37d671",
+    "hicp_validation_failures": "835b0564e279ce888697489442e3c911f787f15f7a8a566d23d90c1fe513554a",
+    "wob_hicp_mapping_diagnostics": "0d6b7bcf4ff0e226c9afbaad052d1c0ce564ae4e27618738b728c27d98596348",
+    "headline_hicp_indices_monthly": "913d0582a8b9a79f4464469d93e2689e10fb4ce075d0867addaddb33d68c6642",
+    "headline_hicp_weights_annual": "3f7a4dce76b007d8b933e72d21bac430d4c4aa628c6facccd01998664a880a4b",
+    "headline_hicp_weight_identity_diagnostics": "d64560ad605a37cc4021e4b02478de946c323ded75275fe6c24263925cfe1ecf",
+    "headline_joint_weights_annual": "2618b7d00c2e0a38a6ed2b7ed67078e5499ac61a6f321fd4f14aafa7de5ed8c4",
+    "headline_joint_weight_identity_diagnostics": "094d19ef56a8d82df961ec18e4a2c0c33f64c466f932f50410601a3ad9cfd59b"
+  }
+}

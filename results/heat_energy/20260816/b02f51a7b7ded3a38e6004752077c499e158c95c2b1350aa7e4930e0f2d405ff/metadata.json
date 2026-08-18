@@ -1,0 +1,82 @@
+{
+  "model_id": "heat_energy",
+  "vintage": "20260816",
+  "data_hash": "ffd7436d06438369681014d1c91943e3557535ccc134c2bd8ea0f57fc2e4a969",
+  "config_hash": "8a8c118df61c27eb43fb22455de998ebb5297be208bdb1720e76d5b6dcd0870d",
+  "code_version": "energy_bvar_model-v4-calendar-prior-missing-selectable",
+  "seed": 42,
+  "run_id": "b02f51a7b7ded3a38e6004752077c499e158c95c2b1350aa7e4930e0f2d405ff",
+  "result_schema_version": "1.2",
+  "prior_implementation_version": "2026-08-17-frequency-aware-outlier-scale-normalised-A-v2",
+  "prior_config": {
+    "lambda1": 0.2,
+    "lambda2": 0.5,
+    "lambda3": 1.0,
+    "lambda4": 10.0,
+    "a_prior_var": 10.0,
+    "phi_prior_mean": 0.02,
+    "phi_prior_df": 10.0,
+    "h0_var": 4.0,
+    "outlier_mean_frequency": 0.020833333333333332,
+    "outlier_prior_observations": 120.0,
+    "outlier_grid_min": 2.0,
+    "outlier_grid_max": 20.0,
+    "outlier_grid_step": 1.0,
+    "ksc_offset_scale": 1e-06,
+    "ksc_offset_floor": 1e-12
+  },
+  "frequency": "monthly",
+  "outlier_period_unit": "months",
+  "outlier_mean_interval_periods": 48.0,
+  "outlier_mean_interval_years": 4.0,
+  "outlier_prior_observations": 120.0,
+  "outlier_prior_strength_years": 10.0,
+  "calendar_rule": "MS",
+  "missing_data_method": "linear",
+  "missing_treatment_exact": true,
+  "source_data_hash": "ffd7436d06438369681014d1c91943e3557535ccc134c2bd8ea0f57fc2e4a969",
+  "effective_estimation_data_hash": "ffd7436d06438369681014d1c91943e3557535ccc134c2bd8ea0f57fc2e4a969",
+  "variables": [
+    "natural_gas_wholesale",
+    "ppi_energy",
+    "hicp_heat_energy"
+  ],
+  "exog_names": [],
+  "exog_prior_scale": null,
+  "p": 12,
+  "n_observations": 368,
+  "created_at_utc": "2026-08-18T05:01:24.000613+00:00",
+  "data_augmentation": "none",
+  "missing_data_approximation_used": false,
+  "interpolated_level_cells": 0,
+  "interpolated_dates": 0,
+  "requires_data_augmentation": false,
+  "interior_missing_dates": 0,
+  "interior_missing_level_cells": 0,
+  "dk_projection_mode": "strict",
+  "dk_projection_diagnostics": null,
+  "a_prior_scale_normalized": true,
+  "a_prior_variance_standardized": 10.0,
+  "ar1_residual_scales": {
+    "natural_gas_wholesale": 10.741775592170574,
+    "ppi_energy": 0.8435923479718127,
+    "hicp_heat_energy": 1.395258684537312
+  },
+  "a_prior_effective_variances": [
+    [
+      null,
+      null,
+      null
+    ],
+    [
+      0.06167556162832369,
+      null,
+      null
+    ],
+    [
+      0.16871640709780378,
+      27.355471542284747,
+      null
+    ]
+  ]
+}

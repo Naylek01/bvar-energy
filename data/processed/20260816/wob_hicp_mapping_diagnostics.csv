@@ -1,0 +1,3 @@
+wob_series,wob_column,expected_hicp_series,cross_hicp_series,observations_own,observations_cross,own_log_change_correlation,cross_log_change_correlation,own_minus_cross_margin,status
+petrol,wob_petroleum_cpr_wtax,hicp_petrol,hicp_diesel,114,114,0.9909795774321833,0.8753479558665607,0.11563162156562268,pass
+diesel,wob_diesel_cpr_wtax,hicp_diesel,hicp_petrol,114,114,0.9927796057502137,0.8590284005352323,0.1337512052149814,pass

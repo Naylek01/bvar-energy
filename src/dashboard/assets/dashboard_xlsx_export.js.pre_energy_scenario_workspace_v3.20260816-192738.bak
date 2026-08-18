@@ -1,0 +1,307 @@
+(function () {
+  "use strict";
+
+  // TABLE-ONLY XLSX export contract.
+  // Plotly graphs keep their native Plotly controls (including PNG) and never
+  // receive a dashboard XLSX button.
+  const EXPORT_URL = "/_dashboard/export-xlsx";
+  const BUTTON_CLASS = "dashboard-xlsx-export-button";
+  const OUTLOOK_ID = "overview-outlook-table";
+
+  function vintage() {
+    const node = document.getElementById("xlsx-export-vintage");
+    return node ? String(node.textContent || "").trim() : "";
+  }
+
+  function filenameFromDisposition(header) {
+    const match = /filename="?([^";]+)"?/i.exec(header || "");
+    return match ? match[1] : "dashboard_table.xlsx";
+  }
+
+  async function downloadTable(payload, button) {
+    const original = button.textContent;
+    button.disabled = true;
+    button.textContent = "… XLSX";
+    try {
+      const response = await fetch(EXPORT_URL, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(payload),
+      });
+      if (!response.ok) throw new Error(await response.text());
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filenameFromDisposition(
+        response.headers.get("Content-Disposition")
+      );
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (error) {
+      console.error("Dashboard table XLSX export failed", error);
+      window.alert("XLSX table export failed: " + error.message);
+    } finally {
+      button.disabled = false;
+      button.textContent = original;
+    }
+  }
+
+  function makeButton(title) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = BUTTON_CLASS;
+    button.textContent = "↓ XLSX";
+    button.title = title;
+    Object.assign(button.style, {
+      border: "1px solid #D2D0D1",
+      borderRadius: "7px",
+      background: "rgba(255,255,255,.96)",
+      color: "#3A3D40",
+      fontFamily: "Inter, Segoe UI, sans-serif",
+      fontSize: "10px",
+      fontWeight: "700",
+      padding: "4px 9px",
+      cursor: "pointer",
+      boxShadow: "0 1px 3px rgba(0,0,0,.06)",
+      whiteSpace: "nowrap",
+    });
+    return button;
+  }
+
+  function tableTitle(table, fallback) {
+    const panel = table.closest(".panel") || table.parentElement;
+    if (panel) {
+      const heading = panel.querySelector(".panel-title, h3, h2");
+      if (heading && String(heading.textContent || "").trim()) {
+        return String(heading.textContent || "").trim();
+      }
+    }
+    return fallback || table.id || "Dashboard table";
+  }
+
+  function attachLiteralTable(table) {
+    if (!table || table.dataset.xlsxTableAttached === "1") return;
+    if (table.closest(".dash-table-container")) return;
+    table.dataset.xlsxTableAttached = "1";
+
+    const root = table.parentElement;
+    if (!root) return;
+    if (!root.style.position || root.style.position === "static") {
+      root.style.position = "relative";
+    }
+
+    const button = makeButton("Download this table as XLSX");
+    button.dataset.tableXlsx = "1";
+    Object.assign(button.style, {
+      position: "absolute",
+      right: "6px",
+      top: "6px",
+      zIndex: "30",
+    });
+    button.addEventListener("click", function (event) {
+      event.preventDefault();
+      event.stopPropagation();
+      const matrix = Array.from(table.querySelectorAll("tr")).map((row) =>
+        Array.from(row.querySelectorAll("th,td")).map((cell) =>
+          String(cell.innerText || cell.textContent || "").trim()
+        )
+      );
+      if (!matrix.length) return;
+      const title = tableTitle(
+        table,
+        table.id || "Dashboard table"
+      );
+      downloadTable({
+        vintage: vintage(),
+        table_id: table.id || (
+          root.id ? root.id + "-table" : "table"
+        ),
+        title: title,
+        table: {
+          headers: matrix[0] || [],
+          rows: matrix.slice(1),
+        },
+      }, button);
+    });
+    root.appendChild(button);
+  }
+
+  function outlookGridRows(root) {
+    const candidates = Array.from(root.querySelectorAll("*")).filter((node) => {
+      const style = window.getComputedStyle(node);
+      if (style.display !== "grid") return false;
+      const children = Array.from(node.children || []);
+      if (children.length < 6) return false;
+      const rect = node.getBoundingClientRect();
+      return rect.width > 50 && rect.height > 8;
+    });
+
+    const rows = [];
+    const seen = new Set();
+    candidates.forEach((node) => {
+      const cells = Array.from(node.children || []).map((cell) =>
+        String(cell.innerText || cell.textContent || "")
+          .replace(/\u00a0/g, " ")
+          .replace(/[ \t]+\n/g, "\n")
+          .trim()
+      );
+      if (cells.filter(Boolean).length < 2) return;
+      const key = JSON.stringify(cells);
+      if (seen.has(key)) return;
+      seen.add(key);
+      rows.push({
+        top: node.getBoundingClientRect().top,
+        cells: cells,
+      });
+    });
+    rows.sort((a, b) => a.top - b.top);
+    return rows.map((item) => item.cells);
+  }
+
+  function outlookGeometryFallback(root) {
+    const leaves = Array.from(root.querySelectorAll("*"))
+      .filter((node) => {
+        if (node.children && node.children.length) return false;
+        if (node.closest("button")) return false;
+        const text = String(node.textContent || "").trim();
+        if (!text) return false;
+        const style = window.getComputedStyle(node);
+        if (
+          style.display === "none"
+          || style.visibility === "hidden"
+        ) return false;
+        const rect = node.getBoundingClientRect();
+        return rect.width > 1 && rect.height > 1;
+      })
+      .map((node) => {
+        const rect = node.getBoundingClientRect();
+        return {
+          text: String(node.textContent || "")
+            .replace(/\u00a0/g, " ")
+            .trim(),
+          top: rect.top,
+          left: rect.left,
+        };
+      })
+      .sort((a, b) => (a.top - b.top) || (a.left - b.left));
+
+    const groups = [];
+    leaves.forEach((item) => {
+      let group = groups.find(
+        (candidate) => Math.abs(candidate.top - item.top) <= 3
+      );
+      if (!group) {
+        group = {top: item.top, items: []};
+        groups.push(group);
+      }
+      group.items.push(item);
+    });
+
+    return groups
+      .sort((a, b) => a.top - b.top)
+      .map((group) =>
+        group.items
+          .sort((a, b) => a.left - b.left)
+          .map((item) => item.text)
+      )
+      .filter((row) => row.length >= 2);
+  }
+
+  function extractOutlookMatrix(root) {
+    const grid = outlookGridRows(root);
+    return grid.length >= 2
+      ? grid
+      : outlookGeometryFallback(root);
+  }
+
+  function attachOutlookTable() {
+    const root = document.getElementById(OUTLOOK_ID);
+    if (!root || root.dataset.xlsxTableAttached === "1") return;
+    root.dataset.xlsxTableAttached = "1";
+
+    const panel = root.closest(".panel") || root.parentElement;
+    if (!panel) return;
+    const heading = (
+      panel.querySelector(".page-heading-row, .panel-heading")
+      || panel
+    );
+    if (heading.querySelector('[data-outlook-xlsx="1"]')) return;
+
+    const button = makeButton(
+      "Download Inflation Outlook as XLSX"
+    );
+    button.dataset.outlookXlsx = "1";
+    button.dataset.tableXlsx = "1";
+    Object.assign(button.style, {
+      marginLeft: "auto",
+      alignSelf: "center",
+    });
+    button.addEventListener("click", function (event) {
+      event.preventDefault();
+      event.stopPropagation();
+      const matrix = extractOutlookMatrix(root);
+      if (!matrix.length) {
+        window.alert("Inflation Outlook table is not ready yet.");
+        return;
+      }
+      downloadTable({
+        vintage: vintage(),
+        table_id: OUTLOOK_ID,
+        title: "Inflation Outlook",
+        table: {
+          headers: matrix[0] || [],
+          rows: matrix.slice(1),
+        },
+      }, button);
+    });
+    heading.appendChild(button);
+  }
+
+  function restorePlotlyPngAndRemoveLegacyGraphXlsx() {
+    document.querySelectorAll("." + BUTTON_CLASS).forEach((button) => {
+      if (button.dataset.tableXlsx === "1") return;
+      const parent = button.parentElement;
+      if (
+        parent
+        && parent.querySelector(".js-plotly-plot")
+      ) {
+        button.remove();
+      }
+    });
+
+    document.querySelectorAll(
+      '.modebar-btn[data-title*="Download plot"], '
+      + '.modebar-btn[data-title*="png" i]'
+    ).forEach((node) => node.style.removeProperty("display"));
+
+    document.querySelectorAll("style").forEach((node) => {
+      const text = String(node.textContent || "");
+      if (
+        text.includes(
+          '.modebar-btn[data-title*="Download plot"]'
+        )
+        && text.includes("display:none")
+      ) {
+        node.remove();
+      }
+    });
+  }
+
+  function scan() {
+    restorePlotlyPngAndRemoveLegacyGraphXlsx();
+    document.querySelectorAll("table").forEach(attachLiteralTable);
+    attachOutlookTable();
+  }
+
+  const observer = new MutationObserver(scan);
+  observer.observe(
+    document.documentElement,
+    {childList: true, subtree: true}
+  );
+  window.addEventListener("load", scan);
+  document.addEventListener("DOMContentLoaded", scan);
+  window.setInterval(scan, 1500);
+})();

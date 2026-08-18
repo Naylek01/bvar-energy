@@ -1,0 +1,4 @@
+,total_draws,retained_draws,rejected_draws,rejection_rate,distribution_interpretation,invalid_draws_baseline_output,invalid_draws_scenario_output,invalid_draws_pre_tax_weekly,invalid_draws_baseline_after_tax_weekly,invalid_draws_scenario_after_tax_weekly
+petrol,500,484,16,0.032,posterior predictive conditional on all supplied price paths being finite and strictly positive,4,4,16,5,5
+diesel,500,487,13,0.026,posterior predictive conditional on all supplied price paths being finite and strictly positive,1,1,13,1,1
+liquid_fuels,500,481,19,0.038,posterior predictive conditional on all supplied price paths being finite and strictly positive,5,5,19,10,10

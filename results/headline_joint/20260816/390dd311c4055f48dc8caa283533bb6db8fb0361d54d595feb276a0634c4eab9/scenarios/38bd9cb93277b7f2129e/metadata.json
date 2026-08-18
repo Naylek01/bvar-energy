@@ -1,0 +1,97 @@
+{
+  "scenario_contract_version": "headline-conditional-v2",
+  "headline_vintage": "20260816",
+  "headline_run_id": "390dd311c4055f48dc8caa283533bb6db8fb0361d54d595feb276a0634c4eab9",
+  "condition_variables": [
+    "hicp_energy"
+  ],
+  "condition_dates": [
+    "2026-08-01T00:00:00",
+    "2026-09-01T00:00:00",
+    "2026-10-01T00:00:00"
+  ],
+  "condition_values": {
+    "hicp_energy": [
+      113.19131844063283,
+      116.98968714547931,
+      121.8746653652337
+    ]
+  },
+  "condition_horizon": 3,
+  "computational_horizon": 12,
+  "n_draws": 1000,
+  "forecast_seed": 2026,
+  "simulate_future_outliers": true,
+  "paired_baseline_conditional": true,
+  "persisted_baseline_bit_identical": true,
+  "bvar_reestimated": false,
+  "lineage_verification_status": "verified_at_estimation",
+  "publication_horizon_max_months": 12,
+  "source_type": "energy_scenario",
+  "energy_vintage": "20260816",
+  "energy_aggregate_run_id": "f83d1b28a3ad4ee8dcca",
+  "energy_forecast_name": "unconditional",
+  "energy_scenario_signature": {
+    "model_id": "gas",
+    "condition_variable": "natural_gas_wholesale",
+    "path_mode": "percent",
+    "path_value": 10
+  },
+  "energy_scenario_components": [
+    "gas"
+  ],
+  "condition_statistic": "p99",
+  "condition_statistic_label": "Pointwise percentile P99",
+  "energy_percentile_contract": "pointwise_direct_from_energy_aggregate_draws",
+  "energy_path_uncertainty_propagated": false,
+  "energy_transfer_method": "mom_growth_reanchored_on_headline_energy",
+  "headline_energy_anchor_date": "2026-07-01T00:00:00",
+  "headline_energy_anchor_level": 109.55,
+  "energy_gross_growth": [
+    1.033238872118967,
+    1.0335570674250842,
+    1.0417556311068668
+  ],
+  "energy_headline_ratio_diagnostic": {
+    "windows": {
+      "12": {
+        "available": true,
+        "observations": 12,
+        "start": "2025-07-01T00:00:00",
+        "end": "2026-06-01T00:00:00",
+        "median_ratio": 1.0000131118718205,
+        "max_relative_ratio_drift": 4.964767795079261e-05,
+        "max_relative_ratio_drift_percent": 0.004964767795079261
+      },
+      "24": {
+        "available": true,
+        "observations": 24,
+        "start": "2024-07-01T00:00:00",
+        "end": "2026-06-01T00:00:00",
+        "median_ratio": 1.0000022707326053,
+        "max_relative_ratio_drift": 5.994665728858983e-05,
+        "max_relative_ratio_drift_percent": 0.005994665728858983
+      },
+      "36": {
+        "available": true,
+        "observations": 36,
+        "start": "2023-07-01T00:00:00",
+        "end": "2026-06-01T00:00:00",
+        "median_ratio": 1.0000022707326053,
+        "max_relative_ratio_drift": 6.124189320799722e-05,
+        "max_relative_ratio_drift_percent": 0.006124189320799722
+      }
+    },
+    "max_drift_across_available_windows": 6.124189320799722e-05,
+    "pathological_threshold": 0.02,
+    "pathological_flag": false
+  },
+  "energy_application_mode": "selected",
+  "energy_scenario_selection_id": "conditional::gas",
+  "energy_headline_bridge_rebuilt_on_apply": false,
+  "condition_metric": "level",
+  "condition_variable": "hicp_energy",
+  "headline_observed_anchor_date": "2026-07-01T00:00:00",
+  "headline_observed_anchor_yoy": 2.921527570046867,
+  "scenario_id": "38bd9cb93277b7f2129e"
+}

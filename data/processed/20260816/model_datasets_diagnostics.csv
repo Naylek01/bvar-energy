@@ -1,0 +1,31 @@
+diagnostic_type,model,equation,output_file,frequency,lags_in_paper,series,observations,first_date,last_date,missing_values,internal_gaps,leading_missing,trailing_missing,coverage_percent,balanced_level_observations,balanced_difference_observations,usable_after_difference_and_lags,usable_edge_only_upper_bound,rows_lost_to_interior_gaps
+series,car_fuels,,car_fuels_weekly.csv,weekly,24,wob_petrol_pre_tax,1079,2005-01-03,2026-08-10,49,49,0.0,0.0,95.66,,,,,
+series,car_fuels,,car_fuels_weekly.csv,weekly,24,wob_diesel_pre_tax,1079,2005-01-03,2026-08-10,49,49,0.0,0.0,95.66,,,,,
+series,car_fuels,,car_fuels_weekly.csv,weekly,24,crude_oil_eur,1128,2005-01-03,2026-08-10,0,0,0.0,0.0,100.0,,,,,
+series,car_fuels,,car_fuels_weekly.csv,weekly,24,refined_petroleum_eur,923,2008-12-08,2026-08-10,205,0,205.0,0.0,81.83,,,,,
+series,car_fuels,,car_fuels_weekly.csv,weekly,24,refined_diesel_eur,1128,2005-01-03,2026-08-10,0,0,0.0,0.0,100.0,,,,,
+equation_sample,car_fuels,petrol,car_fuels_weekly.csv,weekly,24,wob_petrol_pre_tax | crude_oil_eur | refined_petroleum_eur,885,2008-12-08,2026-08-10,243,243,,,78.46,885.0,855.0,338.0,831.0,493.0
+equation_sample,car_fuels,diesel,car_fuels_weekly.csv,weekly,24,wob_diesel_pre_tax | crude_oil_eur | refined_diesel_eur,1079,2005-01-03,2026-08-10,49,49,,,95.66,1079.0,1041.0,377.0,1017.0,640.0
+series,liquid_fuels,,liquid_fuels_weekly.csv,weekly,24,wob_heating_oil_pre_tax,1079,2005-01-03,2026-08-10,49,49,0.0,0.0,95.66,,,,,
+series,liquid_fuels,,liquid_fuels_weekly.csv,weekly,24,crude_oil_eur,1128,2005-01-03,2026-08-10,0,0,0.0,0.0,100.0,,,,,
+series,liquid_fuels,,liquid_fuels_weekly.csv,weekly,24,refined_diesel_eur,1128,2005-01-03,2026-08-10,0,0,0.0,0.0,100.0,,,,,
+equation_sample,liquid_fuels,liquid_fuels,liquid_fuels_weekly.csv,weekly,24,wob_heating_oil_pre_tax | crude_oil_eur | refined_diesel_eur,1079,2005-01-03,2026-08-10,49,49,,,95.66,1079.0,1041.0,377.0,1017.0,640.0
+series,gas,,gas_monthly.csv,monthly,12,gas_pre_tax,276,2003-07-01,2026-06-01,2,0,0.0,2.0,99.28,,,,,
+series,gas,,gas_monthly.csv,monthly,12,natural_gas_eur_mwh,278,2003-07-01,2026-08-01,0,0,0.0,0.0,100.0,,,,,
+equation_sample,gas,gas,gas_monthly.csv,monthly,12,gas_pre_tax | natural_gas_eur_mwh,276,2003-07-01,2026-06-01,2,2,,,99.28,276.0,275.0,263.0,263.0,0.0
+series,electricity,,electricity_monthly.csv,monthly,12,electricity_pre_tax,276,2003-07-01,2026-06-01,2,0,0.0,2.0,99.28,,,,,
+series,electricity,,electricity_monthly.csv,monthly,12,natural_gas_eur_mwh,278,2003-07-01,2026-08-01,0,0,0.0,0.0,100.0,,,,,
+equation_sample,electricity,electricity,electricity_monthly.csv,monthly,12,electricity_pre_tax | natural_gas_eur_mwh,276,2003-07-01,2026-06-01,2,2,,,99.28,276.0,275.0,263.0,263.0,0.0
+series,heat_energy,,heat_energy_monthly.csv,monthly,12,hicp_heat_energy,366,1996-01-01,2026-06-01,2,0,0.0,2.0,99.46,,,,,
+series,heat_energy,,heat_energy_monthly.csv,monthly,12,natural_gas_eur_mwh,368,1996-01-01,2026-08-01,0,0,0.0,0.0,100.0,,,,,
+series,heat_energy,,heat_energy_monthly.csv,monthly,12,ppi_energy,318,2000-01-01,2026-06-01,50,0,48.0,2.0,86.41,,,,,
+equation_sample,heat_energy,heat_energy,heat_energy_monthly.csv,monthly,12,hicp_heat_energy | natural_gas_eur_mwh | ppi_energy,318,2000-01-01,2026-06-01,50,50,,,86.41,318.0,317.0,305.0,305.0,0.0
+series,solid_fuels,,solid_fuels_monthly.csv,monthly,12,hicp_solid_fuels,378,1995-01-01,2026-06-01,2,0,0.0,2.0,99.47,,,,,
+series,solid_fuels,,solid_fuels_monthly.csv,monthly,12,natural_gas_eur_mwh,380,1995-01-01,2026-08-01,0,0,0.0,0.0,100.0,,,,,
+series,solid_fuels,,solid_fuels_monthly.csv,monthly,12,ppi_energy,318,2000-01-01,2026-06-01,62,0,60.0,2.0,83.68,,,,,
+equation_sample,solid_fuels,solid_fuels,solid_fuels_monthly.csv,monthly,12,hicp_solid_fuels | natural_gas_eur_mwh | ppi_energy,318,2000-01-01,2026-06-01,62,62,,,83.68,318.0,317.0,305.0,305.0,0.0
+series,headline_joint,,headline_joint_monthly.csv,monthly,12,hicp_energy,320,1999-12-01,2026-07-01,0,0,0.0,0.0,100.0,,,,,
+series,headline_joint,,headline_joint_monthly.csv,monthly,12,hicp_food,320,1999-12-01,2026-07-01,0,0,0.0,0.0,100.0,,,,,
+series,headline_joint,,headline_joint_monthly.csv,monthly,12,hicp_neig,320,1999-12-01,2026-07-01,0,0,0.0,0.0,100.0,,,,,
+series,headline_joint,,headline_joint_monthly.csv,monthly,12,hicp_services,320,1999-12-01,2026-07-01,0,0,0.0,0.0,100.0,,,,,
+equation_sample,headline_joint,headline_joint,headline_joint_monthly.csv,monthly,12,hicp_energy | hicp_food | hicp_neig | hicp_services,320,1999-12-01,2026-07-01,0,0,,,100.0,320.0,319.0,307.0,307.0,0.0
