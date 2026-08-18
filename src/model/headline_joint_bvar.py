@@ -37,6 +37,7 @@ the first aggregation year and to validate historical reconstruction.
 """
 
 from __future__ import annotations
+CONDITIONAL_WINDOWS_HARMONIZED_V1_HEADLINE_JOINT = True
 
 from copy import deepcopy
 from dataclasses import asdict
@@ -463,27 +464,40 @@ def run_headline_joint_lag_comparison(
     return outputs
 
 
-def _native_conditions_to_state(
-    conditions: Mapping[str, float | Sequence[float]] | None,
-) -> dict[str, float | np.ndarray] | None:
+def _native_conditions_to_state(conditions: Mapping[str, float | Sequence[float]] | None, *, allow_partial_level_conditions: bool=False) -> dict[str, float | np.ndarray] | None:
+    """Map native HICP LEVEL conditions to log-state conditions.
+
+    Strict mode preserves the historical all-finite contract.
+
+    With ``allow_partial_level_conditions=True``, NaN marks an unconstrained
+    future period while finite entries remain hard positive HICP-level
+    observations. Infinities and all-NaN arrays are always rejected.
+    """
     if conditions is None:
         return None
     output: dict[str, float | np.ndarray] = {}
     for native_name, values in conditions.items():
         if native_name not in STATE_VARIABLE_MAP:
-            raise KeyError(
-                f"Unknown native condition variable {native_name!r}; choose from "
-                f"{NATIVE_VARIABLES}."
-            )
+            raise KeyError(f'Unknown native condition variable {native_name!r}; choose from {NATIVE_VARIABLES}.')
         arr = np.asarray(values, dtype=float)
-        if not np.all(np.isfinite(arr)):
-            raise ValueError(f"{native_name}: native conditions must be finite.")
-        if np.any(arr <= 0):
-            raise ValueError(f"{native_name}: HICP level conditions must be positive.")
+        if arr.ndim == 0:
+            if not np.isfinite(arr) or float(arr) <= 0:
+                raise ValueError(f'{native_name}: scalar HICP level condition must be finite and positive.')
+        elif allow_partial_level_conditions:
+            if np.isinf(arr).any():
+                raise ValueError(f'{native_name}: partial HICP level conditions cannot contain +/-inf.')
+            finite = np.isfinite(arr)
+            if not finite.any():
+                raise ValueError(f'{native_name}: partial HICP level condition must constrain at least one period.')
+            if np.any(arr[finite] <= 0):
+                raise ValueError(f'{native_name}: finite HICP level conditions must be positive.')
+        else:
+            if not np.all(np.isfinite(arr)):
+                raise ValueError(f'{native_name}: native conditions must be finite.')
+            if np.any(arr <= 0):
+                raise ValueError(f'{native_name}: HICP level conditions must be positive.')
         transformed = np.log(arr)
-        output[STATE_VARIABLE_MAP[native_name]] = (
-            float(transformed) if transformed.ndim == 0 else transformed
-        )
+        output[STATE_VARIABLE_MAP[native_name]] = float(transformed) if transformed.ndim == 0 else transformed
     return output
 
 

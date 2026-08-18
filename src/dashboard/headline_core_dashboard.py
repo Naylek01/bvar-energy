@@ -6,6 +6,7 @@ maintained Core chain-linking utilities.  Official Core history is Eurostat
 TOT_X_NRG_FOOD, currently loaded through ``headline_core``'s Python API/cache.
 """
 from __future__ import annotations
+CONDITIONAL_WINDOWS_HARMONIZED_V1_CORE_DASH = True
 
 from pathlib import Path
 
@@ -186,116 +187,7 @@ def core_forecast_page() -> html.Div:
 
 
 def core_scenarios_page() -> html.Div:
-    return html.Div(
-        [
-            dcc.Store(id="core-scenario-store", storage_type="session"),
-            html.Div(
-                [
-                    html.H2("Core conditional forecast", className="page-title"),
-                    html.P(
-                        "Condition NEIG and/or Services in the saved Headline BVAR. Core is then re-aggregated draw-by-draw. The computational horizon remains 12 months.",
-                        className="page-subtitle",
-                    ),
-                ]
-            ),
-            html.Div(
-                [
-                    html.Div(
-                        [
-                            html.Label("Condition horizon", className="selector-label"),
-                            dcc.Dropdown(
-                                id="core-scenario-horizon",
-                                options=[{"label": f"{h} months", "value": h} for h in HORIZONS],
-                                value=3,
-                                clearable=False,
-                            ),
-                        ],
-                        className="selector-block",
-                    ),
-                    html.Div(
-                        [
-                            html.Label("Input metric", className="selector-label"),
-                            dcc.Dropdown(
-                                id="core-scenario-metric",
-                                options=[
-                                    {"label": "Year-on-year (%)", "value": "yoy"},
-                                    {"label": "HICP level", "value": "level"},
-                                ],
-                                value="yoy",
-                                clearable=False,
-                            ),
-                        ],
-                        className="selector-block",
-                    ),
-                ],
-                className="chart-controls",
-            ),
-            html.Div(
-                [
-                    html.Div(
-                        [
-                            html.Label("NEIG path", className="selector-label"),
-                            dcc.Textarea(
-                                id="core-scenario-neig-values",
-                                placeholder="Enter H values separated by commas. Leave blank if unconstrained.",
-                                className="scenario-textarea",
-                            ),
-                        ],
-                        className="panel",
-                    ),
-                    html.Div(
-                        [
-                            html.Label("Services path", className="selector-label"),
-                            dcc.Textarea(
-                                id="core-scenario-services-values",
-                                placeholder="Enter H values separated by commas. Leave blank if unconstrained.",
-                                className="scenario-textarea",
-                            ),
-                        ],
-                        className="panel",
-                    ),
-                ],
-                className="two-column-grid",
-            ),
-            html.Div(
-                [
-                    html.Button("Run conditional forecast", id="core-scenario-run", n_clicks=0, className="refresh-button"),
-                    html.Button("Clear", id="core-scenario-clear", n_clicks=0, className="refresh-button"),
-                ],
-                style={"display": "flex", "gap": "10px", "marginTop": "12px"},
-            ),
-            html.Div(id="core-scenario-status", className="selection-banner"),
-            html.Div(
-                [
-                    html.Div([html.Div("Key scenario results", className="eyebrow"), html.H3("Core conditional effect by horizon", className="panel-title"), html.P("Baseline, conditional path and paired effect from the same frozen Core scenario draws.", className="panel-subtitle")], className="panel-heading"),
-                    readable_table("core-scenario-summary-table", PAIRED_EFFECT_COLUMNS, page_size=7),
-                ], className="panel table-panel",
-            ),
-            html.Div(
-                [
-                    html.Div("Baseline vs conditional", className="eyebrow"),
-                    html.H3("Core HICP — year-on-year", className="panel-title"),
-                    dcc.Loading(
-                        dcc.Graph(id="core-scenario-main", config=graph_config("core_scenario_main")),
-                        type="circle",
-                    ),
-                ],
-                className="panel chart-panel",
-            ),
-            html.Div(
-                [
-                    html.Div("Conditional impact", className="eyebrow"),
-                    html.H3("Conditional − baseline", className="panel-title"),
-                    dcc.Loading(
-                        dcc.Graph(id="core-scenario-impact", config=graph_config("core_scenario_impact")),
-                        type="circle",
-                    ),
-                ],
-                className="panel chart-panel",
-            ),
-        ],
-        className="page-body headline-page",
-    )
+    return html.Div([dcc.Store(id='core-scenario-store', storage_type='session'), html.Div([html.H2('Core conditional forecast', className='page-title'), html.P('Condition NEIG and/or Services in the saved Headline BVAR. Core is then re-aggregated draw-by-draw. The computational horizon remains 12 months.', className='page-subtitle')]), html.Div([html.Div([html.Label('Condition start', className='selector-label'), dcc.Dropdown(id='core-scenario-start', options=[{'label': f'M+{h}', 'value': h} for h in range(1, 13)], value=1, clearable=False)], className='selector-block'), html.Div([html.Label('Condition end', className='selector-label'), dcc.Dropdown(id='core-scenario-horizon', options=[{'label': f'M+{h}', 'value': h} for h in range(1, 13)], value=3, clearable=False)], className='selector-block'), html.Div([html.Label('Input metric', className='selector-label'), dcc.Dropdown(id='core-scenario-metric', options=[{'label': 'Year-on-year (%)', 'value': 'yoy'}, {'label': 'HICP level', 'value': 'level'}], value='yoy', clearable=False)], className='selector-block')], className='chart-controls'), html.Div([html.Div([html.Label('NEIG path', className='selector-label'), dcc.Textarea(id='core-scenario-neig-values', placeholder='Enter one value per month in the selected start..end window. Outside the window the series is not hard-conditioned, but may still react under joint DK smoothing.', className='scenario-textarea')], className='panel'), html.Div([html.Label('Services path', className='selector-label'), dcc.Textarea(id='core-scenario-services-values', placeholder='Enter one value per month in the selected start..end window. Outside the window the series is not hard-conditioned, but may still react under joint DK smoothing.', className='scenario-textarea')], className='panel')], className='two-column-grid'), html.Div([html.Button('Run conditional forecast', id='core-scenario-run', n_clicks=0, className='refresh-button'), html.Button('Clear', id='core-scenario-clear', n_clicks=0, className='refresh-button')], style={'display': 'flex', 'gap': '10px', 'marginTop': '12px'}), html.Div(id='core-scenario-status', className='selection-banner'), html.Div([html.Div([html.Div('Key scenario results', className='eyebrow'), html.H3('Core conditional effect by horizon', className='panel-title'), html.P('Baseline, conditional path and paired effect from the same frozen Core scenario draws.', className='panel-subtitle')], className='panel-heading'), readable_table('core-scenario-summary-table', PAIRED_EFFECT_COLUMNS, page_size=7)], className='panel table-panel'), html.Div([html.Div('Baseline vs conditional', className='eyebrow'), html.H3('Core HICP — year-on-year', className='panel-title'), dcc.Loading(dcc.Graph(id='core-scenario-main', config=graph_config('core_scenario_main')), type='circle')], className='panel chart-panel'), html.Div([html.Div('Conditional impact', className='eyebrow'), html.H3('Conditional − baseline', className='panel-title'), dcc.Loading(dcc.Graph(id='core-scenario-impact', config=graph_config('core_scenario_impact')), type='circle')], className='panel chart-panel')], className='page-body headline-page')
 
 
 def _run_directory(results_root: Path, store: dict | None) -> Path:
@@ -589,81 +481,37 @@ def register_core_dashboard_callbacks(
             ),
         )
 
-    @app.callback(
-        Output("core-scenario-store", "data"),
-        Output("core-scenario-status", "children"),
-        Input("core-scenario-run", "n_clicks"),
-        Input("core-scenario-clear", "n_clicks"),
-        State(store_id, "data"),
-        State("core-scenario-horizon", "value"),
-        State("core-scenario-metric", "value"),
-        State("core-scenario-neig-values", "value"),
-        State("core-scenario-services-values", "value"),
-        prevent_initial_call=True,
-    )
-    def run_or_clear(run_clicks, clear_clicks, headline_store, horizon, metric, neig_text, services_text):
+    @app.callback(Output('core-scenario-store', 'data'), Output('core-scenario-status', 'children'), Input('core-scenario-run', 'n_clicks'), Input('core-scenario-clear', 'n_clicks'), State(store_id, 'data'), State('core-scenario-start', 'value'), State('core-scenario-horizon', 'value'), State('core-scenario-metric', 'value'), State('core-scenario-neig-values', 'value'), State('core-scenario-services-values', 'value'), prevent_initial_call=True)
+    def run_or_clear(run_clicks, clear_clicks, headline_store, condition_start, horizon, metric, neig_text, services_text):
         from dash import ctx
-
-        if ctx.triggered_id == "core-scenario-clear":
-            return None, "Core conditional forecast cleared."
-        if ctx.triggered_id != "core-scenario-run" or not run_clicks:
+        if ctx.triggered_id == 'core-scenario-clear':
+            return (None, 'Core conditional forecast cleared.')
+        if ctx.triggered_id != 'core-scenario-run' or not run_clicks:
             raise PreventUpdate
         try:
-            H = int(horizon or 3)
+            condition_start_offset = int(condition_start or 1)
+            condition_end_offset = int(horizon or 3)
+            if condition_start_offset < 1 or condition_end_offset < condition_start_offset or condition_end_offset > 12:
+                raise HeadlineConditionalError(f'Condition window must satisfy 1 <= start <= end <= 12; received M+{condition_start_offset}..M+{condition_end_offset}.')
+            H = condition_end_offset - condition_start_offset + 1
             run_dir = _run_directory(results_root, headline_store)
             posterior = load_saved_headline_posterior(run_dir, project_root=project_root)
             conditions = {}
-            raw_inputs = {
-                "hicp_neig": str(neig_text or "").strip(),
-                "hicp_services": str(services_text or "").strip(),
-            }
+            raw_inputs = {'hicp_neig': str(neig_text or '').strip(), 'hicp_services': str(services_text or '').strip()}
             for variable, text in raw_inputs.items():
                 if not text:
                     continue
-                _, values = manual_condition_levels(
-                    posterior,
-                    variable=variable,
-                    metric=metric or "yoy",
-                    values=text,
-                    H=H,
-                )
+                _, values = manual_condition_levels(posterior, variable=variable, metric=metric or 'yoy', values=text, H=H, condition_start=condition_start_offset)
                 conditions[variable] = values
             if not conditions:
-                raise HeadlineConditionalError(
-                    "Enter a NEIG path, a Services path, or both."
-                )
-            lineage = {
-                "source_type": "core_manual",
-                "condition_metric": str(metric or "yoy"),
-                "core_condition_variables": sorted(conditions),
-                "core_derived_from": list(CORE_CONDITION_VARIABLES),
-                "core_aggregation": "draw_wise_neig_services",
-            }
-            headline_payload = run_saved_headline_conditional(
-                run_dir,
-                native_level_conditions=conditions,
-                H=H,
-                lineage=lineage,
-                project_root=project_root,
-                persist=True,
-            )
+                raise HeadlineConditionalError('Enter a NEIG path, a Services path, or both.')
+            lineage = {'source_type': 'core_manual', 'condition_metric': str(metric or 'yoy'), 'core_condition_variables': sorted(conditions), 'core_derived_from': list(CORE_CONDITION_VARIABLES), 'core_aggregation': 'draw_wise_neig_services', 'condition_start_offset': condition_start_offset, 'condition_end_offset': condition_end_offset}
+            headline_payload = run_saved_headline_conditional(run_dir, native_level_conditions=conditions, H=H, lineage=lineage, project_root=project_root, persist=True, condition_start=condition_start_offset)
             payload = _core_scenario_payload(run_dir, headline_payload)
-            m = payload["meta"]
-            return payload, html.Div(
-                [
-                    html.Strong("Core conditional complete"),
-                    html.Span(f" · vintage {m['headline_vintage']}"),
-                    html.Span(f" · {m['n_draws']} paired draws"),
-                    html.Span(f" · condition {m['condition_horizon']}m / compute {m['computational_horizon']}m"),
-                    html.Span(f" · lineage {m['lineage_verification_status']}"),
-                    html.Span(" · BVAR re-estimation: NO"),
-                ]
-            )
+            m = payload['meta']
+            return (payload, html.Div([html.Strong('Core conditional complete'), html.Span(f" · vintage {m['headline_vintage']}"), html.Span(f" · {m['n_draws']} paired draws"), html.Span(f" · condition {m['condition_horizon']}m / compute {m['computational_horizon']}m"), html.Span(f" · lineage {m['lineage_verification_status']}"), html.Span(' · BVAR re-estimation: NO')]))
         except Exception as exc:
-            return None, html.Div(
-                [html.Strong("Core conditional failed: "), html.Span(str(exc))],
-                className="banner-error",
-            )
+            return (None, html.Div([html.Strong('Core conditional failed: '), html.Span(str(exc))], className='banner-error'))
 
     @app.callback(
         Output("core-scenario-main", "figure"),

@@ -194,8 +194,19 @@ def build_export_xlsx(payload: dict[str, Any]) -> tuple[bytes, str]:
             ["Table title", title],
             ["Exported UTC", exported],
         ]
+        for row in list(payload.get("metadata_rows") or []):
+            values = list(row) if isinstance(row, (list, tuple)) else []
+            if len(values) < 2:
+                raise ValueError("metadata_rows entries must contain Field and Value.")
+            metadata.append([values[0], values[1]])
+
         data_rows = [headers] + rows if headers else rows
-        sheets = [("Metadata", metadata, 1), ("Table_Data", data_rows, 1 if headers else 0)]
+        used = {"metadata"}
+        data_sheet_name = _sanitize_sheet(
+            str(payload.get("sheet_name") or "Table_Data"),
+            used,
+        )
+        sheets = [("Metadata", metadata, 1), (data_sheet_name, data_rows, 1 if headers else 0)]
         out = io.BytesIO()
         with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
             z.writestr("[Content_Types].xml", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>' + ''.join(f'<Override PartName="/xl/worksheets/sheet{i}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>' for i in range(1, len(sheets) + 1)) + '</Types>')
@@ -207,7 +218,15 @@ def build_export_xlsx(payload: dict[str, Any]) -> tuple[bytes, str]:
             z.writestr("xl/styles.xml", _styles_xml())
             for i, (_, sheet_rows, header_rows) in enumerate(sheets, 1):
                 z.writestr(f"xl/worksheets/sheet{i}.xml", _sheet_xml(sheet_rows, header_rows))
-        return out.getvalue(), f"{_sanitize_filename(title)}_vintage_{vintage or 'unknown'}.xlsx"
+
+        requested_filename = str(payload.get("filename") or "").strip()
+        if requested_filename:
+            filename = _sanitize_filename(requested_filename)
+            if not filename.lower().endswith(".xlsx"):
+                filename += ".xlsx"
+        else:
+            filename = f"{_sanitize_filename(title)}_vintage_{vintage or 'unknown'}.xlsx"
+        return out.getvalue(), filename
     return build_chart_xlsx(payload)
 
 

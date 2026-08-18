@@ -1187,3 +1187,20 @@ html, body {
 .selection-banner.global-production-results-warning span {
   color: var(--danger);
 }
+
+/* HEADLINE_TABLE_STICKY_DOMAIN_SWITCH_V1
+   Keep Energy / Headline HICP / Core reachable on every domain page while
+   scrolling.  The switch is a direct child of page-body after the Python
+   navigation change above, so sticky is bounded by the whole page. */
+.page-domain-switch {
+  position: sticky;
+  top: 72px;
+  z-index: 95;
+  align-self: flex-start;
+  background: rgba(255, 255, 255, 0.96);
+  backdrop-filter: blur(10px);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: var(--shadow-sm);
+  padding: 5px;
+}

@@ -88,6 +88,7 @@ def overview_page() -> html.Div:
     return html.Div(
         [
             dcc.Store(id="overview-data-store", storage_type="memory"),
+            dcc.Download(id="overview-download-results-file"),
             html.Div(
                 [
                     html.Div(
@@ -104,6 +105,17 @@ def overview_page() -> html.Div:
                             html.Div("Production vintage", className="eyebrow"),
                             html.Div(id="overview-vintage-label", className="stat-value"),
                             dcc.Link("Change in Data →", href="/data", className="refresh-button"),
+                            html.Button(
+                                "Download results (.xlsx)",
+                                id="overview-download-results",
+                                n_clicks=0,
+                                disabled=True,
+                                className="refresh-button",
+                            ),
+                            html.Div(
+                                "Persisted display artifacts only · observed history + stored nowcast/forecast · no recomputation.",
+                                className="control-help",
+                            ),
                         ],
                         className="panel",
                     ),
@@ -2600,6 +2612,321 @@ def overview_decomposition_figure(
     )
 
 
+# OVERVIEW_RESULTS_XLSX_V1
+_OVERVIEW_EXPORT_HEADERS = [
+    "date",
+    "vintage",
+    "run_id",
+    "series",
+    "unit",
+    "record_type",
+    "observed",
+    "mean",
+    "median",
+    "q05",
+    "q16",
+    "q84",
+    "q95",
+]
+
+
+def _overview_export_scalar(value):
+    import pandas as pd
+
+    if value is None or pd.isna(value):
+        return ""
+    if isinstance(value, pd.Timestamp):
+        return value.strftime("%Y-%m-%d")
+    if hasattr(value, "item"):
+        try:
+            value = value.item()
+        except Exception:
+            pass
+    if isinstance(value, (int, float, bool, str)):
+        return value
+    return str(value)
+
+
+def _overview_export_rows_from_frame(
+    frame,
+    *,
+    domain: str,
+    model: str,
+    run_id: str,
+    vintage: str,
+    source_artifact: str,
+    max_future_periods: int = 12,
+):
+    """Extract one canonical observed/predictive metric per persisted series.
+
+    Results omit source/domain/model/forecast/label/metric presentation columns.
+    To keep rows unambiguous after removing ``metric``, HICP series prefer YoY
+    and other observables prefer their LEVEL metric.
+    """
+    import pandas as pd
+
+    required = {
+        "record_type", "metric", "series", "date", "value",
+        "q05", "q16", "q50", "q84", "q95",
+    }
+    missing = sorted(required.difference(frame.columns))
+    if missing:
+        raise ValueError(
+            f"Persisted display {source_artifact} lacks required columns: {missing}"
+        )
+
+    work = frame.copy()
+    work["date"] = pd.to_datetime(work["date"], errors="coerce")
+    work = work.loc[work["date"].notna()].copy()
+    work["metric"] = work["metric"].fillna("").astype(str)
+    work["series"] = work["series"].fillna("").astype(str)
+
+    metric_order = ("level", "yoy", "hicp_level", "absolute_change")
+    keep_blocks = []
+    for series_name, block in work.groupby("series", dropna=False, sort=False):
+        available = set(block["metric"].dropna().astype(str))
+        preferred = "yoy" if str(series_name).lower().startswith("hicp_") else "level"
+        chosen = preferred if preferred in available else next(
+            (name for name in metric_order if name in available),
+            None,
+        )
+        if chosen is not None:
+            keep_blocks.append(block.loc[block["metric"].astype(str).eq(chosen)].copy())
+    work = (
+        pd.concat(keep_blocks, ignore_index=False)
+        if keep_blocks
+        else work.iloc[0:0].copy()
+    )
+
+    record = work["record_type"].fillna("").astype(str).str.lower()
+    history = work.loc[record.eq("history")].copy()
+    fan = work.loc[record.eq("fan")].copy()
+
+    if not fan.empty and "basis" in fan.columns:
+        basis = fan["basis"].fillna("").astype(str).str.lower()
+        if basis.eq("baseline").any():
+            fan = fan.loc[basis.eq("baseline")].copy()
+
+    if not fan.empty:
+        if "segment" not in fan.columns:
+            fan = fan.iloc[0:0].copy()
+        else:
+            segment = fan["segment"].fillna("").astype(str).str.lower()
+            fan = fan.loc[segment.isin({"nowcast", "forecast"})].copy()
+
+    capped = []
+    if not fan.empty:
+        for _, block in fan.groupby(["series", "metric"], dropna=False, sort=False):
+            dates = sorted(pd.DatetimeIndex(block["date"].dropna().unique()))
+            keep_dates = set(dates[: max(1, int(max_future_periods))])
+            capped.append(block.loc[block["date"].isin(keep_dates)].copy())
+    fan = pd.concat(capped, ignore_index=False) if capped else fan.iloc[0:0].copy()
+
+    selected = pd.concat([history, fan], ignore_index=False)
+    if selected.empty:
+        return []
+
+    rows = []
+    for _, row in selected.iterrows():
+        raw_series = str(row.get("series") or "")
+        rec = str(row.get("record_type") or "").lower()
+        segment = str(row.get("segment") or "").lower()
+        output_type = "observed" if rec == "history" else segment
+        is_history = output_type == "observed"
+        values = {
+            "date": pd.Timestamp(row["date"]).strftime("%Y-%m-%d"),
+            "vintage": str(vintage),
+            "run_id": str(run_id),
+            "series": raw_series,
+            "unit": _overview_export_scalar(row.get("unit", "")),
+            "record_type": output_type,
+            "observed": _overview_export_scalar(row.get("value")) if is_history else "",
+            "mean": "" if is_history else _overview_export_scalar(row.get("value")),
+            "median": "" if is_history else _overview_export_scalar(row.get("q50")),
+            "q05": "" if is_history else _overview_export_scalar(row.get("q05")),
+            "q16": "" if is_history else _overview_export_scalar(row.get("q16")),
+            "q84": "" if is_history else _overview_export_scalar(row.get("q84")),
+            "q95": "" if is_history else _overview_export_scalar(row.get("q95")),
+        }
+        rows.append([values[name] for name in _OVERVIEW_EXPORT_HEADERS])
+    return rows
+
+
+def _overview_results_export_payload(
+    bundle,
+    *,
+    vintage: str,
+    results_root,
+    registry_path,
+):
+    """Build the Overview workbook payload from persisted display artifacts only."""
+    import json
+    import pandas as pd
+    from inflation_bvar_registry import promoted_run_ids
+
+    item = dict(bundle or {})
+    vintage = str(vintage or "").strip()
+    headline_run_id = str(item.get("headline_run_id") or "").strip()
+    aggregate_run_id = str(item.get("energy_aggregate_run_id") or "").strip()
+    if not vintage or not headline_run_id or not aggregate_run_id:
+        raise ValueError(
+            "Overview export requires a production vintage, Headline run and Energy aggregate run."
+        )
+
+    root = Path(results_root).resolve()
+    forecast_name = "unconditional"
+    component_run_ids = promoted_run_ids(
+        registry_path,
+        vintage,
+        forecast_name=forecast_name,
+        require_all=True,
+        require_draws=False,
+    )
+    if len(component_run_ids) != 7:
+        raise ValueError(
+            f"Expected 7 promoted Energy component runs for {vintage}, found {len(component_run_ids)}."
+        )
+
+    aggregate_dir = root / "hicp_energy_aggregate" / vintage / aggregate_run_id
+    aggregate_display = aggregate_dir / "display_v1.parquet"
+    aggregate_metadata = aggregate_dir / "metadata.json"
+    if not aggregate_metadata.is_file():
+        raise FileNotFoundError(aggregate_metadata)
+    aggregate_meta = json.loads(aggregate_metadata.read_text(encoding="utf-8"))
+    aggregate_meta_text = json.dumps(aggregate_meta, sort_keys=True, default=str)
+    lineage_missing = [
+        f"{model_id}:{run_id}"
+        for model_id, run_id in component_run_ids.items()
+        if str(run_id) not in aggregate_meta_text
+    ]
+    if lineage_missing:
+        raise ValueError(
+            "Current promoted Energy runs do not match the selected Overview aggregate lineage: "
+            + ", ".join(lineage_missing)
+        )
+
+    headline_display = (
+        root
+        / "headline_joint"
+        / vintage
+        / headline_run_id
+        / "forecasts"
+        / forecast_name
+        / "display_v1.parquet"
+    )
+
+    sources = []
+    for model_id, run_id in sorted(component_run_ids.items()):
+        path = (
+            root
+            / model_id
+            / vintage
+            / str(run_id)
+            / "forecasts"
+            / forecast_name
+            / "display_v1.parquet"
+        )
+        sources.append(("Energy model", model_id, str(run_id), path))
+    sources.extend(
+        [
+            ("Energy aggregate", "hicp_energy_aggregate", aggregate_run_id, aggregate_display),
+            ("Headline", "headline_joint", headline_run_id, headline_display),
+        ]
+    )
+
+    all_rows = []
+    source_notes = []
+    core_rows = 0
+    series_pos = _OVERVIEW_EXPORT_HEADERS.index("series")
+    for domain, model, run_id, path in sources:
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"Persisted display required for Overview export is missing: {path}. "
+                "The export refuses to materialize/recompute it."
+            )
+        frame = pd.read_parquet(path)
+        try:
+            rel = str(path.relative_to(root))
+        except ValueError:
+            rel = str(path)
+        rows = _overview_export_rows_from_frame(
+            frame,
+            domain=domain,
+            model=model,
+            run_id=run_id,
+            vintage=vintage,
+            source_artifact=rel,
+            max_future_periods=12,
+        )
+        all_rows.extend(rows)
+        core_rows += sum(
+            1 for row in rows
+            if str(row[series_pos]) == "hicp_core"
+        )
+        source_notes.append(f"{model}: {rel}")
+
+    if not all_rows:
+        raise ValueError(
+            "Persisted Overview artifacts produced no observed/nowcast/forecast rows."
+        )
+
+    date_pos = _OVERVIEW_EXPORT_HEADERS.index("date")
+    run_pos = _OVERVIEW_EXPORT_HEADERS.index("run_id")
+    record_pos = _OVERVIEW_EXPORT_HEADERS.index("record_type")
+    all_rows.sort(
+        key=lambda row: (
+            str(row[run_pos]),
+            str(row[series_pos]),
+            str(row[record_pos]),
+        )
+    )
+    all_rows.sort(key=lambda row: str(row[date_pos]), reverse=True)
+
+    metadata_rows = [
+        ["Forecast name", forecast_name],
+        ["Headline run ID", headline_run_id],
+        ["Energy aggregate run ID", aggregate_run_id],
+    ]
+    for model_id, run_id in sorted(component_run_ids.items()):
+        metadata_rows.append([f"Energy run · {model_id}", str(run_id)])
+    metadata_rows.extend(
+        [
+            ["Source contract", "Persisted display_v1.parquet artifacts only"],
+            ["Future export cap", "First 12 stored future periods per exported series"],
+            ["Metric policy", "HICP series: YoY preferred; other observables: level preferred"],
+            ["Row ordering", "Most recent date first"],
+            ["Posterior mapping", "mean=value; median=q50; q05/q16/q84/q95 copied when stored"],
+            ["Observed mapping", "history.value -> observed"],
+            ["Core persisted rows", int(core_rows)],
+            [
+                "Core policy",
+                (
+                    "Included from persisted Headline display"
+                    if core_rows
+                    else "Unavailable in persisted Headline display; not materialized/recomputed"
+                ),
+            ],
+            ["Aggregate metadata", str(aggregate_metadata.relative_to(root))],
+            ["BVAR re-estimated", "No"],
+            ["Model/result recomputation", "No"],
+        ]
+    )
+    for note in source_notes:
+        metadata_rows.append(["Source artifact", note])
+
+    return {
+        "vintage": vintage,
+        "table_id": "overview-results",
+        "title": "ECB VAR Overview results",
+        "sheet_name": "Results",
+        "filename": f"ECB_VAR_results_vintage_{vintage}.xlsx",
+        "metadata_rows": metadata_rows,
+        "table": {
+            "headers": list(_OVERVIEW_EXPORT_HEADERS),
+            "rows": all_rows,
+        },
+    }
+
 def register_overview_callbacks(
     app,
     *,
@@ -2609,6 +2936,9 @@ def register_overview_callbacks(
     production_vintage_store_id="production-vintage-store",
     registry_store_id="registry-store",
 ):
+    from dash import State
+    from dash.exceptions import PreventUpdate
+
     results_root = Path(results_root).resolve()
     project_root = Path(project_root).resolve()
 
@@ -2695,6 +3025,45 @@ def register_overview_callbacks(
     )
     def model_spec_table(bundle):
         return overview_model_spec_table(bundle)
+
+    @app.callback(
+        Output("overview-download-results", "disabled"),
+        Input("overview-data-store", "data"),
+    )
+    def download_ready(bundle):
+        item = dict(bundle or {})
+        return not bool(
+            item.get("headline_run_id")
+            and item.get("energy_aggregate_run_id")
+        )
+
+    @app.callback(
+        Output("overview-download-results-file", "data"),
+        Input("overview-download-results", "n_clicks"),
+        State("overview-data-store", "data"),
+        State(production_vintage_store_id, "data"),
+        prevent_initial_call=True,
+    )
+    def download_results(n_clicks, bundle, production_store):
+        if not n_clicks:
+            raise PreventUpdate
+        vintage = str((production_store or {}).get("vintage") or "").strip()
+        if not vintage:
+            raise PreventUpdate
+        payload = _overview_results_export_payload(
+            bundle,
+            vintage=vintage,
+            results_root=results_root,
+            registry_path=registry_path,
+        )
+        from dashboard_xlsx_export import build_export_xlsx
+
+        content, filename = build_export_xlsx(payload)
+
+        def _writer(buffer):
+            buffer.write(content)
+
+        return dcc.send_bytes(_writer, filename)
 
 
 __all__ = [

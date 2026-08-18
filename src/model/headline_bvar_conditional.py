@@ -15,6 +15,7 @@ Delivery 3 correctness contract
 * Energy/Headline vintages must match exactly.
 """
 from __future__ import annotations
+CONDITIONAL_WINDOWS_HARMONIZED_V1_HEADLINE_ENGINE = True
 
 import hashlib
 import json
@@ -312,23 +313,26 @@ def parse_manual_values(text: str | Sequence[float], H: int) -> np.ndarray:
     return values
 
 
-def manual_condition_levels(
-    posterior: SavedHeadlinePosterior,
-    *,
-    variable: str,
-    metric: str,
-    values: str | Sequence[float],
-    H: int,
-) -> tuple[pd.DatetimeIndex, np.ndarray]:
-    """Return the finite conditioned months as HICP levels."""
+def manual_condition_levels(posterior: SavedHeadlinePosterior, *, variable: str, metric: str, values: str | Sequence[float], H: int, condition_start: int=1) -> tuple[pd.DatetimeIndex, np.ndarray]:
+    """Return finite HICP levels for an inclusive condition window.
+
+    H is the number of hard-conditioned months; condition_start is the 1-based
+    forecast offset of the first hard-conditioned month.
+    """
     if variable not in NATIVE_VARIABLES:
-        raise KeyError(f"Unknown Headline variable {variable!r}.")
+        raise KeyError(f'Unknown Headline variable {variable!r}.')
     metric = str(metric).lower()
     if metric not in MANUAL_METRICS:
-        raise ValueError(f"metric must be one of {MANUAL_METRICS}.")
-    future_dates = future_dates_for_saved(posterior, H)
-    raw = parse_manual_values(values, H)
-    if metric == "level":
+        raise ValueError(f'metric must be one of {MANUAL_METRICS}.')
+    count = int(H)
+    start = int(condition_start or 1)
+    end = start + count - 1
+    if count < 1 or start < 1 or end > MAX_PUBLISHED_HORIZON_MONTHS:
+        raise ValueError(f'Condition window must lie inside M+1..M+{MAX_PUBLISHED_HORIZON_MONTHS}; received start={start}, count={count}, end={end}.')
+    full = future_dates_for_saved(posterior, end)
+    future_dates = pd.DatetimeIndex(full[start - 1:end], name='date')
+    raw = parse_manual_values(values, count)
+    if metric == 'level':
         levels = raw
     else:
         history = posterior.inputs.native_levels[variable].astype(float)
@@ -337,14 +341,12 @@ def manual_condition_levels(
         for date in future_dates:
             lag = pd.Timestamp(date) - pd.DateOffset(months=12)
             if lag not in history.index or pd.isna(history.loc[lag]):
-                raise HeadlineConditionalError(
-                    f"Cannot convert YoY condition: {variable} level missing at {lag.date()}."
-                )
+                raise HeadlineConditionalError(f'Cannot convert YoY condition: {variable} level missing at {lag.date()}.')
             den.append(float(history.loc[lag]))
         levels = np.asarray(den, dtype=float) * (1.0 + raw / 100.0)
     if not np.isfinite(levels).all() or np.any(levels <= 0):
-        raise HeadlineConditionalError("Conditioned HICP levels must be finite and positive.")
-    return future_dates, levels
+        raise HeadlineConditionalError('Conditioned HICP levels must be finite and positive.')
+    return (future_dates, levels)
 
 
 def _energy_path_summaries(paths: np.ndarray) -> dict[str, list[float]]:
@@ -508,126 +510,88 @@ def energy_headline_ratio_diagnostic(
     }
 
 
-def energy_bridge_condition(
-    energy_store: Mapping[str, Any],
-    *,
-    posterior: SavedHeadlinePosterior,
-    target_dates: Sequence[pd.Timestamp],
-    statistic: str = "mean",
-    basis: str = "scenario",
-    project_root: str | Path | None = None,
-) -> tuple[np.ndarray, dict[str, Any]]:
-    """Transfer Energy-scenario monthly growth onto Headline HICP-Energy.
+def energy_bridge_condition(energy_store: Mapping[str, Any], *, posterior: SavedHeadlinePosterior, target_dates: Sequence[pd.Timestamp], statistic: str='mean', basis: str='scenario', project_root: str | Path | None=None) -> tuple[np.ndarray, dict[str, Any]]:
+    """Transfer Energy monthly growth onto selected Headline hard-condition dates.
 
-    For target month t, the bridge requires Energy aggregate levels at t-1 and
-    t, forms their gross growth ratio, and applies it cumulatively to the
-    observed Headline HICP-Energy level at the month immediately preceding the
-    first target. Raw Energy aggregate levels are never imposed on Headline.
+    The anchor is the latest observed Headline HICP-Energy month preceding the
+    first requested hard-condition date. Energy growth is accumulated from that
+    observed anchor through the requested target dates, so a window beginning at
+    M+3 is valid even though M+1/M+2 are not themselves hard-conditioned in the
+    Headline DK forecast.
     """
     if not energy_store:
-        raise HeadlineConditionalError(
-            "No live HICP-Energy scenario is available. Configure the Energy scenario first."
-        )
-    bridge = energy_store.get("headline_bridge", energy_store)
-    if str(bridge.get("contract")) != ENERGY_BRIDGE_CONTRACT_VERSION:
-        raise HeadlineConditionalError(
-            "The Energy scenario store does not carry the Delivery-3 Headline bridge. "
-            "Restart the dashboard and recompute the Energy scenario once."
-        )
-    if not bool(bridge.get("scenario_active", False)):
-        raise HeadlineConditionalError("The selected Energy aggregate has no active scenario.")
-    same_vintage(posterior.vintage, str(bridge.get("vintage")))
-    statistic = str(statistic or "mean").strip().lower()
-    if statistic.startswith("q") and statistic[1:].isdigit():
-        statistic = f"p{int(statistic[1:]):02d}"
-    if statistic != "mean":
-        match = re.fullmatch(r"p(\d{1,2})", statistic)
-        if match is None or not (1 <= int(match.group(1)) <= 99):
+        raise HeadlineConditionalError('No live HICP-Energy scenario is available. Configure the Energy scenario first.')
+    bridge = energy_store.get('headline_bridge', energy_store)
+    if str(bridge.get('contract')) != ENERGY_BRIDGE_CONTRACT_VERSION:
+        raise HeadlineConditionalError('The Energy scenario store does not carry the Delivery-3 Headline bridge. Restart the dashboard and recompute the Energy scenario once.')
+    if not bool(bridge.get('scenario_active', False)):
+        raise HeadlineConditionalError('The selected Energy aggregate has no active scenario.')
+    same_vintage(posterior.vintage, str(bridge.get('vintage')))
+    statistic = str(statistic or 'mean').strip().lower()
+    if statistic.startswith('q') and statistic[1:].isdigit():
+        statistic = f'p{int(statistic[1:]):02d}'
+    if statistic != 'mean':
+        match = re.fullmatch('p(\\d{1,2})', statistic)
+        if match is None or not 1 <= int(match.group(1)) <= 99:
             raise ValueError("Energy path statistic must be 'mean' or a percentile P01..P99.")
-        statistic = f"p{int(match.group(1)):02d}"
-
-    basis = str(basis or "scenario").strip().lower()
-    if basis not in {"baseline", "scenario"}:
+        statistic = f'p{int(match.group(1)):02d}'
+    basis = str(basis or 'scenario').strip().lower()
+    if basis not in {'baseline', 'scenario'}:
         raise ValueError("Energy condition basis must be 'baseline' or 'scenario'.")
-
-    dates = _normalise_months(bridge.get("dates") or [])
-    path_map = dict(bridge.get(f"{basis}_level") or {})
+    dates = _normalise_months(bridge.get('dates') or [])
+    path_map = dict(bridge.get(f'{basis}_level') or {})
     values = np.asarray(path_map.get(statistic, []), dtype=float)
     if len(dates) != len(values):
-        raise HeadlineConditionalError("Energy bridge dates/path lengths differ.")
+        raise HeadlineConditionalError('Energy bridge dates/path lengths differ.')
     if dates.has_duplicates:
-        raise HeadlineConditionalError("Energy bridge contains duplicate months.")
+        raise HeadlineConditionalError('Energy bridge contains duplicate months.')
     series = pd.Series(values, index=dates).sort_index()
     targets = _normalise_months(target_dates)
     if len(targets) == 0:
-        raise HeadlineConditionalError("Headline conditional target calendar is empty.")
-
-    gross_growth = []
-    for date in targets:
-        previous = pd.Timestamp(date) - pd.DateOffset(months=1)
-        if date not in series.index or previous not in series.index:
-            raise HeadlineConditionalError(
-                "Energy scenario cannot construct the required monthly growth for "
-                f"{pd.Timestamp(date).date()}: both {previous.date()} and "
-                f"{pd.Timestamp(date).date()} must be present in the Energy path."
-            )
-        prev_value = float(series.loc[previous])
-        this_value = float(series.loc[date])
-        if not np.isfinite(prev_value) or not np.isfinite(this_value) or prev_value <= 0 or this_value <= 0:
-            raise HeadlineConditionalError("Energy scenario contains invalid HICP levels.")
-        gross_growth.append(this_value / prev_value)
-    gross_growth_arr = np.asarray(gross_growth, dtype=float)
-
-    history = posterior.inputs.native_levels["hicp_energy"].astype(float).copy()
+        raise HeadlineConditionalError('Headline conditional target calendar is empty.')
+    if targets.has_duplicates or not targets.is_monotonic_increasing:
+        raise HeadlineConditionalError('Headline conditional target dates must be unique and increasing.')
+    history = posterior.inputs.native_levels['hicp_energy'].astype(float).copy()
     history.index = _normalise_months(history.index)
-    anchor_date = pd.Timestamp(targets[0]) - pd.DateOffset(months=1)
-    if anchor_date not in history.index or pd.isna(history.loc[anchor_date]):
-        raise HeadlineConditionalError(
-            "Headline HICP-Energy anchor is unavailable at the month immediately "
-            f"preceding the scenario: {anchor_date.date()}."
-        )
+    history = history.replace([np.inf, -np.inf], np.nan).dropna().sort_index()
+    eligible = history.index[history.index < pd.Timestamp(targets[0])]
+    if len(eligible) == 0:
+        raise HeadlineConditionalError('No observed Headline HICP-Energy anchor exists before the selected condition window.')
+    anchor_date = pd.Timestamp(eligible[-1])
     anchor_level = float(history.loc[anchor_date])
     if not np.isfinite(anchor_level) or anchor_level <= 0:
-        raise HeadlineConditionalError("Headline HICP-Energy anchor level is invalid.")
-    conditioned = anchor_level * np.cumprod(gross_growth_arr)
-
+        raise HeadlineConditionalError('Headline HICP-Energy anchor level is invalid.')
+    growth_dates = pd.date_range(anchor_date + pd.offsets.MonthBegin(1), pd.Timestamp(targets[-1]), freq='MS', name='date')
+    gross_growth = []
+    for date in growth_dates:
+        previous = pd.Timestamp(date) - pd.DateOffset(months=1)
+        if date not in series.index or previous not in series.index:
+            raise HeadlineConditionalError(f'Energy scenario cannot construct the required monthly growth from the observed anchor through {pd.Timestamp(targets[-1]).date()}: both {previous.date()} and {pd.Timestamp(date).date()} must be present.')
+        prev_value = float(series.loc[previous])
+        this_value = float(series.loc[date])
+        if not np.isfinite(prev_value) or not np.isfinite(this_value) or prev_value <= 0 or (this_value <= 0):
+            raise HeadlineConditionalError('Energy scenario contains invalid HICP levels.')
+        gross_growth.append(this_value / prev_value)
+    gross_growth_arr = np.asarray(gross_growth, dtype=float)
+    full_conditioned = anchor_level * np.cumprod(gross_growth_arr)
+    conditioned_series = pd.Series(full_conditioned, index=growth_dates)
+    missing_targets = targets.difference(conditioned_series.index)
+    if len(missing_targets):
+        raise HeadlineConditionalError('Energy bridge failed to cover requested hard-condition dates: ' + ', '.join((pd.Timestamp(x).date().isoformat() for x in missing_targets)))
+    conditioned = conditioned_series.reindex(targets).to_numpy(dtype=float)
     root = _project_root_from_run(posterior.run_directory, project_root)
     ratio_diag = energy_headline_ratio_diagnostic(project_root=root, vintage=posterior.vintage)
-    if ratio_diag.get("pathological_flag") is True:
-        maximum = float(ratio_diag["max_drift_across_available_windows"])
-        raise HeadlineConditionalError(
-            "Energy -> Headline bridge rejected: historical Energy reconstruction and "
-            "published HICP Energy are not comparable enough for scenario transfer "
-            f"(max ratio drift {100.0 * maximum:.3f}% > 2.000%)."
-        )
-
-    lineage = {
-        "source_type": "energy_scenario",
-        "energy_vintage": str(bridge.get("vintage")),
-        "energy_aggregate_run_id": str(bridge.get("aggregate_run_id")),
-        "energy_forecast_name": str(bridge.get("forecast_name")),
-        "energy_scenario_signature": bridge.get("scenario_signature"),
-        "energy_scenario_components": list(bridge.get("scenario_components") or []),
-        "condition_statistic": statistic,
-        "condition_statistic_label": ("Posterior mean" if statistic == "mean" else f"Pointwise percentile {statistic.upper()}"),
-        "energy_condition_basis": basis,
-        "energy_condition_horizon_months": int(len(targets)),
-        "energy_computational_horizon_months": int(COMPUTATIONAL_HORIZON),
-        "energy_free_propagation_horizon_months": int(COMPUTATIONAL_HORIZON - len(targets)),
-        "energy_condition_horizon_contract": (
-            "Energy levels are imposed only for the first condition_horizon months; "
-            "remaining months through the locked computational horizon stay latent "
-            "inside the joint DK conditional forecast."
-        ),
-        "energy_percentile_contract": bridge.get("percentile_contract"),
-        "energy_path_uncertainty_propagated": False,
-        "energy_transfer_method": "mom_growth_reanchored_on_headline_energy",
-        "headline_energy_anchor_date": anchor_date.isoformat(),
-        "headline_energy_anchor_level": anchor_level,
-        "energy_gross_growth": gross_growth_arr.tolist(),
-        "energy_headline_ratio_diagnostic": ratio_diag,
-    }
-    return conditioned, lineage
+    if ratio_diag.get('pathological_flag') is True:
+        maximum = float(ratio_diag['max_drift_across_available_windows'])
+        raise HeadlineConditionalError(f'Energy -> Headline bridge rejected: historical Energy reconstruction and published HICP Energy are not comparable enough for scenario transfer (max ratio drift {100.0 * maximum:.3f}% > 2.000%).')
+    full_future = future_dates_for_saved(posterior, COMPUTATIONAL_HORIZON)
+    positions = full_future.get_indexer(targets)
+    if (positions < 0).any():
+        raise HeadlineConditionalError('Requested Energy condition dates fall outside Headline forecast horizon.')
+    start_offset = int(positions[0]) + 1
+    end_offset = int(positions[-1]) + 1
+    lineage = {'source_type': 'energy_scenario', 'energy_vintage': str(bridge.get('vintage')), 'energy_aggregate_run_id': str(bridge.get('aggregate_run_id')), 'energy_forecast_name': str(bridge.get('forecast_name')), 'energy_scenario_signature': bridge.get('scenario_signature'), 'energy_scenario_components': list(bridge.get('scenario_components') or []), 'condition_statistic': statistic, 'condition_statistic_label': 'Posterior mean' if statistic == 'mean' else f'Pointwise percentile {statistic.upper()}', 'energy_condition_basis': basis, 'energy_condition_horizon_months': int(len(targets)), 'energy_condition_start_offset': start_offset, 'energy_condition_end_offset': end_offset, 'energy_computational_horizon_months': int(COMPUTATIONAL_HORIZON), 'energy_free_before_condition_months': int(start_offset - 1), 'energy_free_after_condition_months': int(COMPUTATIONAL_HORIZON - end_offset), 'energy_free_propagation_horizon_months': int(COMPUTATIONAL_HORIZON - len(targets)), 'energy_condition_horizon_contract': 'Only the selected M+start..M+end dates are hard HICP-Energy level conditions; months before and after remain latent inside the same 12-month joint DK conditional forecast.', 'energy_percentile_contract': bridge.get('percentile_contract'), 'energy_path_uncertainty_propagated': False, 'energy_transfer_method': 'mom_growth_reanchored_on_headline_energy', 'headline_energy_anchor_date': anchor_date.isoformat(), 'headline_energy_anchor_level': anchor_level, 'energy_bridge_growth_dates': [pd.Timestamp(x).isoformat() for x in growth_dates], 'energy_gross_growth': gross_growth_arr.tolist(), 'energy_headline_ratio_diagnostic': ratio_diag}
+    return (conditioned, lineage)
 
 
 def _aggregate_pair(
@@ -756,27 +720,16 @@ def _assert_persisted_baseline_identity(
         )
 
 
-def headline_energy_baseline_cache_key(
-    *,
-    vintage: str,
-    headline_run_id: str,
-    source_aggregate_run_id: str,
-    forecast_name: str,
-    condition_statistic: str,
-    condition_horizon: int,
-) -> tuple[Any, ...]:
+def headline_energy_baseline_cache_key(*, vintage: str, headline_run_id: str, source_aggregate_run_id: str, forecast_name: str, condition_statistic: str, condition_horizon: int, condition_start: int=1) -> tuple[Any, ...]:
     """Stable draw-cache key; every dimension that can change A is explicit."""
-    return (
-        ENERGY_BASELINE_CACHE_CONTRACT_VERSION,
-        str(vintage),
-        str(headline_run_id),
-        str(source_aggregate_run_id),
-        str(forecast_name),
-        str(condition_statistic),
-        int(condition_horizon),
-        ENERGY_BRIDGE_CONTRACT_VERSION,
-        CONDITIONAL_CONTRACT_VERSION,
-    )
+    start = int(condition_start or 1)
+    count = int(condition_horizon)
+    end = start + count - 1
+    mask = np.zeros(COMPUTATIONAL_HORIZON, dtype=np.uint8)
+    if 1 <= start <= end <= COMPUTATIONAL_HORIZON:
+        mask[start - 1:end] = 1
+    condition_mask_hash = __import__('hashlib').sha256(mask.tobytes()).hexdigest()
+    return (ENERGY_BASELINE_CACHE_CONTRACT_VERSION, str(vintage), str(headline_run_id), str(source_aggregate_run_id), str(forecast_name), str(condition_statistic), start, count, condition_mask_hash, ENERGY_BRIDGE_CONTRACT_VERSION, CONDITIONAL_CONTRACT_VERSION)
 
 
 def clear_headline_energy_baseline_cache() -> None:
@@ -809,56 +762,35 @@ def _expand_finite_conditions(
     return expanded_conditions
 
 
-def _condition_draw_bundle(
-    posterior: SavedHeadlinePosterior,
-    *,
-    native_level_conditions: Mapping[str, Sequence[float]],
-    H: int,
-) -> HeadlineConditionalDrawBundle:
-    """Run one conditional forecast and retain draw arrays before `_qsummary`."""
+def _condition_draw_bundle(posterior: SavedHeadlinePosterior, *, native_level_conditions: Mapping[str, Sequence[float]], H: int, condition_start: int=1) -> HeadlineConditionalDrawBundle:
+    """Run one partial-window conditional forecast and retain draw arrays."""
     condition_horizon = int(H)
-    if condition_horizon < 1 or condition_horizon > MAX_PUBLISHED_HORIZON_MONTHS:
-        raise ValueError(f"H must lie in 1..{MAX_PUBLISHED_HORIZON_MONTHS}.")
-    expanded_conditions = _expand_finite_conditions(
-        native_level_conditions, condition_horizon
-    )
-    conditional = forecast_locked_headline(
-        posterior.result,
-        inputs=posterior.inputs,
-        H=COMPUTATIONAL_HORIZON,
-        n_draws=posterior.forecast_draws,
-        native_level_conditions=expanded_conditions,
-        allow_partial_level_conditions=True,
-        simulate_future_outliers=posterior.simulate_future_outliers,
-        seed=posterior.forecast_seed,
-    )
+    start = int(condition_start or 1)
+    end = start + condition_horizon - 1
+    if condition_horizon < 1 or start < 1 or end > MAX_PUBLISHED_HORIZON_MONTHS:
+        raise ValueError(f'Condition window must lie inside M+1..M+{MAX_PUBLISHED_HORIZON_MONTHS}; received start={start}, count={condition_horizon}, end={end}.')
+    if not native_level_conditions:
+        raise HeadlineConditionalError('At least one native HICP condition is required.')
+    expanded_conditions: dict[str, np.ndarray] = {}
+    for name, raw in native_level_conditions.items():
+        if name not in NATIVE_VARIABLES:
+            raise KeyError(f'Unknown conditioned variable {name!r}.')
+        values = np.asarray(raw, dtype=float)
+        if values.ndim != 1 or len(values) != condition_horizon:
+            raise HeadlineConditionalError(f'{name}: expected {condition_horizon} finite condition values.')
+        if not np.isfinite(values).all() or np.any(values <= 0):
+            raise HeadlineConditionalError(f'{name}: condition levels must be finite and positive.')
+        expanded = np.full(COMPUTATIONAL_HORIZON, np.nan, dtype=float)
+        expanded[start - 1:end] = values
+        expanded_conditions[str(name)] = expanded
+    conditional = forecast_locked_headline(posterior.result, inputs=posterior.inputs, H=COMPUTATIONAL_HORIZON, n_draws=posterior.forecast_draws, native_level_conditions=expanded_conditions, allow_partial_level_conditions=True, simulate_future_outliers=posterior.simulate_future_outliers, seed=posterior.forecast_seed)
     aggregate, contrib = _aggregate_pair(conditional, posterior)
-    tail = int(conditional["tail_length"])
-    future_dates = pd.DatetimeIndex(conditional["future_dates"], name="date")
+    tail = int(conditional['tail_length'])
+    future_dates = pd.DatetimeIndex(conditional['future_dates'], name='date')
     expected = future_dates_for_saved(posterior, COMPUTATIONAL_HORIZON)
     if not future_dates.equals(expected):
-        raise HeadlineConditionalError(
-            "Conditional H=12 future calendar changed unexpectedly."
-        )
-    return HeadlineConditionalDrawBundle(
-        draw_indices=np.asarray(conditional["draw_indices"], dtype=int).copy(),
-        future_dates=future_dates,
-        native_level_paths=np.asarray(
-            conditional["native_level_paths"], dtype=float
-        )[:, tail:, :].copy(),
-        component_yoy_paths=np.asarray(
-            conditional["component_yoy_paths"], dtype=float
-        )[:, tail:, :].copy(),
-        headline_level_paths=np.asarray(
-            aggregate["headline_level_paths"], dtype=float
-        )[:, tail:].copy(),
-        headline_yoy_paths=np.asarray(
-            aggregate["headline_yoy_paths"], dtype=float
-        )[:, tail:].copy(),
-        contribution_yoy_paths=np.asarray(
-            contrib, dtype=float
-        )[:, tail:, :].copy(),
-    )
+        raise HeadlineConditionalError('Conditional H=12 future calendar changed unexpectedly.')
+    return HeadlineConditionalDrawBundle(draw_indices=np.asarray(conditional['draw_indices'], dtype=int).copy(), future_dates=future_dates, native_level_paths=np.asarray(conditional['native_level_paths'], dtype=float)[:, tail:, :].copy(), component_yoy_paths=np.asarray(conditional['component_yoy_paths'], dtype=float)[:, tail:, :].copy(), headline_level_paths=np.asarray(aggregate['headline_level_paths'], dtype=float)[:, tail:].copy(), headline_yoy_paths=np.asarray(aggregate['headline_yoy_paths'], dtype=float)[:, tail:].copy(), contribution_yoy_paths=np.asarray(contrib, dtype=float)[:, tail:, :].copy())
 
 
 def _assert_energy_marginal_pairing(
@@ -892,17 +824,7 @@ def _assert_energy_marginal_pairing(
             )
 
 
-def run_saved_headline_energy_marginal_draws(
-    run_directory: str | Path,
-    *,
-    energy_store: Mapping[str, Any],
-    source_aggregate_run_id: str,
-    forecast_name: str,
-    H: int,
-    statistic: str = "mean",
-    lineage: Mapping[str, Any] | None = None,
-    project_root: str | Path | None = None,
-) -> dict[str, Any]:
+def run_saved_headline_energy_marginal_draws(run_directory: str | Path, *, energy_store: Mapping[str, Any], source_aggregate_run_id: str, forecast_name: str, H: int, statistic: str='mean', lineage: Mapping[str, Any] | None=None, project_root: str | Path | None=None, condition_start: int=1) -> dict[str, Any]:
     """Return paired draw-level A/B for the marginal Energy-scenario effect.
 
     A = Headline | Energy baseline path.
@@ -910,136 +832,44 @@ def run_saved_headline_energy_marginal_draws(
     The first H Energy levels are conditioned; months H+1..12 remain latent.
     """
     condition_horizon = int(H)
-    posterior = load_saved_headline_posterior(
-        run_directory, project_root=project_root
-    )
-    target_dates = future_dates_for_saved(posterior, condition_horizon)
-    bridge = dict((energy_store or {}).get("headline_bridge") or {})
-    store_meta = dict((energy_store or {}).get("meta") or {})
-    stored_source = str(store_meta.get("aggregate_run_id") or "")
+    condition_start_offset = int(condition_start or 1)
+    condition_end_offset = condition_start_offset + condition_horizon - 1
+    if condition_horizon < 1 or condition_start_offset < 1 or condition_end_offset > MAX_PUBLISHED_HORIZON_MONTHS:
+        raise ValueError(f'Condition window must lie inside M+1..M+{MAX_PUBLISHED_HORIZON_MONTHS}; received start={condition_start_offset}, count={condition_horizon}, end={condition_end_offset}.')
+    posterior = load_saved_headline_posterior(run_directory, project_root=project_root)
+    condition_calendar = future_dates_for_saved(posterior, condition_end_offset)
+    target_dates = pd.DatetimeIndex(condition_calendar[condition_start_offset - 1:condition_end_offset], name='date')
+    condition_mask = np.zeros(COMPUTATIONAL_HORIZON, dtype=np.uint8)
+    condition_mask[condition_start_offset - 1:condition_end_offset] = 1
+    condition_mask_hash = __import__('hashlib').sha256(condition_mask.tobytes()).hexdigest()
+    bridge = dict((energy_store or {}).get('headline_bridge') or {})
+    store_meta = dict((energy_store or {}).get('meta') or {})
+    stored_source = str(store_meta.get('aggregate_run_id') or '')
     if stored_source and stored_source != str(source_aggregate_run_id):
-        raise HeadlineConditionalError(
-            "Energy source aggregate mismatch: "
-            f"store={stored_source}, requested={source_aggregate_run_id}."
-        )
-    bridge_forecast = str(bridge.get("forecast_name") or "")
+        raise HeadlineConditionalError(f'Energy source aggregate mismatch: store={stored_source}, requested={source_aggregate_run_id}.')
+    bridge_forecast = str(bridge.get('forecast_name') or '')
     if bridge_forecast and bridge_forecast != str(forecast_name):
-        raise HeadlineConditionalError(
-            "Energy forecast contract mismatch: "
-            f"bridge={bridge_forecast}, requested={forecast_name}."
-        )
-
-    baseline_values, baseline_lineage = energy_bridge_condition(
-        energy_store,
-        posterior=posterior,
-        target_dates=target_dates,
-        statistic=statistic,
-        basis="baseline",
-        project_root=project_root,
-    )
-    scenario_values, scenario_lineage = energy_bridge_condition(
-        energy_store,
-        posterior=posterior,
-        target_dates=target_dates,
-        statistic=statistic,
-        basis="scenario",
-        project_root=project_root,
-    )
-    statistic_effective = str(scenario_lineage["condition_statistic"])
-    cache_key = headline_energy_baseline_cache_key(
-        vintage=posterior.vintage,
-        headline_run_id=posterior.run_id,
-        source_aggregate_run_id=str(source_aggregate_run_id),
-        forecast_name=str(forecast_name),
-        condition_statistic=statistic_effective,
-        condition_horizon=condition_horizon,
-    )
+        raise HeadlineConditionalError(f'Energy forecast contract mismatch: bridge={bridge_forecast}, requested={forecast_name}.')
+    baseline_values, baseline_lineage = energy_bridge_condition(energy_store, posterior=posterior, target_dates=target_dates, statistic=statistic, basis='baseline', project_root=project_root)
+    scenario_values, scenario_lineage = energy_bridge_condition(energy_store, posterior=posterior, target_dates=target_dates, statistic=statistic, basis='scenario', project_root=project_root)
+    statistic_effective = str(scenario_lineage['condition_statistic'])
+    cache_key = headline_energy_baseline_cache_key(vintage=posterior.vintage, headline_run_id=posterior.run_id, source_aggregate_run_id=str(source_aggregate_run_id), forecast_name=str(forecast_name), condition_statistic=statistic_effective, condition_horizon=condition_horizon, condition_start=condition_start_offset)
     cached = _ENERGY_BASELINE_DRAW_CACHE.get(cache_key)
     cache_hit = cached is not None
     if cached is None:
-        baseline = _condition_draw_bundle(
-            posterior,
-            native_level_conditions={"hicp_energy": baseline_values},
-            H=condition_horizon,
-        )
-        _ENERGY_BASELINE_DRAW_CACHE[cache_key] = (
-            np.asarray(baseline_values, dtype=float).copy(),
-            baseline,
-        )
+        baseline = _condition_draw_bundle(posterior, native_level_conditions={'hicp_energy': baseline_values}, H=condition_horizon, condition_start=condition_start_offset)
+        _ENERGY_BASELINE_DRAW_CACHE[cache_key] = (np.asarray(baseline_values, dtype=float).copy(), baseline)
     else:
         cached_values, baseline = cached
-        if not np.array_equal(
-            np.asarray(cached_values, dtype=float),
-            np.asarray(baseline_values, dtype=float),
-            equal_nan=True,
-        ):
-            raise HeadlineConditionalError(
-                "Energy baseline cache key resolved to different condition levels; "
-                "source aggregate immutability contract was violated."
-            )
-
-    scenario = _condition_draw_bundle(
-        posterior,
-        native_level_conditions={"hicp_energy": scenario_values},
-        H=condition_horizon,
-    )
+        if not np.array_equal(np.asarray(cached_values, dtype=float), np.asarray(baseline_values, dtype=float), equal_nan=True):
+            raise HeadlineConditionalError('Energy baseline cache key resolved to different condition levels; source aggregate immutability contract was violated.')
+    scenario = _condition_draw_bundle(posterior, native_level_conditions={'hicp_energy': scenario_values}, H=condition_horizon, condition_start=condition_start_offset)
     _assert_energy_marginal_pairing(baseline, scenario)
-
-    meta: dict[str, Any] = {
-        "scenario_contract_version": CONDITIONAL_CONTRACT_VERSION,
-        "headline_vintage": posterior.vintage,
-        "headline_run_id": posterior.run_id,
-        "source_aggregate_run_id": str(source_aggregate_run_id),
-        "scenario_aggregate_run_id": str(bridge.get("aggregate_run_id") or ""),
-        "forecast_name": str(forecast_name),
-        "condition_variables": ["hicp_energy"],
-        "condition_dates": [x.isoformat() for x in target_dates],
-        "baseline_condition_values": np.asarray(baseline_values, dtype=float).tolist(),
-        "scenario_condition_values": np.asarray(scenario_values, dtype=float).tolist(),
-        "condition_statistic": statistic_effective,
-        "condition_statistic_label": scenario_lineage.get("condition_statistic_label"),
-        "condition_horizon": condition_horizon,
-        "computational_horizon": int(COMPUTATIONAL_HORIZON),
-        "conditioned_horizon_months": condition_horizon,
-        "free_propagation_horizon_months": int(
-            COMPUTATIONAL_HORIZON - condition_horizon
-        ),
-        "horizon_interpretation": (
-            "Energy is conditioned for the first condition_horizon months; "
-            "the remaining months through computational_horizon are latent "
-            "joint-DK propagation."
-        ),
-        "n_draws": posterior.forecast_draws,
-        "forecast_seed": posterior.forecast_seed,
-        "simulate_future_outliers": posterior.simulate_future_outliers,
-        "paired_baseline_conditional": True,
-        "paired_energy_baseline_scenario": True,
-        "impact_reference": "energy_baseline_conditioned",
-        "impact_definition": (
-            "Headline | Energy scenario path minus "
-            "Headline | Energy baseline path"
-        ),
-        "bvar_reestimated": False,
-        "energy_path_uncertainty_propagated": False,
-        "baseline_cache_contract": ENERGY_BASELINE_CACHE_CONTRACT_VERSION,
-        "baseline_cache_key": list(cache_key),
-        "lineage_verification_status": posterior.integrity.get(
-            "verification_status", "unverified"
-        ),
-        "publication_horizon_max_months": MAX_PUBLISHED_HORIZON_MONTHS,
-        "baseline_energy_condition_lineage": dict(baseline_lineage),
-        "scenario_energy_condition_lineage": dict(scenario_lineage),
-    }
+    meta: dict[str, Any] = {'scenario_contract_version': CONDITIONAL_CONTRACT_VERSION, 'headline_vintage': posterior.vintage, 'headline_run_id': posterior.run_id, 'source_aggregate_run_id': str(source_aggregate_run_id), 'scenario_aggregate_run_id': str(bridge.get('aggregate_run_id') or ''), 'forecast_name': str(forecast_name), 'condition_variables': ['hicp_energy'], 'condition_dates': [x.isoformat() for x in target_dates], 'baseline_condition_values': np.asarray(baseline_values, dtype=float).tolist(), 'scenario_condition_values': np.asarray(scenario_values, dtype=float).tolist(), 'condition_statistic': statistic_effective, 'condition_statistic_label': scenario_lineage.get('condition_statistic_label'), 'condition_horizon': condition_horizon, 'computational_horizon': int(COMPUTATIONAL_HORIZON), 'conditioned_horizon_months': condition_horizon, 'free_propagation_horizon_months': int(COMPUTATIONAL_HORIZON - condition_horizon), 'horizon_interpretation': f'Energy is hard-conditioned on M+{condition_start_offset}..M+{condition_end_offset}; months outside that window remain latent joint-DK propagation inside the {COMPUTATIONAL_HORIZON}-month computation.', 'n_draws': posterior.forecast_draws, 'forecast_seed': posterior.forecast_seed, 'simulate_future_outliers': posterior.simulate_future_outliers, 'paired_baseline_conditional': True, 'paired_energy_baseline_scenario': True, 'impact_reference': 'energy_baseline_conditioned', 'impact_definition': 'Headline | Energy scenario path minus Headline | Energy baseline path', 'bvar_reestimated': False, 'energy_path_uncertainty_propagated': False, 'baseline_cache_contract': ENERGY_BASELINE_CACHE_CONTRACT_VERSION, 'baseline_cache_key': list(cache_key), 'lineage_verification_status': posterior.integrity.get('verification_status', 'unverified'), 'publication_horizon_max_months': MAX_PUBLISHED_HORIZON_MONTHS, 'baseline_energy_condition_lineage': dict(baseline_lineage), 'scenario_energy_condition_lineage': dict(scenario_lineage), 'condition_start': condition_start_offset, 'condition_end': condition_end_offset, 'condition_start_offset': condition_start_offset, 'condition_end_offset': condition_end_offset, 'condition_mask_hash': condition_mask_hash, 'free_before_condition_months': condition_start_offset - 1, 'free_after_condition_months': COMPUTATIONAL_HORIZON - condition_end_offset}
     meta.update(dict(lineage or {}))
-    meta["scenario_id"] = _scenario_identity(meta)
-    # Runtime cache state is diagnostic only and must never change scenario identity.
-    meta["baseline_cache_hit"] = bool(cache_hit)
-    return {
-        "meta": meta,
-        "future_dates": scenario.future_dates,
-        "baseline": baseline,
-        "scenario": scenario,
-    }
+    meta['scenario_id'] = _scenario_identity(meta)
+    meta['baseline_cache_hit'] = bool(cache_hit)
+    return {'meta': meta, 'future_dates': scenario.future_dates, 'baseline': baseline, 'scenario': scenario}
 
 
 def compact_headline_energy_marginal(
@@ -1085,18 +915,7 @@ def compact_headline_energy_marginal(
     )
 
 
-def run_saved_headline_energy_marginal(
-    run_directory: str | Path,
-    *,
-    energy_store: Mapping[str, Any],
-    source_aggregate_run_id: str,
-    forecast_name: str,
-    H: int,
-    statistic: str = "mean",
-    lineage: Mapping[str, Any] | None = None,
-    project_root: str | Path | None = None,
-    persist: bool = False,
-) -> dict[str, Any]:
+def run_saved_headline_energy_marginal(run_directory: str | Path, *, energy_store: Mapping[str, Any], source_aggregate_run_id: str, forecast_name: str, H: int, statistic: str='mean', lineage: Mapping[str, Any] | None=None, project_root: str | Path | None=None, persist: bool=False, condition_start: int=1) -> dict[str, Any]:
     """Browser-safe B-A payload using draw-level paired Energy conditioning.
 
     When ``persist=True`` the saved scenario keeps the same artifact filenames
@@ -1104,93 +923,29 @@ def run_saved_headline_energy_marginal(
     Energy-baseline-conditioned A object. Metadata makes that denominator
     explicit through ``impact_reference`` and ``impact_definition``.
     """
-    draw_result = run_saved_headline_energy_marginal_draws(
-        run_directory,
-        energy_store=energy_store,
-        source_aggregate_run_id=source_aggregate_run_id,
-        forecast_name=forecast_name,
-        H=H,
-        statistic=statistic,
-        lineage=lineage,
-        project_root=project_root,
-    )
+    draw_result = run_saved_headline_energy_marginal_draws(run_directory, energy_store=energy_store, source_aggregate_run_id=source_aggregate_run_id, forecast_name=forecast_name, H=H, statistic=statistic, lineage=lineage, project_root=project_root, condition_start=condition_start)
     payload = compact_headline_energy_marginal(draw_result)
     if not persist:
         return payload
-
-    baseline = draw_result["baseline"]
-    scenario = draw_result["scenario"]
-    if not isinstance(baseline, HeadlineConditionalDrawBundle) or not isinstance(
-        scenario, HeadlineConditionalDrawBundle
-    ):
-        raise TypeError(
-            "draw_result does not contain HeadlineConditionalDrawBundle objects."
-        )
+    baseline = draw_result['baseline']
+    scenario = draw_result['scenario']
+    if not isinstance(baseline, HeadlineConditionalDrawBundle) or not isinstance(scenario, HeadlineConditionalDrawBundle):
+        raise TypeError('draw_result does not contain HeadlineConditionalDrawBundle objects.')
     _assert_energy_marginal_pairing(baseline, scenario)
-    meta = dict(payload.get("meta") or {})
-    scenario_id = str(meta.get("scenario_id") or "")
+    meta = dict(payload.get('meta') or {})
+    scenario_id = str(meta.get('scenario_id') or '')
     if not scenario_id:
-        raise HeadlineConditionalError(
-            "Energy marginal payload has no scenario_id; refusing to persist."
-        )
-    directory = Path(run_directory) / "scenarios" / scenario_id
+        raise HeadlineConditionalError('Energy marginal payload has no scenario_id; refusing to persist.')
+    directory = Path(run_directory) / 'scenarios' / scenario_id
     directory.mkdir(parents=True, exist_ok=True)
-    (directory / "metadata.json").write_text(
-        json.dumps(meta, indent=2, default=str), encoding="utf-8"
-    )
-    np.savez_compressed(
-        directory / "scenario_draws.npz",
-        future_dates=scenario.future_dates.astype("datetime64[ns]").to_numpy(),
-        draw_indices=np.asarray(scenario.draw_indices, dtype=int),
-        baseline_native_level_paths=np.asarray(
-            baseline.native_level_paths, dtype=float
-        ),
-        conditional_native_level_paths=np.asarray(
-            scenario.native_level_paths, dtype=float
-        ),
-        baseline_component_yoy_paths=np.asarray(
-            baseline.component_yoy_paths, dtype=float
-        ),
-        conditional_component_yoy_paths=np.asarray(
-            scenario.component_yoy_paths, dtype=float
-        ),
-        baseline_headline_level_paths=np.asarray(
-            baseline.headline_level_paths, dtype=float
-        ),
-        conditional_headline_level_paths=np.asarray(
-            scenario.headline_level_paths, dtype=float
-        ),
-        baseline_headline_yoy_paths=np.asarray(
-            baseline.headline_yoy_paths, dtype=float
-        ),
-        conditional_headline_yoy_paths=np.asarray(
-            scenario.headline_yoy_paths, dtype=float
-        ),
-        baseline_yoy_contribution_paths=np.asarray(
-            baseline.contribution_yoy_paths, dtype=float
-        ),
-        conditional_yoy_contribution_paths=np.asarray(
-            scenario.contribution_yoy_paths, dtype=float
-        ),
-    )
-    payload["meta"]["directory"] = str(directory)
-    (directory / "display.json").write_text(
-        json.dumps(payload, indent=2, default=str), encoding="utf-8"
-    )
+    (directory / 'metadata.json').write_text(json.dumps(meta, indent=2, default=str), encoding='utf-8')
+    np.savez_compressed(directory / 'scenario_draws.npz', future_dates=scenario.future_dates.astype('datetime64[ns]').to_numpy(), draw_indices=np.asarray(scenario.draw_indices, dtype=int), baseline_native_level_paths=np.asarray(baseline.native_level_paths, dtype=float), conditional_native_level_paths=np.asarray(scenario.native_level_paths, dtype=float), baseline_component_yoy_paths=np.asarray(baseline.component_yoy_paths, dtype=float), conditional_component_yoy_paths=np.asarray(scenario.component_yoy_paths, dtype=float), baseline_headline_level_paths=np.asarray(baseline.headline_level_paths, dtype=float), conditional_headline_level_paths=np.asarray(scenario.headline_level_paths, dtype=float), baseline_headline_yoy_paths=np.asarray(baseline.headline_yoy_paths, dtype=float), conditional_headline_yoy_paths=np.asarray(scenario.headline_yoy_paths, dtype=float), baseline_yoy_contribution_paths=np.asarray(baseline.contribution_yoy_paths, dtype=float), conditional_yoy_contribution_paths=np.asarray(scenario.contribution_yoy_paths, dtype=float))
+    payload['meta']['directory'] = str(directory)
+    (directory / 'display.json').write_text(json.dumps(payload, indent=2, default=str), encoding='utf-8')
     return payload
 
 
-def run_saved_headline_conditional(
-    run_directory: str | Path,
-    *,
-    native_level_conditions: Mapping[str, Sequence[float]],
-    H: int,
-    lineage: Mapping[str, Any] | None = None,
-    n_draws: int | None = None,
-    seed: int | None = None,
-    project_root: str | Path | None = None,
-    persist: bool = True,
-) -> dict[str, Any]:
+def run_saved_headline_conditional(run_directory: str | Path, *, native_level_conditions: Mapping[str, Sequence[float]], H: int, lineage: Mapping[str, Any] | None=None, n_draws: int | None=None, seed: int | None=None, project_root: str | Path | None=None, persist: bool=True, condition_start: int=1) -> dict[str, Any]:
     """Paired H=12 baseline/conditional forecast from one saved posterior.
 
     ``H`` is the *condition horizon* only. The stochastic forecast is always
@@ -1198,158 +953,67 @@ def run_saved_headline_conditional(
     invariant to the UI display/condition horizon.
     """
     condition_horizon = int(H)
+    condition_start_offset = int(condition_start or 1)
+    condition_end_offset = condition_start_offset + condition_horizon - 1
+    if condition_horizon < 1 or condition_start_offset < 1 or condition_end_offset > MAX_PUBLISHED_HORIZON_MONTHS:
+        raise ValueError(f'Condition window must lie inside M+1..M+{MAX_PUBLISHED_HORIZON_MONTHS}; received start={condition_start_offset}, count={condition_horizon}, end={condition_end_offset}.')
     if condition_horizon < 1 or condition_horizon > MAX_PUBLISHED_HORIZON_MONTHS:
-        raise ValueError(
-            f"H must lie in 1..{MAX_PUBLISHED_HORIZON_MONTHS}."
-        )
+        raise ValueError(f'H must lie in 1..{MAX_PUBLISHED_HORIZON_MONTHS}.')
     posterior = load_saved_headline_posterior(run_directory, project_root=project_root)
     contract_draws = posterior.forecast_draws
     contract_seed = posterior.forecast_seed
     contract_outliers = posterior.simulate_future_outliers
     if n_draws is not None and int(n_draws) != contract_draws:
-        raise HeadlineConditionalError(
-            "Conditional n_draws must equal the persisted baseline contract: "
-            f"requested={int(n_draws)}, persisted={contract_draws}."
-        )
+        raise HeadlineConditionalError(f'Conditional n_draws must equal the persisted baseline contract: requested={int(n_draws)}, persisted={contract_draws}.')
     if seed is not None and int(seed) != contract_seed:
-        raise HeadlineConditionalError(
-            "Conditional seed must equal the persisted baseline contract: "
-            f"requested={int(seed)}, persisted={contract_seed}."
-        )
-
-    condition_dates = future_dates_for_saved(posterior, condition_horizon)
+        raise HeadlineConditionalError(f'Conditional seed must equal the persisted baseline contract: requested={int(seed)}, persisted={contract_seed}.')
+    condition_calendar = future_dates_for_saved(posterior, condition_end_offset)
+    condition_dates = pd.DatetimeIndex(condition_calendar[condition_start_offset - 1:condition_end_offset], name='date')
+    condition_mask = np.zeros(COMPUTATIONAL_HORIZON, dtype=np.uint8)
+    condition_mask[condition_start_offset - 1:condition_end_offset] = 1
+    condition_mask_hash = __import__('hashlib').sha256(condition_mask.tobytes()).hexdigest()
     full_future_dates = future_dates_for_saved(posterior, COMPUTATIONAL_HORIZON)
     finite_conditions: dict[str, np.ndarray] = {}
     expanded_conditions: dict[str, np.ndarray] = {}
     if not native_level_conditions:
-        raise HeadlineConditionalError("At least one native HICP condition is required.")
+        raise HeadlineConditionalError('At least one native HICP condition is required.')
     for name, raw in native_level_conditions.items():
         if name not in NATIVE_VARIABLES:
-            raise KeyError(f"Unknown conditioned variable {name!r}.")
+            raise KeyError(f'Unknown conditioned variable {name!r}.')
         values = np.asarray(raw, dtype=float)
         if values.ndim != 1 or len(values) != condition_horizon:
-            raise HeadlineConditionalError(
-                f"{name}: expected {condition_horizon} finite condition values."
-            )
+            raise HeadlineConditionalError(f'{name}: expected {condition_horizon} finite condition values.')
         if not np.isfinite(values).all() or np.any(values <= 0):
-            raise HeadlineConditionalError(
-                f"{name}: condition levels must be finite and positive."
-            )
+            raise HeadlineConditionalError(f'{name}: condition levels must be finite and positive.')
         finite_conditions[str(name)] = values
         expanded = np.full(COMPUTATIONAL_HORIZON, np.nan, dtype=float)
-        expanded[:condition_horizon] = values
+        expanded[condition_start_offset - 1:condition_end_offset] = values
         expanded_conditions[str(name)] = expanded
-
-    baseline = forecast_locked_headline(
-        posterior.result,
-        inputs=posterior.inputs,
-        H=COMPUTATIONAL_HORIZON,
-        n_draws=contract_draws,
-        native_level_conditions=None,
-        simulate_future_outliers=contract_outliers,
-        seed=contract_seed,
-    )
+    baseline = forecast_locked_headline(posterior.result, inputs=posterior.inputs, H=COMPUTATIONAL_HORIZON, n_draws=contract_draws, native_level_conditions=None, simulate_future_outliers=contract_outliers, seed=contract_seed)
     _assert_persisted_baseline_identity(posterior, baseline)
-    conditional = forecast_locked_headline(
-        posterior.result,
-        inputs=posterior.inputs,
-        H=COMPUTATIONAL_HORIZON,
-        n_draws=contract_draws,
-        native_level_conditions=expanded_conditions,
-        allow_partial_level_conditions=True,
-        simulate_future_outliers=contract_outliers,
-        seed=contract_seed,
-    )
-    if not np.array_equal(
-        np.asarray(baseline["draw_indices"]), np.asarray(conditional["draw_indices"])
-    ):
-        raise HeadlineConditionalError("Baseline/conditional posterior draw pairing failed.")
-    if not pd.DatetimeIndex(baseline["path_dates"]).equals(
-        pd.DatetimeIndex(conditional["path_dates"])
-    ):
-        raise HeadlineConditionalError("Baseline/conditional calendars differ.")
-
+    conditional = forecast_locked_headline(posterior.result, inputs=posterior.inputs, H=COMPUTATIONAL_HORIZON, n_draws=contract_draws, native_level_conditions=expanded_conditions, allow_partial_level_conditions=True, simulate_future_outliers=contract_outliers, seed=contract_seed)
+    if not np.array_equal(np.asarray(baseline['draw_indices']), np.asarray(conditional['draw_indices'])):
+        raise HeadlineConditionalError('Baseline/conditional posterior draw pairing failed.')
+    if not pd.DatetimeIndex(baseline['path_dates']).equals(pd.DatetimeIndex(conditional['path_dates'])):
+        raise HeadlineConditionalError('Baseline/conditional calendars differ.')
     base_agg, base_contrib = _aggregate_pair(baseline, posterior)
     cond_agg, cond_contrib = _aggregate_pair(conditional, posterior)
-    future_dates = pd.DatetimeIndex(conditional["future_dates"], name="date")
+    future_dates = pd.DatetimeIndex(conditional['future_dates'], name='date')
     if not future_dates.equals(full_future_dates):
-        raise HeadlineConditionalError("Conditional H=12 future calendar changed unexpectedly.")
-
-    meta: dict[str, Any] = {
-        "scenario_contract_version": CONDITIONAL_CONTRACT_VERSION,
-        "headline_vintage": posterior.vintage,
-        "headline_run_id": posterior.run_id,
-        "condition_variables": sorted(finite_conditions),
-        "condition_dates": [x.isoformat() for x in condition_dates],
-        "condition_values": {k: v.tolist() for k, v in finite_conditions.items()},
-        "condition_horizon": condition_horizon,
-        "computational_horizon": COMPUTATIONAL_HORIZON,
-        "n_draws": contract_draws,
-        "forecast_seed": contract_seed,
-        "simulate_future_outliers": contract_outliers,
-        "paired_baseline_conditional": True,
-        "persisted_baseline_bit_identical": True,
-        "bvar_reestimated": False,
-        "lineage_verification_status": posterior.integrity.get("verification_status", "unverified"),
-        "publication_horizon_max_months": MAX_PUBLISHED_HORIZON_MONTHS,
-    }
+        raise HeadlineConditionalError('Conditional H=12 future calendar changed unexpectedly.')
+    meta: dict[str, Any] = {'scenario_contract_version': CONDITIONAL_CONTRACT_VERSION, 'headline_vintage': posterior.vintage, 'headline_run_id': posterior.run_id, 'condition_variables': sorted(finite_conditions), 'condition_dates': [x.isoformat() for x in condition_dates], 'condition_values': {k: v.tolist() for k, v in finite_conditions.items()}, 'condition_horizon': condition_horizon, 'computational_horizon': COMPUTATIONAL_HORIZON, 'n_draws': contract_draws, 'forecast_seed': contract_seed, 'simulate_future_outliers': contract_outliers, 'paired_baseline_conditional': True, 'persisted_baseline_bit_identical': True, 'bvar_reestimated': False, 'lineage_verification_status': posterior.integrity.get('verification_status', 'unverified'), 'publication_horizon_max_months': MAX_PUBLISHED_HORIZON_MONTHS, 'condition_start': condition_start_offset, 'condition_end': condition_end_offset, 'condition_start_offset': condition_start_offset, 'condition_end_offset': condition_end_offset, 'condition_mask_hash': condition_mask_hash, 'conditioned_horizon_months': condition_horizon, 'free_before_condition_months': condition_start_offset - 1, 'free_after_condition_months': COMPUTATIONAL_HORIZON - condition_end_offset, 'free_propagation_horizon_months': COMPUTATIONAL_HORIZON - condition_horizon}
     meta.update(dict(lineage or {}))
     scenario_id = _scenario_identity(meta)
-    meta["scenario_id"] = scenario_id
-
-    payload = _compact_payload(
-        metadata=meta,
-        future_dates=future_dates,
-        baseline_component=baseline,
-        conditional_component=conditional,
-        baseline_aggregate=base_agg,
-        conditional_aggregate=cond_agg,
-        baseline_contrib=base_contrib,
-        conditional_contrib=cond_contrib,
-    )
-
+    meta['scenario_id'] = scenario_id
+    payload = _compact_payload(metadata=meta, future_dates=future_dates, baseline_component=baseline, conditional_component=conditional, baseline_aggregate=base_agg, conditional_aggregate=cond_agg, baseline_contrib=base_contrib, conditional_contrib=cond_contrib)
     if persist:
-        directory = posterior.run_directory / "scenarios" / scenario_id
+        directory = posterior.run_directory / 'scenarios' / scenario_id
         directory.mkdir(parents=True, exist_ok=True)
-        (directory / "metadata.json").write_text(
-            json.dumps(meta, indent=2, default=str), encoding="utf-8"
-        )
-        tail = int(conditional["tail_length"])
-        np.savez_compressed(
-            directory / "scenario_draws.npz",
-            future_dates=future_dates.astype("datetime64[ns]").to_numpy(),
-            draw_indices=np.asarray(conditional["draw_indices"], dtype=int),
-            baseline_native_level_paths=np.asarray(
-                baseline["native_level_paths"], dtype=float
-            )[:, tail:, :],
-            conditional_native_level_paths=np.asarray(
-                conditional["native_level_paths"], dtype=float
-            )[:, tail:, :],
-            baseline_component_yoy_paths=np.asarray(
-                baseline["component_yoy_paths"], dtype=float
-            )[:, tail:, :],
-            conditional_component_yoy_paths=np.asarray(
-                conditional["component_yoy_paths"], dtype=float
-            )[:, tail:, :],
-            baseline_headline_level_paths=np.asarray(
-                base_agg["headline_level_paths"], dtype=float
-            )[:, tail:],
-            conditional_headline_level_paths=np.asarray(
-                cond_agg["headline_level_paths"], dtype=float
-            )[:, tail:],
-            baseline_headline_yoy_paths=np.asarray(
-                base_agg["headline_yoy_paths"], dtype=float
-            )[:, tail:],
-            conditional_headline_yoy_paths=np.asarray(
-                cond_agg["headline_yoy_paths"], dtype=float
-            )[:, tail:],
-            baseline_yoy_contribution_paths=np.asarray(base_contrib, dtype=float)[:, tail:, :],
-            conditional_yoy_contribution_paths=np.asarray(cond_contrib, dtype=float)[:, tail:, :],
-        )
-        (directory / "display.json").write_text(
-            json.dumps(payload, indent=2, default=str), encoding="utf-8"
-        )
-        payload["meta"]["directory"] = str(directory)
+        (directory / 'metadata.json').write_text(json.dumps(meta, indent=2, default=str), encoding='utf-8')
+        tail = int(conditional['tail_length'])
+        np.savez_compressed(directory / 'scenario_draws.npz', future_dates=future_dates.astype('datetime64[ns]').to_numpy(), draw_indices=np.asarray(conditional['draw_indices'], dtype=int), baseline_native_level_paths=np.asarray(baseline['native_level_paths'], dtype=float)[:, tail:, :], conditional_native_level_paths=np.asarray(conditional['native_level_paths'], dtype=float)[:, tail:, :], baseline_component_yoy_paths=np.asarray(baseline['component_yoy_paths'], dtype=float)[:, tail:, :], conditional_component_yoy_paths=np.asarray(conditional['component_yoy_paths'], dtype=float)[:, tail:, :], baseline_headline_level_paths=np.asarray(base_agg['headline_level_paths'], dtype=float)[:, tail:], conditional_headline_level_paths=np.asarray(cond_agg['headline_level_paths'], dtype=float)[:, tail:], baseline_headline_yoy_paths=np.asarray(base_agg['headline_yoy_paths'], dtype=float)[:, tail:], conditional_headline_yoy_paths=np.asarray(cond_agg['headline_yoy_paths'], dtype=float)[:, tail:], baseline_yoy_contribution_paths=np.asarray(base_contrib, dtype=float)[:, tail:, :], conditional_yoy_contribution_paths=np.asarray(cond_contrib, dtype=float)[:, tail:, :])
+        (directory / 'display.json').write_text(json.dumps(payload, indent=2, default=str), encoding='utf-8')
+        payload['meta']['directory'] = str(directory)
     return payload
 
 

@@ -18,6 +18,7 @@ and display artefacts and never re-estimates a model from a plotting callback.
 """
 
 from __future__ import annotations
+CONDITIONAL_WINDOWS_HARMONIZED_V1_ENERGY_DASH = True
 
 import inspect
 import json
@@ -105,37 +106,6 @@ if not MODEL_DIR.is_dir():
     MODEL_DIR = PROJECT_ROOT
 if str(MODEL_DIR) not in sys.path:
     sys.path.insert(0, str(MODEL_DIR))
-
-# ---------------------------------------------------------------------------
-# Optional Economic Data feature boundary
-# ---------------------------------------------------------------------------
-#
-# The feature is deliberately isolated from Energy / Headline / Core.  Setting
-# DASH_ENABLE_ECONOMIC_DATA=0 disables it without importing its package.  If the
-# package directory has been physically removed, the dashboard also degrades
-# cleanly to the core application.
-_ECONOMIC_DATA_REQUESTED = os.getenv(
-    "DASH_ENABLE_ECONOMIC_DATA", "1"
-).strip().lower() not in {"0", "false", "no", "off"}
-
-ECONOMIC_DATA_ENABLED = False
-_economic_data_page = None
-_register_economic_data_callbacks = None
-
-if _ECONOMIC_DATA_REQUESTED:
-    try:
-        from economic_data import (  # noqa: E402
-            economic_data_page as _economic_data_page,
-            register_callbacks as _register_economic_data_callbacks,
-        )
-        ECONOMIC_DATA_ENABLED = True
-    except ModuleNotFoundError as exc:
-        if not str(exc.name or "").startswith("economic_data"):
-            raise
-        print(
-            "Economic Data feature package not found; "
-            "continuing without /economic-data."
-        )
 
 from energy_bvar_dashboard_aggregate import (  # noqa: E402
     aggregate_fan_figure,
@@ -1412,6 +1382,24 @@ def forecast_page() -> html.Div:
                         [
                             html.Div(
                                 [
+                                    html.Label("Model", className="control-label"),
+                                    dcc.Dropdown(
+                                        id="forecast-model-select",
+                                        options=[
+                                            {"label": model_spec(model_id).label, "value": model_id}
+                                            for model_id in ENERGY_SUITE_MODEL_IDS
+                                        ],
+                                        value="gas",
+                                        clearable=False,
+                                        persistence=True,
+                                        persistence_type="session",
+                                        className="compact-dropdown wide-control",
+                                    ),
+                                ],
+                                className="control-block wide-control",
+                            ),
+                            html.Div(
+                                [
                                     html.Label("Metric", className="control-label"),
                                     dcc.Dropdown(
                                         id="forecast-metric",
@@ -2028,864 +2016,10 @@ def aggregate_page() -> html.Div:
 # ENERGY_SCENARIO_UI_CLARITY_AND_JOINT_WORKSPACE_V1
 def scenario_page() -> html.Div:
     """Conditional observable paths plus ex-post VAT/excise scenarios."""
-
-    conditional_controls = html.Div(
-        [
-            html.Div(
-                [
-                    html.Label("Energy component", className="control-label"),
-                    dcc.Dropdown(
-                        id="conditional-component-select",
-                        options=[],
-                        value=None,
-                        clearable=False,
-                        className="compact-dropdown",
-                    ),
-                ],
-                className="control-block",
-            ),
-            html.Div(
-                [
-                    html.Label("Scenario driver", className="control-label"),
-                    dcc.Dropdown(
-                        id="conditional-variable-select",
-                        options=[],
-                        value=None,
-                        clearable=False,
-                        className="compact-dropdown",
-                    ),
-                ],
-                className="control-block",
-            ),
-            html.Div(
-                [
-                    html.Label("Assumption type", className="control-label"),
-                    dcc.RadioItems(
-                        id="conditional-path-mode",
-                        options=[
-                            {"label": "% vs last observed", "value": "percent"},
-                            {"label": "Absolute level", "value": "level"},
-                        ],
-                        value="percent",
-                        inline=True,
-                        className="fan-radio",
-                    ),
-                ],
-                className="control-block",
-            ),
-            html.Div(
-                [
-                    html.Label(
-                        "Change vs last observed (%)",
-                        id="conditional-path-value-label",
-                        className="control-label",
-                    ),
-                    dcc.Input(
-                        id="conditional-path-value",
-                        type="number",
-                        value=10.0,
-                        step=0.1,
-                        debounce=0.4,
-                        className="compact-dropdown",
-                    ),
-                ],
-                className="control-block",
-            ),
-            html.Div(
-                [
-                    html.Label("Fan", className="control-label"),
-                    dcc.RadioItems(
-                        id="conditional-fan",
-                        options=[
-                            {"label": "68%", "value": "68"},
-                            {"label": "90%", "value": "90"},
-                            {"label": "Both", "value": "both"},
-                        ],
-                        value="68",
-                        inline=True,
-                        className="fan-radio",
-                    ),
-                ],
-                className="control-block",
-            ),
-        ],
-        className="chart-controls",
-    )
-
-    conditional_advanced = html.Details(
-        [
-            html.Summary(
-                "Advanced / source run",
-                style={
-                    "fontWeight": "650",
-                    "cursor": "pointer",
-                    "color": "#475569",
-                },
-            ),
-            html.Div(
-                [
-                    html.Label(
-                        "HICP Energy aggregate run",
-                        className="control-label",
-                    ),
-                    dcc.Dropdown(
-                        id="conditional-agg-select",
-                        options=[],
-                        value=None,
-                        clearable=False,
-                        className="compact-dropdown",
-                    ),
-                ],
-                style={"maxWidth": "520px", "paddingTop": "10px"},
-            ),
-        ],
-        style={"marginTop": "10px", "marginBottom": "10px"},
-    )
-
-    tax_controls = html.Div(
-        [
-            html.Div(
-                [
-                    html.Label("Component", className="control-label"),
-                    dcc.Dropdown(
-                        id="scenario-component-select",
-                        options=[],
-                        value=None,
-                        clearable=False,
-                        className="compact-dropdown",
-                    ),
-                ],
-                className="control-block",
-            ),
-            html.Div(
-                [
-                    html.Label("Scenario start", className="control-label"),
-                    dcc.DatePickerSingle(
-                        id="scenario-start-date",
-                        display_format="YYYY-MM-DD",
-                        first_day_of_week=1,
-                        clearable=False,
-                    ),
-                ],
-                className="control-block",
-            ),
-            html.Div(
-                [
-                    html.Label("VAT change (pp; − = cut)", className="control-label"),
-                    dcc.Input(
-                        id="scenario-vat-delta",
-                        type="number",
-                        value=0.0,
-                        step=0.1,
-                        debounce=0.4,
-                        className="compact-dropdown",
-                    ),
-                ],
-                className="control-block",
-            ),
-            html.Div(
-                [
-                    html.Label(
-                        id="scenario-excise-label",
-                        children="Excise change (− = cut)",
-                        className="control-label",
-                    ),
-                    dcc.Input(
-                        id="scenario-excise-delta",
-                        type="number",
-                        value=0.0,
-                        step=0.1,
-                        debounce=0.4,
-                        className="compact-dropdown",
-                    ),
-                ],
-                className="control-block",
-            ),
-            html.Div(
-                [
-                    html.Label("Fan", className="control-label"),
-                    dcc.RadioItems(
-                        id="scenario-fan",
-                        options=[
-                            {"label": "68%", "value": "68"},
-                            {"label": "90%", "value": "90"},
-                            {"label": "Both", "value": "both"},
-                        ],
-                        value="68",
-                        inline=True,
-                        className="fan-radio",
-                    ),
-                ],
-                className="control-block",
-            ),
-            html.Button(
-                "Add / update",
-                id="scenario-apply",
-                n_clicks=0,
-                className="refresh-button",
-            ),
-            html.Button(
-                "Remove",
-                id="scenario-remove",
-                n_clicks=0,
-                className="refresh-button",
-            ),
-            html.Button(
-                "Reset all",
-                id="scenario-reset-all",
-                n_clicks=0,
-                className="refresh-button",
-            ),
-        ],
-        className="chart-controls",
-    )
-
-    return html.Div(
-        [
-            html.Div(
-                [
-                    html.H2("Scenarios", className="page-title"),
-                    html.P(
-                        "Conditional observable-price paths answer “what if the future "
-                        "commodity path were X?”. VAT/excise scenarios remain ex-post "
-                        "accounting shocks. Neither exercise re-estimates the BVAR; "
-                        "Structural remains the separate identified-innovation analysis.",
-                        className="page-subtitle",
-                    ),
-                ],
-                className="page-heading-row",
-            ),
-
-            # ----------------------------------------------------------
-            # Conditional observable path
-            # ----------------------------------------------------------
-            html.Div(
-                [
-                    html.Div(
-                        [
-                            html.H3(
-                                "Conditional commodity / observable path",
-                                className="panel-title",
-                            ),
-                            html.P(
-                                "V1 imposes one permanent future LEVEL path from the "
-                                "first forecast period onward. Only non-target endogenous "
-                                "variables are offered. Baseline and conditional forecasts "
-                                "reuse the exact same posterior draws, future SV, outliers "
-                                "and simulation-smoother randomness; the effect is then "
-                                "propagated through the saved HICP Energy pairing.",
-                                className="panel-subtitle",
-                            ),
-                        ]
-                    ),
-                    conditional_controls,
-                    html.Div(
-                        id="conditional-question",
-                        className="selection-banner",
-                    ),
-                    conditional_advanced,
-                    html.Div(
-                        id="conditional-support-note",
-                        className="selection-banner",
-                    ),
-                    html.Div(id="conditional-banner"),
-                    html.Div(
-                        [
-                            html.Button(
-                                "Add / update conditional",
-                                id="conditional-run",
-                                n_clicks=0,
-                                className="estimation-run-button",
-                            ),
-                            html.Button(
-                                "Remove selected",
-                                id="conditional-remove",
-                                n_clicks=0,
-                                className="refresh-button",
-                            ),
-                            html.Button(
-                                "Reset all conditionals",
-                                id="conditional-reset-all",
-                                n_clicks=0,
-                                className="refresh-button",
-                            ),
-                            html.Button(
-                                "Cancel",
-                                id="conditional-cancel",
-                                n_clicks=0,
-                                disabled=True,
-                                className="estimation-cancel-button",
-                            ),
-                            dcc.Link(
-                                "Open Headline scenarios →",
-                                href="/headline/scenarios",
-                                className="refresh-button",
-                                style={
-                                    "textDecoration": "none",
-                                    "display": "inline-flex",
-                                    "alignItems": "center",
-                                },
-                            ),
-                        ],
-                        className="estimation-actions",
-                    ),
-                    html.Div(
-                        [
-                            html.Progress(
-                                id="conditional-progress",
-                                value=0,
-                                max=100,
-                                className="estimation-progress",
-                            ),
-                            html.Div(
-                                [
-                                    html.Div(
-                                        "Idle",
-                                        id="conditional-phase",
-                                        className="estimation-phase",
-                                    ),
-                                    html.Div(
-                                        "Choose a saved aggregate, component and observable path, then compute.",
-                                        id="conditional-progress-detail",
-                                        className="estimation-progress-detail",
-                                    ),
-                                ],
-                                className="estimation-progress-text",
-                            ),
-                        ],
-                        className="estimation-progress-wrap",
-                    ),
-                ],
-                className="panel",
-            ),
-            html.Div(
-                [
-                    html.Div(
-                        [
-                            html.Div("Active conditional scenario set", className="eyebrow"),
-                            html.Div(id="conditional-set-summary"),
-                        ],
-                        className="panel",
-                        style={"padding": "16px 18px", "marginBottom": "16px"},
-                    )
-                ]
-            ),
-            html.Div(
-                [
-                    _stat_card(
-                        "Imposed future level",
-                        "conditional-stat-level",
-                        "conditional-stat-level-note",
-                    ),
-                    _stat_card(
-                        "Component terminal effect",
-                        "conditional-stat-component",
-                        "conditional-stat-component-note",
-                    ),
-                    _stat_card(
-                        "HICP Energy terminal effect",
-                        "conditional-stat-aggregate",
-                        "conditional-stat-aggregate-note",
-                    ),
-                    _stat_card(
-                        "Paired aggregate draws",
-                        "conditional-stat-draws",
-                        "conditional-stat-draws-note",
-                    ),
-                ],
-                className="stats-grid",
-            ),
-            html.Div(
-                [
-                    html.Div([html.Div("Key scenario results", className="eyebrow"), html.H3("Conditional effect by horizon", className="panel-title"), html.P("Component and HICP Energy effects from the same paired conditional draws used by the charts.", className="panel-subtitle")], className="panel-heading"),
-                    readable_table("conditional-effect-table", DUAL_IMPACT_COLUMNS, page_size=7),
-                ],
-                className="panel table-panel",
-            ),
-            html.Div(
-                [
-                    dcc.Loading(
-                        dcc.Graph(
-                            id="conditional-path-graph",
-                            config=_GRAPH_CONFIG,
-                        ),
-                        type="circle",
-                    )
-                ],
-                className="panel chart-panel",
-            ),
-            html.Div(
-                [
-                    html.Div(
-                        [
-                            dcc.Loading(
-                                dcc.Graph(
-                                    id="conditional-target-graph",
-                                    config=_GRAPH_CONFIG,
-                                ),
-                                type="circle",
-                            )
-                        ],
-                        className="panel chart-panel",
-                    ),
-                    html.Div(
-                        [
-                            dcc.Loading(
-                                dcc.Graph(
-                                    id="conditional-component-graph",
-                                    config=_GRAPH_CONFIG,
-                                ),
-                                type="circle",
-                            )
-                        ],
-                        className="panel chart-panel",
-                    ),
-                ],
-                style={
-                    "display": "grid",
-                    "gridTemplateColumns": "repeat(2, minmax(0, 1fr))",
-                    "gap": "16px",
-                },
-            ),
-            html.Div(
-                [
-                    html.Div(
-                        [
-                            dcc.Loading(
-                                dcc.Graph(
-                                    id="conditional-aggregate-graph",
-                                    config=_GRAPH_CONFIG,
-                                ),
-                                type="circle",
-                            )
-                        ],
-                        className="panel chart-panel",
-                    ),
-                    html.Div(
-                        [
-                            dcc.Loading(
-                                dcc.Graph(
-                                    id="conditional-aggregate-impact-graph",
-                                    config=_GRAPH_CONFIG,
-                                ),
-                                type="circle",
-                            )
-                        ],
-                        className="panel chart-panel",
-                    ),
-                ],
-                style={
-                    "display": "grid",
-                    "gridTemplateColumns": "repeat(2, minmax(0, 1fr))",
-                    "gap": "16px",
-                    "marginBottom": "24px",
-                },
-            ),
-
-            # ----------------------------------------------------------
-            # Existing tax scenario block
-            # ----------------------------------------------------------
-            html.Div(
-                [
-                    html.Div(
-                        [
-                            html.H3("VAT / excise scenarios", className="panel-title"),
-                            html.P(
-                                "Build several ex-post VAT/excise shocks on different "
-                                "energy components. Saved BVAR price draws remain fixed; "
-                                "the active tax set is propagated draw-by-draw to HICP Energy.",
-                                className="panel-subtitle",
-                            ),
-                        ]
-                    ),
-                    tax_controls,
-                ],
-                className="panel",
-            ),
-            html.Div(id="scenario-support-note", className="selection-banner"),
-            html.Div(id="scenario-tax-preview", className="selection-banner"),
-            html.Div(id="scenario-banner"),
-            html.Div(
-                [
-                    html.Div(
-                        [
-                            html.Div("Active tax scenario set", className="eyebrow"),
-                            html.Div(id="scenario-set-summary"),
-                        ],
-                        className="panel",
-                        style={"padding": "16px 18px", "marginBottom": "16px"},
-                    )
-                ]
-            ),
-            html.Div(
-                [
-                    _stat_card(
-                        "Baseline terminal YoY",
-                        "scenario-baseline-terminal",
-                        "scenario-terminal-date",
-                    ),
-                    _stat_card(
-                        "Scenario terminal YoY",
-                        "scenario-scenario-terminal",
-                        "scenario-terminal-date-2",
-                    ),
-                    _stat_card(
-                        "Terminal tax impact",
-                        "scenario-impact-terminal",
-                        "scenario-impact-interval",
-                    ),
-                    _stat_card(
-                        "Paired posterior draws",
-                        "scenario-draws",
-                        "scenario-draws-note",
-                    ),
-                ],
-                className="stats-grid",
-            ),
-            html.Div(
-                [
-                    html.Div([html.Div("Key scenario results", className="eyebrow"), html.H3("Tax scenario effect by horizon", className="panel-title"), html.P("Legacy tax artefacts persist quantiles rather than a posterior mean; central values here are therefore the saved posterior medians.", className="panel-subtitle")], className="panel-heading"),
-                    readable_table("scenario-effect-table", PAIRED_EFFECT_COLUMNS, page_size=7),
-                ],
-                className="panel table-panel",
-            ),
-            html.Div(
-                [
-                    dcc.Loading(
-                        dcc.Graph(
-                            id="scenario-main-graph",
-                            config=_GRAPH_CONFIG,
-                        ),
-                        type="circle",
-                    )
-                ],
-                className="panel chart-panel",
-            ),
-            html.Div(
-                [
-                    html.Div(
-                        [
-                            dcc.Loading(
-                                dcc.Graph(
-                                    id="scenario-level-impact",
-                                    config=_GRAPH_CONFIG,
-                                ),
-                                type="circle",
-                            )
-                        ],
-                        className="panel chart-panel",
-                    ),
-                    html.Div(
-                        [
-                            dcc.Loading(
-                                dcc.Graph(
-                                    id="scenario-yoy-impact",
-                                    config=_GRAPH_CONFIG,
-                                ),
-                                type="circle",
-                            )
-                        ],
-                        className="panel chart-panel",
-                    ),
-                ],
-                style={
-                    "display": "grid",
-                    "gridTemplateColumns": "repeat(2, minmax(0, 1fr))",
-                    "gap": "16px",
-                },
-            ),
-            html.Div(
-                [
-                    dcc.Loading(
-                        dcc.Graph(
-                            id="scenario-tax-graph",
-                            config=_GRAPH_CONFIG,
-                        ),
-                        type="circle",
-                    )
-                ],
-                className="panel chart-panel",
-            ),
-            html.Div(
-                [
-                    html.Div(
-                        [
-                            html.H3(
-                                "Selected tax scenario — HICP Energy marginal effect",
-                                className="panel-title",
-                            ),
-                            html.P(
-                                "The selected VAT/excise scenario is propagated alone through "
-                                "the same saved HICP Energy aggregate. The underlying pre-tax BVAR "
-                                "target is unchanged by construction.",
-                                className="panel-subtitle",
-                            ),
-                        ],
-                        className="panel-heading",
-                    ),
-                    html.Div(
-                        "BVAR target effect = 0 by construction for a pure tax scenario.",
-                        className="selection-banner",
-                    ),
-                    dcc.Loading(
-                        dcc.Graph(
-                            id="scenario-tax-energy-graph",
-                            config=_GRAPH_CONFIG,
-                        ),
-                        type="circle",
-                    ),
-                ],
-                className="panel chart-panel",
-            ),
-            html.Div(
-                [
-                    html.Div(
-                        [
-                            html.Div(
-                                [
-                                    html.Div(
-                                        "INTER-DOMAIN PROPAGATION",
-                                        className="eyebrow",
-                                    ),
-                                    html.H3(
-                                        "Propagation to HICP Energy and Headline",
-                                        className="panel-title",
-                                    ),
-                                    html.P(
-                                        "HICP Energy is read from the already materialized aggregate "
-                                        "scenario store. Headline is intentionally not recomputed "
-                                        "automatically; Core is zero by construction because the Core "
-                                        "definition excludes Energy.",
-                                        className="panel-subtitle",
-                                    ),
-                                ]
-                            ),
-                        ],
-                        className="panel-heading",
-                    ),
-                    html.Div(
-                        [
-                            dcc.Loading(
-                                html.Div(
-                                    _result_block(
-                                        eyebrow="HICP Energy impact",
-                                        value=None,
-                                        unit_date="Awaiting propagated aggregate scenario",
-                                        uncertainty=(
-                                            "Posterior mean and 68% interval appear after "
-                                            "agg-scenario-store is materialized."
-                                        ),
-                                        provenance=(
-                                            "source · agg-scenario-store · no materialized "
-                                            "propagation"
-                                        ),
-                                    ),
-                                    id="scenario-propagation-energy-result",
-                                ),
-                                type="circle",
-                            ),
-                            html.Div(
-                                [
-                                    dcc.Loading(
-                                        html.Div(
-                                            _result_block(
-                                                eyebrow="Headline impact",
-                                                value="Not calculated",
-                                                unit_date=(
-                                                    "Explicit conditional run required · "
-                                                    "~23 s warm / ~40 s cold"
-                                                ),
-                                                uncertainty=(
-                                                    "Point estimate and bands withheld until "
-                                                    "paired Energy-baseline/scenario Headline run."
-                                                ),
-                                                provenance=(
-                                                    "source · agg-scenario-store · Headline result "
-                                                    "not materialized"
-                                                ),
-                                            ),
-                                            id="scenario-propagation-headline-result",
-                                        ),
-                                        type="circle",
-                                    ),
-                                    html.Button(
-                                        "Calculate Headline impact (~23–40 s)",
-                                        id="scenario-propagation-headline-run",
-                                        n_clicks=0,
-                                        className="estimation-run-button",
-                                    ),
-                                    html.Div(
-                                        "Contract · Energy conditioned 3m, then freely propagated "
-                                        "9m inside the 12m DK horizon. Build an HICP Energy scenario "
-                                        "first, then calculate explicitly.",
-                                        id="scenario-propagation-headline-status",
-                                        className="propagation-headline-status",
-                                    ),
-                                ],
-                                className="propagation-headline-column",
-                            ),
-                            html.Div(
-                                _result_block(
-                                    eyebrow="Core impact",
-                                    value="0.00 pp",
-                                    unit_date="All horizons",
-                                    uncertainty=(
-                                        "Null by construction · Core excludes Energy."
-                                    ),
-                                    provenance=(
-                                        "definition · TOT_X_NRG_FOOD excludes Energy"
-                                    ),
-                                ),
-                                className="propagation-core-static",
-                            ),
-                        ],
-                        className="propagation-result-grid",
-                    ),
-                    dcc.Loading(
-                        dcc.Graph(
-                            id="scenario-propagation-headline-graph",
-                            figure=empty_scenario_figure(
-                                "Calculate Headline impact explicitly to materialize the B−A path."
-                            ),
-                            config=_GRAPH_CONFIG,
-                        ),
-                        type="circle",
-                    ),
-                    html.P(
-                        "Headline values are an explicit conditional-forecast calculation, "
-                        "not an automatic continuation of the fast component/HICP Energy "
-                        "scenario update. The future Headline result will use paired "
-                        "Energy-baseline/scenario draws before posterior summaries.",
-                        className="panel-subtitle propagation-contract-note",
-                    ),
-                ],
-                className="panel",
-                style={"marginTop": "24px", "marginBottom": "24px"},
-            ),
-            html.Div(
-                [
-                    html.Div(
-                        [
-                            html.Div(
-                                [
-                                    html.Div("JOINT ENERGY SCENARIO", className="eyebrow"),
-                                    html.H3(
-                                        "All active Energy assumptions — one HICP Energy distribution",
-                                        className="panel-title",
-                                    ),
-                                    html.P(
-                                        "All active conditional and tax scenarios are combined before one "
-                                        "draw-by-draw HICP Energy aggregation. Marginal effects are never added.",
-                                        className="panel-subtitle",
-                                    ),
-                                ]
-                            ),
-                            html.Div(
-                                [
-                                    dcc.RadioItems(
-                                        id="joint-energy-fan",
-                                        options=[
-                                            {"label": "68%", "value": "68"},
-                                            {"label": "90%", "value": "90"},
-                                            {"label": "Both", "value": "both"},
-                                        ],
-                                        value="68",
-                                        inline=True,
-                                        className="fan-radio",
-                                    ),
-                                    html.Button(
-                                        "Build / refresh joint scenario",
-                                        id="joint-energy-build",
-                                        n_clicks=0,
-                                        className="estimation-run-button",
-                                    ),
-                                    dcc.Link(
-                                        "Open Headline scenarios →",
-                                        href="/headline/scenarios",
-                                        className="refresh-button",
-                                        style={"textDecoration": "none"},
-                                    ),
-                                ],
-                                style={"display": "flex", "gap": "10px", "flexWrap": "wrap"},
-                            ),
-                        ],
-                        style={
-                            "display": "flex",
-                            "justifyContent": "space-between",
-                            "gap": "18px",
-                            "alignItems": "flex-start",
-                            "flexWrap": "wrap",
-                        },
-                    ),
-                    html.Div(id="joint-energy-active-summary", className="selection-banner"),
-                    html.Div(id="joint-energy-result-banner", className="selection-banner"),
-                    html.Div(
-                        [
-                            html.Progress(
-                                id="joint-energy-progress",
-                                value=0,
-                                max=100,
-                                className="estimation-progress",
-                            ),
-                            html.Div(
-                                [
-                                    html.Div("Idle", id="joint-energy-phase", className="estimation-phase"),
-                                    html.Div(
-                                        "Build the joint package when the active Energy assumptions are ready.",
-                                        id="joint-energy-progress-detail",
-                                        className="estimation-progress-detail",
-                                    ),
-                                ],
-                                className="estimation-progress-text",
-                            ),
-                        ],
-                        className="estimation-progress-wrap",
-                    ),
-                ],
-                className="panel",
-                style={"marginTop": "24px"},
-            ),
-            html.Div(
-                [
-                    dcc.Loading(
-                        dcc.Graph(id="joint-energy-main-graph", config=_GRAPH_CONFIG),
-                        type="circle",
-                    )
-                ],
-                className="panel chart-panel",
-            ),
-            html.Div(
-                [
-                    html.Div(
-                        [
-                            dcc.Loading(
-                                dcc.Graph(id="joint-energy-impact-graph", config=_GRAPH_CONFIG),
-                                type="circle",
-                            )
-                        ],
-                        className="panel chart-panel",
-                    ),
-                    html.Div(
-                        [
-                            dcc.Loading(
-                                dcc.Graph(id="joint-energy-contribution-graph", config=_GRAPH_CONFIG),
-                                type="circle",
-                            )
-                        ],
-                        className="panel chart-panel",
-                    ),
-                ],
-                style={
-                    "display": "grid",
-                    "gridTemplateColumns": "repeat(2, minmax(0, 1fr))",
-                    "gap": "16px",
-                    "marginBottom": "24px",
-                },
-            ),
-
-        ],
-        className="page-body",
-    )
+    conditional_controls = html.Div([html.Div([html.Label('Model', className='control-label'), dcc.Dropdown(id='scenario-model-select', options=[{'label': model_spec(model_id).label, 'value': model_id} for model_id in ENERGY_SUITE_MODEL_IDS], value='gas', clearable=False, persistence=True, persistence_type='session', className='compact-dropdown wide-control')], className='control-block wide-control'), html.Div([html.Label('Energy component', className='control-label'), dcc.Dropdown(id='conditional-component-select', options=[], value=None, clearable=False, className='compact-dropdown')], className='control-block'), html.Div([html.Label('Scenario driver', className='control-label'), dcc.Dropdown(id='conditional-variable-select', options=[], value=None, clearable=False, className='compact-dropdown')], className='control-block'), html.Div([html.Label('Assumption type', className='control-label'), dcc.RadioItems(id='conditional-path-mode', options=[{'label': '% vs last observed', 'value': 'percent'}, {'label': 'Absolute level', 'value': 'level'}], value='percent', inline=True, className='fan-radio')], className='control-block'), html.Div([html.Label('Change vs last observed (%)', id='conditional-path-value-label', className='control-label'), dcc.Input(id='conditional-path-value', type='number', value=10.0, step=0.1, debounce=0.4, className='compact-dropdown')], className='control-block'), html.Div([html.Label('Condition start (forecast offset)', className='selector-label'), dcc.Dropdown(id='conditional-window-start', options=[], value=None, clearable=False)], className='selector-block'), html.Div([html.Label('Condition end (forecast offset)', className='selector-label'), dcc.Dropdown(id='conditional-window-end', options=[], value=None, clearable=False)], className='selector-block'), html.Div([html.Label('Fan', className='control-label'), dcc.RadioItems(id='conditional-fan', options=[{'label': '68%', 'value': '68'}, {'label': '90%', 'value': '90'}, {'label': 'Both', 'value': 'both'}], value='68', inline=True, className='fan-radio')], className='control-block')], className='chart-controls')
+    conditional_advanced = html.Details([html.Summary('Advanced / source run', style={'fontWeight': '650', 'cursor': 'pointer', 'color': '#475569'}), html.Div([html.Label('HICP Energy aggregate run', className='control-label'), dcc.Dropdown(id='conditional-agg-select', options=[], value=None, clearable=False, className='compact-dropdown')], style={'maxWidth': '520px', 'paddingTop': '10px'})], style={'marginTop': '10px', 'marginBottom': '10px'})
+    tax_controls = html.Div([html.Div([html.Label('Component', className='control-label'), dcc.Dropdown(id='scenario-component-select', options=[], value=None, clearable=False, className='compact-dropdown')], className='control-block'), html.Div([html.Label('Scenario start', className='control-label'), dcc.DatePickerSingle(id='scenario-start-date', display_format='YYYY-MM-DD', first_day_of_week=1, clearable=False)], className='control-block'), html.Div([html.Label('VAT change (pp; − = cut)', className='control-label'), dcc.Input(id='scenario-vat-delta', type='number', value=0.0, step=0.1, debounce=0.4, className='compact-dropdown')], className='control-block'), html.Div([html.Label(id='scenario-excise-label', children='Excise change (− = cut)', className='control-label'), dcc.Input(id='scenario-excise-delta', type='number', value=0.0, step=0.1, debounce=0.4, className='compact-dropdown')], className='control-block'), html.Div([html.Label('Fan', className='control-label'), dcc.RadioItems(id='scenario-fan', options=[{'label': '68%', 'value': '68'}, {'label': '90%', 'value': '90'}, {'label': 'Both', 'value': 'both'}], value='68', inline=True, className='fan-radio')], className='control-block'), html.Button('Add / update', id='scenario-apply', n_clicks=0, className='refresh-button'), html.Button('Remove', id='scenario-remove', n_clicks=0, className='refresh-button'), html.Button('Reset all', id='scenario-reset-all', n_clicks=0, className='refresh-button')], className='chart-controls')
+    return html.Div([html.Div([html.H2('Scenarios', className='page-title'), html.P('Conditional observable-price paths answer “what if the future commodity path were X?”. VAT/excise scenarios remain ex-post accounting shocks. Neither exercise re-estimates the BVAR; Structural remains the separate identified-innovation analysis.', className='page-subtitle')], className='page-heading-row'), html.Div([html.Div([html.H3('Conditional commodity / observable path', className='panel-title'), html.P('Choose one observable/upstream driver and an inclusive forecast window. Only periods inside the window are hard LEVEL conditions; earlier and later periods are unconstrained but remain jointly smoothed, so they may react to the imposed future window through anticipation/propagation.', className='panel-subtitle')]), conditional_controls, html.Div(id='conditional-question', className='selection-banner'), conditional_advanced, html.Div(id='conditional-support-note', className='selection-banner'), html.Div(id='conditional-banner'), html.Div([html.Button('Add / update conditional', id='conditional-run', n_clicks=0, className='estimation-run-button'), html.Button('Remove selected', id='conditional-remove', n_clicks=0, className='refresh-button'), html.Button('Reset all conditionals', id='conditional-reset-all', n_clicks=0, className='refresh-button'), html.Button('Cancel', id='conditional-cancel', n_clicks=0, disabled=True, className='estimation-cancel-button'), dcc.Link('Open Headline scenarios →', href='/headline/scenarios', className='refresh-button', style={'textDecoration': 'none', 'display': 'inline-flex', 'alignItems': 'center'})], className='estimation-actions'), html.Div([html.Progress(id='conditional-progress', value=0, max=100, className='estimation-progress'), html.Div([html.Div('Idle', id='conditional-phase', className='estimation-phase'), html.Div('Choose a saved aggregate, component and observable path, then compute.', id='conditional-progress-detail', className='estimation-progress-detail')], className='estimation-progress-text')], className='estimation-progress-wrap')], className='panel'), html.Div([html.Div([html.Div('Active conditional scenario set', className='eyebrow'), html.Div(id='conditional-set-summary')], className='panel', style={'padding': '16px 18px', 'marginBottom': '16px'})]), html.Div([_stat_card('Imposed future level', 'conditional-stat-level', 'conditional-stat-level-note'), _stat_card('Component terminal effect', 'conditional-stat-component', 'conditional-stat-component-note'), _stat_card('HICP Energy terminal effect', 'conditional-stat-aggregate', 'conditional-stat-aggregate-note'), _stat_card('Paired aggregate draws', 'conditional-stat-draws', 'conditional-stat-draws-note')], className='stats-grid'), html.Div([html.Div([html.Div('Key scenario results', className='eyebrow'), html.H3('Conditional effect by horizon', className='panel-title'), html.P('Component and HICP Energy effects from the same paired conditional draws used by the charts.', className='panel-subtitle')], className='panel-heading'), readable_table('conditional-effect-table', DUAL_IMPACT_COLUMNS, page_size=7)], className='panel table-panel'), html.Div([dcc.Loading(dcc.Graph(id='conditional-path-graph', config=_GRAPH_CONFIG), type='circle')], className='panel chart-panel'), html.Div([html.Div([dcc.Loading(dcc.Graph(id='conditional-target-graph', config=_GRAPH_CONFIG), type='circle')], className='panel chart-panel'), html.Div([dcc.Loading(dcc.Graph(id='conditional-component-graph', config=_GRAPH_CONFIG), type='circle')], className='panel chart-panel')], style={'display': 'grid', 'gridTemplateColumns': 'repeat(2, minmax(0, 1fr))', 'gap': '16px'}), html.Div([html.Div([dcc.Loading(dcc.Graph(id='conditional-aggregate-graph', config=_GRAPH_CONFIG), type='circle')], className='panel chart-panel'), html.Div([dcc.Loading(dcc.Graph(id='conditional-aggregate-impact-graph', config=_GRAPH_CONFIG), type='circle')], className='panel chart-panel')], style={'display': 'grid', 'gridTemplateColumns': 'repeat(2, minmax(0, 1fr))', 'gap': '16px', 'marginBottom': '24px'}), html.Div([html.Div([html.H3('VAT / excise scenarios', className='panel-title'), html.P('Build several ex-post VAT/excise shocks on different energy components. Saved BVAR price draws remain fixed; the active tax set is propagated draw-by-draw to HICP Energy.', className='panel-subtitle')]), tax_controls], className='panel'), html.Div(id='scenario-support-note', className='selection-banner'), html.Div(id='scenario-tax-preview', className='selection-banner'), html.Div(id='scenario-banner'), html.Div([html.Div([html.Div('Active tax scenario set', className='eyebrow'), html.Div(id='scenario-set-summary')], className='panel', style={'padding': '16px 18px', 'marginBottom': '16px'})]), html.Div([_stat_card('Baseline terminal YoY', 'scenario-baseline-terminal', 'scenario-terminal-date'), _stat_card('Scenario terminal YoY', 'scenario-scenario-terminal', 'scenario-terminal-date-2'), _stat_card('Terminal tax impact', 'scenario-impact-terminal', 'scenario-impact-interval'), _stat_card('Paired posterior draws', 'scenario-draws', 'scenario-draws-note')], className='stats-grid'), html.Div([html.Div([html.Div('Key scenario results', className='eyebrow'), html.H3('Tax scenario effect by horizon', className='panel-title'), html.P('Legacy tax artefacts persist quantiles rather than a posterior mean; central values here are therefore the saved posterior medians.', className='panel-subtitle')], className='panel-heading'), readable_table('scenario-effect-table', PAIRED_EFFECT_COLUMNS, page_size=7)], className='panel table-panel'), html.Div([dcc.Loading(dcc.Graph(id='scenario-main-graph', config=_GRAPH_CONFIG), type='circle')], className='panel chart-panel'), html.Div([html.Div([dcc.Loading(dcc.Graph(id='scenario-level-impact', config=_GRAPH_CONFIG), type='circle')], className='panel chart-panel'), html.Div([dcc.Loading(dcc.Graph(id='scenario-yoy-impact', config=_GRAPH_CONFIG), type='circle')], className='panel chart-panel')], style={'display': 'grid', 'gridTemplateColumns': 'repeat(2, minmax(0, 1fr))', 'gap': '16px'}), html.Div([dcc.Loading(dcc.Graph(id='scenario-tax-graph', config=_GRAPH_CONFIG), type='circle')], className='panel chart-panel'), html.Div([html.Div([html.H3('Selected tax scenario — HICP Energy marginal effect', className='panel-title'), html.P('The selected VAT/excise scenario is propagated alone through the same saved HICP Energy aggregate. The underlying pre-tax BVAR target is unchanged by construction.', className='panel-subtitle')], className='panel-heading'), html.Div('BVAR target effect = 0 by construction for a pure tax scenario.', className='selection-banner'), dcc.Loading(dcc.Graph(id='scenario-tax-energy-graph', config=_GRAPH_CONFIG), type='circle')], className='panel chart-panel'), html.Div([html.Div([html.Div([html.Div('INTER-DOMAIN PROPAGATION', className='eyebrow'), html.H3('Propagation to HICP Energy and Headline', className='panel-title'), html.P('HICP Energy is read from the already materialized aggregate scenario store. Headline is intentionally not recomputed automatically; Core is zero by construction because the Core definition excludes Energy.', className='panel-subtitle')])], className='panel-heading'), html.Div([dcc.Loading(html.Div(_result_block(eyebrow='HICP Energy impact', value=None, unit_date='Awaiting propagated aggregate scenario', uncertainty='Posterior mean and 68% interval appear after agg-scenario-store is materialized.', provenance='source · agg-scenario-store · no materialized propagation'), id='scenario-propagation-energy-result'), type='circle'), html.Div([dcc.Loading(html.Div(_result_block(eyebrow='Headline impact', value='Not calculated', unit_date='Explicit conditional run required · ~23 s warm / ~40 s cold', uncertainty='Point estimate and bands withheld until paired Energy-baseline/scenario Headline run.', provenance='source · agg-scenario-store · Headline result not materialized'), id='scenario-propagation-headline-result'), type='circle'), html.Button('Calculate Headline impact (~23–40 s)', id='scenario-propagation-headline-run', n_clicks=0, className='estimation-run-button'), html.Div('Contract · Energy conditioned 3m, then freely propagated 9m inside the 12m DK horizon. Build an HICP Energy scenario first, then calculate explicitly.', id='scenario-propagation-headline-status', className='propagation-headline-status')], className='propagation-headline-column'), html.Div(_result_block(eyebrow='Core impact', value='0.00 pp', unit_date='All horizons', uncertainty='Null by construction · Core excludes Energy.', provenance='definition · TOT_X_NRG_FOOD excludes Energy'), className='propagation-core-static')], className='propagation-result-grid'), dcc.Loading(dcc.Graph(id='scenario-propagation-headline-graph', figure=empty_scenario_figure('Calculate Headline impact explicitly to materialize the B−A path.'), config=_GRAPH_CONFIG), type='circle'), html.P('Headline values are an explicit conditional-forecast calculation, not an automatic continuation of the fast component/HICP Energy scenario update. The future Headline result will use paired Energy-baseline/scenario draws before posterior summaries.', className='panel-subtitle propagation-contract-note')], className='panel', style={'marginTop': '24px', 'marginBottom': '24px'}), html.Div([html.Div([html.Div([html.Div('JOINT ENERGY SCENARIO', className='eyebrow'), html.H3('All active Energy assumptions — one HICP Energy distribution', className='panel-title'), html.P('All active conditional and tax scenarios are combined before one draw-by-draw HICP Energy aggregation. Marginal effects are never added.', className='panel-subtitle')]), html.Div([dcc.RadioItems(id='joint-energy-fan', options=[{'label': '68%', 'value': '68'}, {'label': '90%', 'value': '90'}, {'label': 'Both', 'value': 'both'}], value='68', inline=True, className='fan-radio'), html.Button('Build / refresh joint scenario', id='joint-energy-build', n_clicks=0, className='estimation-run-button'), dcc.Link('Open Headline scenarios →', href='/headline/scenarios', className='refresh-button', style={'textDecoration': 'none'})], style={'display': 'flex', 'gap': '10px', 'flexWrap': 'wrap'})], style={'display': 'flex', 'justifyContent': 'space-between', 'gap': '18px', 'alignItems': 'flex-start', 'flexWrap': 'wrap'}), html.Div(id='joint-energy-active-summary', className='selection-banner'), html.Div(id='joint-energy-result-banner', className='selection-banner'), html.Div([html.Progress(id='joint-energy-progress', value=0, max=100, className='estimation-progress'), html.Div([html.Div('Idle', id='joint-energy-phase', className='estimation-phase'), html.Div('Build the joint package when the active Energy assumptions are ready.', id='joint-energy-progress-detail', className='estimation-progress-detail')], className='estimation-progress-text')], className='estimation-progress-wrap')], className='panel', style={'marginTop': '24px'}), html.Div([dcc.Loading(dcc.Graph(id='joint-energy-main-graph', config=_GRAPH_CONFIG), type='circle')], className='panel chart-panel'), html.Div([html.Div([dcc.Loading(dcc.Graph(id='joint-energy-impact-graph', config=_GRAPH_CONFIG), type='circle')], className='panel chart-panel'), html.Div([dcc.Loading(dcc.Graph(id='joint-energy-contribution-graph', config=_GRAPH_CONFIG), type='circle')], className='panel chart-panel')], style={'display': 'grid', 'gridTemplateColumns': 'repeat(2, minmax(0, 1fr))', 'gap': '16px', 'marginBottom': '24px'})], className='page-body')
 
 
 
@@ -2937,6 +2071,24 @@ def structural_page() -> html.Div:
                 [
                     html.Div(
                         [
+                            html.Div(
+                                [
+                                    html.Label("Model", className="control-label"),
+                                    dcc.Dropdown(
+                                        id="structural-model-select",
+                                        options=[
+                                            {"label": model_spec(model_id).label, "value": model_id}
+                                            for model_id in ENERGY_SUITE_MODEL_IDS
+                                        ],
+                                        value="gas",
+                                        clearable=False,
+                                        persistence=True,
+                                        persistence_type="session",
+                                        className="compact-dropdown wide-control",
+                                    ),
+                                ],
+                                className="control-block wide-control",
+                            ),
                             html.Div(
                                 [
                                     html.Label("Horizon", className="control-label"),
@@ -3014,7 +2166,7 @@ def structural_page() -> html.Div:
                         ],
                         style={
                             "display": "grid",
-                            "gridTemplateColumns": "minmax(110px,.45fr) minmax(130px,.5fr) minmax(250px,1fr) minmax(180px,.75fr)",
+                            "gridTemplateColumns": "minmax(180px,.8fr) minmax(110px,.45fr) minmax(130px,.5fr) minmax(250px,1fr) minmax(180px,.75fr)",
                             "gap": "14px", "alignItems": "end",
                         },
                     ),
@@ -5123,13 +4275,30 @@ def _with_page_navigation(
     domain: str,
     forecast_view: str | None = None,
 ):
-    additions = [_domain_switch(section)]
-    if section == "forecast" and domain == "energy":
-        additions.append(_forecast_view_switch(forecast_view or "components"))
-    if not _insert_page_navigation(page, additions):
+    """Keep the three-domain switch as a direct sticky child of every domain page."""
+    children = getattr(page, "children", None)
+    if not isinstance(children, list):
         raise RuntimeError(
-            f"Could not find a page title for section={section!r}, domain={domain!r}."
+            f"Domain page has no direct children list for section={section!r}, "
+            f"domain={domain!r}."
         )
+
+    # Direct child of page-body: CSS sticky is then bounded by the whole page,
+    # not by a short heading row, so Energy / Headline HICP / Core remain
+    # accessible while the user scrolls.
+    children.insert(0, _domain_switch(section))
+
+    # Keep the existing Energy Forecast sub-view switch near the page heading;
+    # only the three-domain switch becomes page-sticky.
+    if section == "forecast" and domain == "energy":
+        if not _insert_page_navigation(
+            page,
+            [_forecast_view_switch(forecast_view or "components")],
+        ):
+            raise RuntimeError(
+                f"Could not find the Energy Forecast page title for "
+                f"forecast_view={forecast_view!r}."
+            )
     return page
 
 
@@ -5181,11 +4350,6 @@ def sidebar() -> html.Aside:
                 [
                     _nav_link("Overview", "/overview", "◎"),
                     _nav_link("Data", "/data", "▦"),
-                    *(
-                        [_nav_link("Economic Data", "/economic-data", "▤")]
-                        if ECONOMIC_DATA_ENABLED
-                        else []
-                    ),
                 ],
                 id="global-nav",
                 className="nav-stack",
@@ -5241,8 +4405,8 @@ def topbar() -> html.Div:
             html.Div(
                 [
                     _selector("Production vintage", "vintage-select", "Select production vintage"),
-                    _selector("Model", "model-select", "Select model"),
-                    _selector("Forecast", "forecast-select", "Forecast contract"),
+                    html.Div([_selector("Model", "model-select", "Select model")], style={"display": "none"}),
+                    html.Div([_selector("Forecast", "forecast-select", "Forecast contract")], style={"display": "none"}),
                     _selector("Run", "run-select", "Select run"),
                 ],
                 className="selectors-grid",
@@ -5317,16 +4481,6 @@ app.layout = html.Div(
                     [
                         html.Div(overview_page(), id="page-overview", style={"display": "none"}),
                         html.Div(data_page(), id="page-data", style={"display": "none"}),
-                        html.Div(
-                            (
-                                _economic_data_page()
-                                if ECONOMIC_DATA_ENABLED
-                                and _economic_data_page is not None
-                                else None
-                            ),
-                            id="page-economic-data",
-                            style={"display": "none"},
-                        ),
                         html.Div(_with_page_navigation(forecast_page(), section="forecast", domain="energy", forecast_view="components"), id="page-forecast"),
                         html.Div(
                             _with_page_navigation(aggregate_page(), section="forecast", domain="energy", forecast_view="aggregate"),
@@ -5693,12 +4847,20 @@ def vintage_options(
     Input("registry-store", "data"),
     Input("url", "pathname"),
     State("model-select", "value"),
+    State("forecast-model-select", "value"),
+    State("scenario-model-select", "value"),
+    State("structural-model-select", "value"),
+    State("est-model-select", "value"),
 )
 def model_options(
     vintage: str | None,
     _: dict | None,
     pathname: str | None,
     current: str | None,
+    forecast_model: str | None,
+    scenario_model: str | None,
+    structural_model: str | None,
+    estimation_model: str | None,
 ):
     if not vintage:
         return [], None
@@ -5710,7 +4872,8 @@ def model_options(
     if forecasts.empty:
         return [], None
 
-    domain = "headline" if (pathname or "").startswith("/core") else domain_from_path(pathname)
+    path = pathname or "/forecast"
+    domain = "headline" if path.startswith("/core") else domain_from_path(path)
     models = models_for_domain(
         forecasts["model_id"].astype(str).unique(),
         domain,
@@ -5720,10 +4883,25 @@ def model_options(
         for model_id in models
     ]
     values = [item["value"] for item in options]
-    return (
-        options,
-        current if current in values else (values[0] if values else None),
-    )
+
+    local_candidate = None
+    if domain == "energy":
+        if path in {"/forecast", "/forecast/aggregate", "/aggregate"}:
+            local_candidate = forecast_model
+        elif path == "/scenarios":
+            local_candidate = scenario_model
+        elif path == "/structural":
+            local_candidate = structural_model
+        elif path == "/estimation":
+            local_candidate = estimation_model
+
+    if local_candidate in values:
+        selected = local_candidate
+    elif current in values:
+        selected = current
+    else:
+        selected = values[0] if values else None
+    return options, selected
 
 
 @callback(
@@ -5740,6 +4918,9 @@ def forecast_options(
     _: dict | None,
     current: str | None,
 ):
+    # current is retained in the callback contract for compatibility, but the
+    # now-hidden control is deliberately locked to the production forecast.
+    _ = current
     if not vintage or not model_id:
         return [], None
     frame = _registry_table("forecasts")
@@ -5748,10 +4929,19 @@ def forecast_options(
             frame["model_id"].astype(str).eq(str(model_id))
             & frame["vintage"].astype(str).eq(str(vintage))
         ].copy()
-    names = sorted(frame["forecast_name"].astype(str).unique()) if not frame.empty else []
-    options = [{"label": name.replace("_", " ").title(), "value": name} for name in names]
-    preferred = "unconditional" if "unconditional" in names else (names[0] if names else None)
-    return options, current if current in names else preferred
+    names = sorted(
+        frame["forecast_name"].astype(str).unique()
+    ) if not frame.empty else []
+    if "unconditional" in names:
+        return (
+            [{"label": "Unconditional", "value": "unconditional"}],
+            "unconditional",
+        )
+    options = [
+        {"label": name.replace("_", " ").title(), "value": name}
+        for name in names
+    ]
+    return options, (names[0] if names else None)
 
 
 @callback(
@@ -6042,6 +5232,100 @@ def sync_estimation_model(pathname, global_model, current):
     if global_model in ENERGY_SUITE_MODEL_IDS:
         return global_model
     return current if current in ENERGY_SUITE_MODEL_IDS else "gas"
+
+# ENERGY_LOCAL_MODEL_SELECTORS_V2
+@callback(
+    Output("model-select", "value", allow_duplicate=True),
+    Output("scenario-model-select", "value", allow_duplicate=True),
+    Output("structural-model-select", "value", allow_duplicate=True),
+    Output("est-model-select", "value", allow_duplicate=True),
+    Input("forecast-model-select", "value"),
+    State("url", "pathname"),
+    prevent_initial_call=True,
+)
+def sync_forecast_model(local_model, pathname):
+    if (pathname or "") not in {"/forecast", "/forecast/aggregate", "/aggregate"}:
+        raise PreventUpdate
+    if local_model not in ENERGY_SUITE_MODEL_IDS:
+        raise PreventUpdate
+    return local_model, local_model, local_model, local_model
+
+
+@callback(
+    Output("model-select", "value", allow_duplicate=True),
+    Output("forecast-model-select", "value", allow_duplicate=True),
+    Output("structural-model-select", "value", allow_duplicate=True),
+    Output("est-model-select", "value", allow_duplicate=True),
+    Output("conditional-component-select", "value", allow_duplicate=True),
+    Output("scenario-component-select", "value", allow_duplicate=True),
+    Input("scenario-model-select", "value"),
+    State("url", "pathname"),
+    State("conditional-component-select", "options"),
+    State("scenario-component-select", "options"),
+    prevent_initial_call=True,
+)
+def sync_scenario_model(
+    local_model,
+    pathname,
+    conditional_options,
+    tax_options,
+):
+    if (pathname or "") != "/scenarios":
+        raise PreventUpdate
+    if local_model not in ENERGY_SUITE_MODEL_IDS:
+        raise PreventUpdate
+
+    def _listed(options):
+        return any(
+            str(item.get("value")) == str(local_model)
+            for item in (options or [])
+            if isinstance(item, dict)
+        )
+
+    conditional_value = local_model if _listed(conditional_options) else no_update
+    tax_value = local_model if _listed(tax_options) else no_update
+    return (
+        local_model,
+        local_model,
+        local_model,
+        local_model,
+        conditional_value,
+        tax_value,
+    )
+
+
+@callback(
+    Output("model-select", "value", allow_duplicate=True),
+    Output("forecast-model-select", "value", allow_duplicate=True),
+    Output("scenario-model-select", "value", allow_duplicate=True),
+    Output("est-model-select", "value", allow_duplicate=True),
+    Input("structural-model-select", "value"),
+    State("url", "pathname"),
+    prevent_initial_call=True,
+)
+def sync_structural_model(local_model, pathname):
+    if (pathname or "") != "/structural":
+        raise PreventUpdate
+    if local_model not in ENERGY_SUITE_MODEL_IDS:
+        raise PreventUpdate
+    return local_model, local_model, local_model, local_model
+
+
+@callback(
+    Output("model-select", "value", allow_duplicate=True),
+    Output("forecast-model-select", "value", allow_duplicate=True),
+    Output("scenario-model-select", "value", allow_duplicate=True),
+    Output("structural-model-select", "value", allow_duplicate=True),
+    Input("est-model-select", "value"),
+    State("url", "pathname"),
+    prevent_initial_call=True,
+)
+def push_estimation_model(local_model, pathname):
+    if (pathname or "") != "/estimation":
+        raise PreventUpdate
+    if local_model not in ENERGY_SUITE_MODEL_IDS:
+        raise PreventUpdate
+    return local_model, local_model, local_model, local_model
 
 
 @callback(
@@ -9730,7 +9014,7 @@ def structural_hd_graph(hd_state, response, window, relayout_data):
 def domain_navigation_styles(pathname: str | None):
     path = pathname or ""
     hidden = {"display": "none"}
-    if path in {"/", "/overview", "/data", "/economic-data"}:
+    if path in {"/", "/overview", "/data"}:
         # Global pages have no domain of their own; keep the section tabs visible.
         return {}, hidden, hidden
     domain = domain_from_path(pathname)
@@ -9751,7 +9035,7 @@ def domain_navigation_styles(pathname: str | None):
 def data_shell_visibility(pathname: str | None):
     path = pathname or ""
     if path in {
-        "/", "/overview", "/data", "/economic-data",
+        "/", "/overview", "/data",
         "/estimation", "/estimation/headline", "/estimation/core",
         "/headline/estimation", "/headline/diagnostics", "/core/estimation",
     }:
@@ -9764,7 +9048,6 @@ def data_shell_visibility(pathname: str | None):
 @callback(
     Output("page-overview", "style"),
     Output("page-data", "style"),
-    Output("page-economic-data", "style"),
     Output("page-forecast", "style"),
     Output("page-aggregate", "style"),
     Output("page-scenarios", "style"),
@@ -9786,11 +9069,6 @@ def route(pathname: str | None):
         "/": "overview",
         "/overview": "overview",
         "/data": "data",
-        "/economic-data": (
-            "economic-data" if ECONOMIC_DATA_ENABLED else "overview"
-        ),
-
-        # Canonical section-first Energy routes.
         "/forecast": "forecast",
         "/forecast/aggregate": "aggregate",
         "/scenarios": "scenarios",
@@ -9833,7 +9111,6 @@ def route(pathname: str | None):
     names = (
         "overview",             # 1  page-overview
         "data",                 # 2  page-data
-        "economic-data",        # 3  page-economic-data
         "forecast",             # 4  page-forecast
         "aggregate",            # 5  page-aggregate
         "scenarios",            # 6  page-scenarios
@@ -9996,143 +9273,52 @@ def update_forecast_view(
 
 # ---------------------------------------------------------------------------
 # ENERGY_SCENARIO_WORKSPACE_V1
-def _joint_energy_dashboard_recipe(
-    *,
-    conditional_store,
-    tax_store,
-    vintage,
-    selected_aggregate_run_id,
-):
-    vintage = str(vintage or "")
+def _joint_energy_dashboard_recipe(*, conditional_store, tax_store, vintage, selected_aggregate_run_id):
+    vintage = str(vintage or '')
     if not vintage:
-        raise ConditionalScenarioError(
-            "No production vintage is selected."
-        )
-
+        raise ConditionalScenarioError('No production vintage is selected.')
     conditional_specs = []
     aggregate_ids = set()
     labels = []
-    for model_id in conditional_set_components(
-        conditional_store
-    ):
-        payload = conditional_set_payload(
-            conditional_store,
-            model_id,
-        )
-        meta = dict((payload or {}).get("meta") or {})
+    for model_id in conditional_set_components(conditional_store):
+        payload = conditional_set_payload(conditional_store, model_id)
+        meta = dict((payload or {}).get('meta') or {})
         if not meta:
             continue
-        item_vintage = str(meta.get("vintage") or vintage)
+        item_vintage = str(meta.get('vintage') or vintage)
         if item_vintage != vintage:
-            raise ConditionalScenarioError(
-                f"{model_id}: conditional vintage {item_vintage} "
-                f"!= production vintage {vintage}."
-            )
-        aggregate_run_id = str(
-            meta.get("aggregate_run_id") or ""
-        )
+            raise ConditionalScenarioError(f'{model_id}: conditional vintage {item_vintage} != production vintage {vintage}.')
+        aggregate_run_id = str(meta.get('aggregate_run_id') or '')
         if not aggregate_run_id:
-            raise ConditionalScenarioError(
-                f"{model_id}: active conditional does not record aggregate_run_id."
-            )
+            raise ConditionalScenarioError(f'{model_id}: active conditional does not record aggregate_run_id.')
         aggregate_ids.add(aggregate_run_id)
-        conditional_specs.append(
-            {
-                "vintage": vintage,
-                "aggregate_run_id": aggregate_run_id,
-                "model_id": str(model_id),
-                "condition_variable": str(
-                    meta.get("condition_variable") or ""
-                ),
-                "path_mode": str(meta.get("path_mode") or ""),
-                "path_value": float(meta.get("path_value")),
-            }
-        )
-        labels.append(
-            {
-                "kind": "Conditional",
-                "component": str(
-                    meta.get("model_label") or model_id
-                ),
-                "detail": str(
-                    meta.get("condition_description")
-                    or meta.get("condition_variable")
-                    or ""
-                ),
-            }
-        )
-
-    tax_scenarios = scenario_set_to_tax_scenarios(
-        tax_store
-    )
+        conditional_specs.append({'vintage': vintage, 'aggregate_run_id': aggregate_run_id, 'model_id': str(model_id), 'condition_variable': str(meta.get('condition_variable') or ''), 'path_mode': str(meta.get('path_mode') or ''), 'path_value': float(meta.get('path_value')), 'condition_start': int(meta.get('condition_start') or 1), 'condition_end': None if meta.get('condition_end') is None else int(meta.get('condition_end')), 'condition_mask_hash': meta.get('condition_mask_hash')})
+        labels.append({'kind': 'Conditional', 'component': str(meta.get('model_label') or model_id), 'detail': str(meta.get('condition_description') or meta.get('condition_variable') or '')})
+    tax_scenarios = scenario_set_to_tax_scenarios(tax_store)
     for row in scenario_set_summary(tax_store):
-        vat = float(row.get("vat_delta_pp", 0.0) or 0.0)
-        excise = float(row.get("excise_delta", 0.0) or 0.0)
+        vat = float(row.get('vat_delta_pp', 0.0) or 0.0)
+        excise = float(row.get('excise_delta', 0.0) or 0.0)
         if abs(vat) < 1e-15 and abs(excise) < 1e-15:
             continue
-        detail = f"VAT {vat:+.2f} pp"
+        detail = f'VAT {vat:+.2f} pp'
         if abs(excise) >= 1e-15:
-            detail += (
-                f" · excise {excise:+.3f} "
-                + str(row.get("excise_unit") or "")
-            )
-        labels.append(
-            {
-                "kind": "Tax",
-                "component": str(
-                    row.get("label")
-                    or row.get("model_id")
-                    or "Energy component"
-                ),
-                "detail": detail,
-            }
-        )
-
+            detail += f' · excise {excise:+.3f} ' + str(row.get('excise_unit') or '')
+        labels.append({'kind': 'Tax', 'component': str(row.get('label') or row.get('model_id') or 'Energy component'), 'detail': detail})
     count = len(conditional_specs) + len(tax_scenarios)
     if count < 1:
-        raise ConditionalScenarioError(
-            "No active conditional or tax Energy scenario."
-        )
-
-    selected = str(selected_aggregate_run_id or "")
+        raise ConditionalScenarioError('No active conditional or tax Energy scenario.')
+    selected = str(selected_aggregate_run_id or '')
     if not aggregate_ids:
         if not selected:
-            raise ConditionalScenarioError(
-                "Select the HICP Energy aggregate run used by the joint package."
-            )
+            raise ConditionalScenarioError('Select the HICP Energy aggregate run used by the joint package.')
         aggregate_ids.add(selected)
     elif selected and selected not in aggregate_ids:
-        raise ConditionalScenarioError(
-            "The selected aggregate run differs from the aggregate used by "
-            "the active conditional scenarios."
-        )
-
+        raise ConditionalScenarioError('The selected aggregate run differs from the aggregate used by the active conditional scenarios.')
     if len(aggregate_ids) != 1:
-        raise ConditionalScenarioError(
-            "Active conditional scenarios refer to different HICP Energy "
-            "aggregate runs: "
-            + ", ".join(sorted(aggregate_ids))
-        )
+        raise ConditionalScenarioError('Active conditional scenarios refer to different HICP Energy aggregate runs: ' + ', '.join(sorted(aggregate_ids)))
     aggregate_run_id = next(iter(aggregate_ids))
-    signature = json.dumps(
-        {
-            "vintage": vintage,
-            "aggregate_run_id": aggregate_run_id,
-            "conditional": conditional_specs,
-            "tax": tax_scenarios,
-        },
-        sort_keys=True,
-        default=str,
-    )
-    return {
-        "vintage": vintage,
-        "aggregate_run_id": aggregate_run_id,
-        "conditional_specs": conditional_specs,
-        "tax_scenarios": tax_scenarios,
-        "labels": labels,
-        "scenario_count": count,
-        "signature": signature,
-    }
+    signature = json.dumps({'vintage': vintage, 'aggregate_run_id': aggregate_run_id, 'conditional': conditional_specs, 'tax': tax_scenarios}, sort_keys=True, default=str)
+    return {'vintage': vintage, 'aggregate_run_id': aggregate_run_id, 'conditional_specs': conditional_specs, 'tax_scenarios': tax_scenarios, 'labels': labels, 'scenario_count': count, 'signature': signature}
 
 
 @callback(
@@ -10750,261 +9936,99 @@ def conditional_variable_options(
     return options, value
 
 
-@callback(
-    Output("conditional-path-value-label", "children"),
-    Output("conditional-path-value", "value"),
-    Output("conditional-question", "children"),
-    Output("conditional-support-note", "children"),
-    Input("conditional-agg-select", "value"),
-    Input("conditional-component-select", "value"),
-    Input("conditional-variable-select", "value"),
-    Input("conditional-path-mode", "value"),
-    Input("vintage-select", "value"),
-    Input("conditional-store", "data"),
-)
-def conditional_path_defaults(
-    aggregate_run_id,
-    model_id,
-    condition_variable,
-    path_mode,
-    vintage,
-    conditional_store,
-):
+@callback(Output('conditional-path-value-label', 'children'), Output('conditional-path-value', 'value'), Output('conditional-question', 'children'), Output('conditional-support-note', 'children'), Output('conditional-window-start', 'options'), Output('conditional-window-start', 'value'), Output('conditional-window-end', 'options'), Output('conditional-window-end', 'value'), Input('conditional-agg-select', 'value'), Input('conditional-component-select', 'value'), Input('conditional-variable-select', 'value'), Input('conditional-path-mode', 'value'), Input('vintage-select', 'value'), Input('conditional-store', 'data'))
+def conditional_path_defaults(aggregate_run_id, model_id, condition_variable, path_mode, vintage, conditional_store):
     row = _selected_aggregate_row(vintage, aggregate_run_id)
-    if row is None or not model_id or not condition_variable:
-        return (
-            "Scenario value",
-            10.0 if path_mode != "level" else None,
-            "Choose an Energy component and a scenario driver.",
-            "The source aggregate is selected automatically from the production vintage.",
-        )
+    if row is None or not model_id or (not condition_variable):
+        return ('Scenario value', 10.0 if path_mode != 'level' else None, 'Choose an Energy component and a scenario driver.', 'The source aggregate is selected automatically from the production vintage.', [], None, [], None)
     try:
-        contract = _cached_conditional_component_contract(
-            Path(str(row["directory"])),
-            model_id=str(model_id),
-        )
-        latest = dict(contract.get("latest_observed", {}) or {}).get(
-            str(condition_variable), {}
-        )
-        last_value = float(latest["value"])
-        last_date = pd.Timestamp(latest["date"]).date().isoformat()
-        unit = str(
-            latest.get("unit")
-            or contract.get("units", {}).get(condition_variable, "")
-        )
-        future = pd.to_datetime(contract.get("future_dates", []))
-        start = (
-            pd.Timestamp(future[0]).date().isoformat() if len(future) else "—"
-        )
-        end = (
-            pd.Timestamp(future[-1]).date().isoformat() if len(future) else "—"
-        )
-
+        contract = _cached_conditional_component_contract(Path(str(row['directory'])), model_id=str(model_id))
+        latest = dict(contract.get('latest_observed', {}) or {}).get(str(condition_variable), {})
+        last_value = float(latest['value'])
+        last_date = pd.Timestamp(latest['date']).date().isoformat()
+        unit = str(latest.get('unit') or contract.get('units', {}).get(condition_variable, ''))
+        future = pd.to_datetime(contract.get('future_dates', []))
+        start = pd.Timestamp(future[0]).date().isoformat() if len(future) else '—'
+        end = pd.Timestamp(future[-1]).date().isoformat() if len(future) else '—'
+        H = int(contract.get('H') or len(future))
+        if H < 1:
+            raise ConditionalScenarioError('The saved forecast has no future period.')
+        period_prefix = 'W' if str(contract.get('frequency') or '').lower() == 'weekly' else 'M'
+        window_options = [{'label': f'{period_prefix}+{x}', 'value': x} for x in range(1, H + 1)]
         existing = conditional_set_payload(conditional_store, model_id)
-        em = dict((existing or {}).get("meta", {}) or {})
-        same_variable = (
-            str(em.get("condition_variable") or "") == str(condition_variable)
-        )
-
-        if str(path_mode) == "level":
-            label = f"Scenario level{f' ({unit})' if unit else ''}"
-            if same_variable and str(em.get("path_mode")) == "level":
-                value = float(em.get("path_value"))
+        em = dict((existing or {}).get('meta', {}) or {})
+        same_variable = str(em.get('condition_variable') or '') == str(condition_variable)
+        if same_variable:
+            window_start = int(em.get('condition_start') or 1)
+            raw_end = em.get('condition_end')
+            window_end = H if raw_end is None else int(raw_end)
+        else:
+            window_start = 1
+            window_end = H
+        window_start = min(max(window_start, 1), H)
+        window_end = min(max(window_end, window_start), H)
+        if str(path_mode) == 'level':
+            label = f"Scenario level{(f' ({unit})' if unit else '')}"
+            if same_variable and str(em.get('path_mode')) == 'level':
+                value = float(em.get('path_value'))
             else:
                 value = last_value
-            assumption_text = (
-                f"is fixed at {float(value):.6g}"
-                f"{(' ' + unit) if unit else ''}"
-            )
+            assumption_text = f"is fixed at {float(value):.6g}{(' ' + unit if unit else '')}"
         else:
-            label = "Scenario change (%)"
-            if same_variable and str(em.get("path_mode")) == "percent":
-                value = float(em.get("path_value"))
+            label = 'Scenario change (%)'
+            if same_variable and str(em.get('path_mode')) == 'percent':
+                value = float(em.get('path_value'))
             else:
                 value = 10.0
-            assumption_text = (
-                f"remains {float(value):+.2f}% versus its latest observed level"
-            )
-
-        driver_label = str(condition_variable).replace("_", " ").title()
-        hicp_component = str(
-            contract.get("affected_hicp_component")
-            or model_id
-        ).replace("_", " ").title()
-        question = html.Div(
-            [
-                html.Strong("You are asking: "),
-                html.Span(
-                    f"What happens to HICP {hicp_component} if "
-                    f"{driver_label} {assumption_text} over the saved forecast horizon?"
-                ),
-            ]
-        )
-        note = (
-            f"{contract['model_label']} · run {_short_run(contract['run_id'])} · "
-            f"{condition_variable.replace('_', ' ')} last observed "
-            f"{last_value:.6g}{(' ' + unit) if unit else ''} on {last_date} · "
-            f"condition applied permanently from {start} through {end} · "
-            f"{int(contract['n_forecast_draws']):,} saved forecast draws · "
-            f"affects final HICP component: "
-            f"{str(contract['affected_hicp_component']).replace('_', ' ')}. "
-            "One active conditional is allowed per component BVAR; Add / update "
-            "replaces that component's previous conditional."
-        )
-        return label, value, question, note
+            assumption_text = f'is {float(value):+.2f}% versus its latest observed level'
+        driver_label = str(condition_variable).replace('_', ' ').title()
+        hicp_component = str(contract.get('affected_hicp_component') or model_id).replace('_', ' ').title()
+        question = html.Div([html.Strong('You are asking: '), html.Span(f'What happens to HICP {hicp_component} if {driver_label} {assumption_text} during {period_prefix}+{window_start}…{period_prefix}+{window_end}?')])
+        note = f"{contract['model_label']} · run {_short_run(contract['run_id'])} · {condition_variable.replace('_', ' ')} last observed {last_value:.6g}{(' ' + unit if unit else '')} on {last_date} · saved forecast spans {start} through {end} ({period_prefix}+1…{period_prefix}+{H}) · periods before and after the hard-condition window are unconstrained but may move under joint DK conditioning · {int(contract['n_forecast_draws']):,} saved forecast draws · affects final HICP component: {str(contract['affected_hicp_component']).replace('_', ' ')}. One active conditional is allowed per component BVAR; Add / update replaces that component's previous conditional."
+        return (label, value, question, note, window_options, window_start, window_options, window_end)
     except Exception as exc:
-        return (
-            "Scenario value",
-            10.0 if path_mode != "level" else None,
-            "Scenario question unavailable.",
-            html.Div(
-                [
-                    html.Strong("Conditional controls unavailable: "),
-                    html.Span(str(exc)),
-                ],
-                className="banner-error",
-            ),
-        )
+        return ('Scenario value', 10.0 if path_mode != 'level' else None, 'Scenario question unavailable.', html.Div([html.Strong('Conditional controls unavailable: '), html.Span(str(exc))], className='banner-error'), [], None, [], None)
 
 
-@callback(
-    output=Output("conditional-store", "data"),
-    inputs=[
-        Input("conditional-run", "n_clicks"),
-        Input("conditional-remove", "n_clicks"),
-        Input("conditional-reset-all", "n_clicks"),
-    ],
-    state=[
-        State("conditional-agg-select", "value"),
-        State("conditional-component-select", "value"),
-        State("conditional-variable-select", "value"),
-        State("conditional-path-mode", "value"),
-        State("conditional-path-value", "value"),
-        State("vintage-select", "value"),
-        State("conditional-store", "data"),
-    ],
-    background=True,
-    running=[
-        (Output("conditional-run", "disabled"), True, False),
-        (Output("conditional-cancel", "disabled"), False, True),
-    ],
-    cancel=[Input("conditional-cancel", "n_clicks")],
-    progress=[
-        Output("conditional-progress", "value"),
-        Output("conditional-phase", "children"),
-        Output("conditional-progress-detail", "children"),
-    ],
-    progress_default=(
-        0,
-        "Idle",
-        "Choose a saved aggregate, component and observable path, then Add / update.",
-    ),
-    prevent_initial_call=True,
-)
-def mutate_conditional_set(
-    set_progress,
-    _run,
-    _remove,
-    _reset,
-    aggregate_run_id,
-    model_id,
-    condition_variable,
-    path_mode,
-    path_value,
-    vintage,
-    current_store,
-):
+@callback(output=Output('conditional-store', 'data'), inputs=[Input('conditional-run', 'n_clicks'), Input('conditional-remove', 'n_clicks'), Input('conditional-reset-all', 'n_clicks')], state=[State('conditional-agg-select', 'value'), State('conditional-component-select', 'value'), State('conditional-variable-select', 'value'), State('conditional-path-mode', 'value'), State('conditional-path-value', 'value'), State('conditional-window-start', 'value'), State('conditional-window-end', 'value'), State('vintage-select', 'value'), State('conditional-store', 'data')], background=True, running=[(Output('conditional-run', 'disabled'), True, False), (Output('conditional-cancel', 'disabled'), False, True)], cancel=[Input('conditional-cancel', 'n_clicks')], progress=[Output('conditional-progress', 'value'), Output('conditional-phase', 'children'), Output('conditional-progress-detail', 'children')], progress_default=(0, 'Idle', 'Choose a saved aggregate, component and observable path, then Add / update.'), prevent_initial_call=True)
+def mutate_conditional_set(set_progress, _run, _remove, _reset, aggregate_run_id, model_id, condition_variable, path_mode, path_value, condition_start, condition_end, vintage, current_store):
     trigger = ctx.triggered_id
-
-    if trigger == "conditional-reset-all":
-        set_progress((100, "Conditional set cleared", "No active conditional scenarios."))
-        return clear_conditional_set(
-            vintage=str(vintage) if vintage else None,
-            aggregate_run_id=(
-                str(aggregate_run_id) if aggregate_run_id else None
-            ),
-        )
-
-    if trigger == "conditional-remove":
+    if trigger == 'conditional-reset-all':
+        set_progress((100, 'Conditional set cleared', 'No active conditional scenarios.'))
+        return clear_conditional_set(vintage=str(vintage) if vintage else None, aggregate_run_id=str(aggregate_run_id) if aggregate_run_id else None)
+    if trigger == 'conditional-remove':
         if not model_id:
             return current_store
-        set_progress(
-            (
-                100,
-                "Conditional removed",
-                f"{model_spec(model_id).label} removed from the active conditional set.",
-            )
-        )
+        set_progress((100, 'Conditional removed', f'{model_spec(model_id).label} removed from the active conditional set.'))
         return remove_conditional_component(current_store, model_id)
-
-    if trigger != "conditional-run":
+    if trigger != 'conditional-run':
         raise PreventUpdate
-
-    if not aggregate_run_id or not model_id or not condition_variable:
-        set_progress((0, "Conditional forecast failed", "Aggregate, component and variable are required."))
+    if not aggregate_run_id or not model_id or (not condition_variable):
+        set_progress((0, 'Conditional forecast failed', 'Aggregate, component and variable are required.'))
         return current_store
     if path_value is None:
-        set_progress((0, "Conditional forecast failed", "Scenario path value is required."))
+        set_progress((0, 'Conditional forecast failed', 'Scenario path value is required.'))
         return current_store
-
     row = _selected_aggregate_row(vintage, aggregate_run_id)
     if row is None:
-        set_progress((0, "Conditional forecast failed", "Selected aggregate run is unavailable."))
+        set_progress((0, 'Conditional forecast failed', 'Selected aggregate run is unavailable.'))
         return current_store
-    directory = Path(str(row["directory"]))
-
-    cache_key = "conditional-v2::" + json.dumps(
-        {
-            "contract": CONDITIONAL_CONTRACT_VERSION,
-            "aggregate_run_id": str(aggregate_run_id),
-            "model_id": str(model_id),
-            "condition_variable": str(condition_variable),
-            "path_mode": str(path_mode),
-            "path_value": float(path_value),
-        },
-        sort_keys=True,
-    )
+    directory = Path(str(row['directory']))
+    cache_key = 'conditional-v2::' + json.dumps({'contract': CONDITIONAL_CONTRACT_VERSION, 'aggregate_run_id': str(aggregate_run_id), 'model_id': str(model_id), 'condition_variable': str(condition_variable), 'path_mode': str(path_mode), 'path_value': float(path_value), 'condition_start': int(condition_start or 1), 'condition_end': None if condition_end is None else int(condition_end)}, sort_keys=True)
     cached = _diskcache.get(cache_key)
-    if isinstance(cached, dict) and cached.get("ok"):
+    if isinstance(cached, dict) and cached.get('ok'):
         payload = cached
     else:
         try:
-            set_progress(
-                (
-                    10,
-                    "Loading saved posterior",
-                    "Reading the exact component forecast/run recorded by the selected aggregate.",
-                )
-            )
-            set_progress(
-                (
-                    30,
-                    "Paired conditional forecast",
-                    "Replaying the saved unconditional path and imposing the observable future path with the same random stream.",
-                )
-            )
-            payload = compute_conditional_scenario(
-                directory,
-                project_root=PROJECT_ROOT,
-                model_id=str(model_id),
-                condition_variable=str(condition_variable),
-                path_mode=str(path_mode or "percent"),
-                path_value=float(path_value),
-            )
+            set_progress((10, 'Loading saved posterior', 'Reading the exact component forecast/run recorded by the selected aggregate.'))
+            set_progress((30, 'Paired conditional forecast', 'Replaying the saved unconditional path and imposing the observable future path with the same random stream.'))
+            payload = compute_conditional_scenario(directory, project_root=PROJECT_ROOT, model_id=str(model_id), condition_variable=str(condition_variable), path_mode=str(path_mode or 'percent'), path_value=float(path_value), condition_start=int(condition_start or 1), condition_end=None if condition_end is None else int(condition_end))
             _diskcache.set(cache_key, payload, expire=3600)
         except Exception as exc:
-            set_progress((0, "Conditional forecast failed", str(exc).splitlines()[0]))
+            set_progress((0, 'Conditional forecast failed', str(exc).splitlines()[0]))
             return current_store
-
     updated = upsert_conditional_component(current_store, payload)
-    set_progress(
-        (
-            100,
-            "Conditional scenario active",
-            f"{model_spec(model_id).label} added/updated. "
-            f"{len(conditional_set_components(updated))} conditional component(s) active.",
-        )
-    )
+    set_progress((100, 'Conditional scenario active', f'{model_spec(model_id).label} added/updated. {len(conditional_set_components(updated))} conditional component(s) active.'))
     return updated
 
 
@@ -12086,6 +11110,44 @@ def scenario_propagation_result_cards(store: dict | None):
         )
 
     provenance = _scenario_propagation_provenance(store)
+    meta = dict((store or {}).get("meta", {}) or {})
+    if str(meta.get("scenario_type") or "").strip().lower() == "conditional":
+        result = dict((store or {}).get("energy_result", {}) or {})
+        if not result:
+            return _result_block(
+                eyebrow="HICP Energy impact · conditional",
+                value=None,
+                unit_date="Conditional Energy result unavailable",
+                uncertainty=(
+                    "No statistic fabricated. Re-run Add / update conditional once "
+                    "to refresh the bridge-ready Energy result."
+                ),
+                provenance=provenance,
+            )
+
+        date = pd.Timestamp(result["date"]).date().isoformat()
+        impact = float(result["value"])
+        low = result.get("q16")
+        high = result.get("q84")
+        draws = result.get("n_draws")
+
+        interval = "68% interval unavailable"
+        if low is not None and high is not None:
+            interval = f"68% [{float(low):+.3f}, {float(high):+.3f}] pp"
+
+        draw_text = (
+            f"{int(draws):,} paired aggregate draws"
+            if draws is not None
+            else "paired aggregate draws"
+        )
+
+        return _result_block(
+            eyebrow="HICP Energy impact · conditional",
+            value=f"{impact:+.3f} pp",
+            unit_date=f"{date} · posterior median",
+            uncertainty=f"{interval} · {draw_text}",
+            provenance=provenance,
+        )
     values = aggregate_live_scenario_kpis(store)
     terminal_date = values.get("date")
 
@@ -12125,7 +11187,12 @@ _HEADLINE_PROPAGATION_STATISTIC = "mean"
 
 
 def _scenario_headline_source_contract(store: dict | None) -> dict[str, str]:
-    """Resolve the exact Energy scenario identity consumed by Headline."""
+    """Resolve the exact Energy scenario identity consumed by Headline.
+
+    Scenario identity is part of the source key. This is essential for Joint
+    Energy because the source aggregate run stays fixed while the combination
+    of conditional/tax assumptions can change.
+    """
     item = dict(store or {})
     meta = dict(item.get("meta") or {})
     bridge = dict(item.get("headline_bridge") or {})
@@ -12139,6 +11206,19 @@ def _scenario_headline_source_contract(store: dict | None) -> dict[str, str]:
     scenario_aggregate_run_id = str(bridge.get("aggregate_run_id") or "").strip()
     forecast_name = str(bridge.get("forecast_name") or "").strip()
     bridge_contract = str(bridge.get("contract") or "").strip()
+    scenario_identity = str(meta.get("dashboard_input_signature") or "").strip()
+    if not scenario_identity:
+        signature = bridge.get("scenario_signature")
+        if signature is not None:
+            scenario_identity = json.dumps(
+                signature,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            )
+    if not scenario_identity:
+        scenario_identity = scenario_aggregate_run_id
+
     missing = [
         name
         for name, value in (
@@ -12147,6 +11227,7 @@ def _scenario_headline_source_contract(store: dict | None) -> dict[str, str]:
             ("scenario_aggregate_run_id", scenario_aggregate_run_id),
             ("forecast_name", forecast_name),
             ("bridge_contract", bridge_contract),
+            ("scenario_identity", scenario_identity),
         )
         if not value
     ]
@@ -12155,6 +11236,7 @@ def _scenario_headline_source_contract(store: dict | None) -> dict[str, str]:
             "agg-scenario-store lacks Headline propagation lineage: "
             + ", ".join(missing)
         )
+
     source_key = "|".join(
         (
             vintage,
@@ -12162,6 +11244,7 @@ def _scenario_headline_source_contract(store: dict | None) -> dict[str, str]:
             scenario_aggregate_run_id,
             forecast_name,
             bridge_contract,
+            scenario_identity,
         )
     )
     return {
@@ -12170,6 +11253,7 @@ def _scenario_headline_source_contract(store: dict | None) -> dict[str, str]:
         "scenario_aggregate_run_id": scenario_aggregate_run_id,
         "forecast_name": forecast_name,
         "bridge_contract": bridge_contract,
+        "scenario_identity": scenario_identity,
         "source_key": source_key,
     }
 
@@ -14235,6 +13319,34 @@ def aggregate_conditional_scenario_impacts(
     )
 
 
+# CONDITIONAL_ENERGY_INTERDOMAIN_DISPLAY_V1_1
+def _conditional_interdomain_energy_result(
+    payload: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    # Reuse the existing conditional dashboard KPI contract exactly.
+    values = conditional_kpis(payload)
+    impact = values.get("aggregate_impact")
+    terminal_date = values.get("terminal_date")
+
+    if impact is None or terminal_date in (None, ""):
+        raise ValueError(
+            "Conditional HICP Energy terminal impact is unavailable. "
+            "Re-run Add / update conditional once."
+        )
+
+    low = values.get("aggregate_low")
+    high = values.get("aggregate_high")
+    draws = values.get("n_draws")
+
+    return {
+        "date": pd.Timestamp(terminal_date).isoformat(),
+        "statistic": "q50",
+        "value": float(impact),
+        "q16": None if low is None else float(low),
+        "q84": None if high is None else float(high),
+        "n_draws": None if draws is None else int(draws),
+    }
+
 def _conditional_headline_bridge_data(
     conditional_store: Mapping[str, Any] | None,
     *,
@@ -14354,6 +13466,7 @@ def _conditional_headline_bridge_data(
         },
         "headline_bridge": bridge,
     }
+    store["energy_result"] = _conditional_interdomain_energy_result(payload)
     return store, None
 
 
@@ -14362,31 +13475,161 @@ def _conditional_headline_bridge_data(
     Output("agg-scenario-banner", "children"),
     Input("scenario-store", "data"),
     Input("conditional-store", "data"),
+    Input("joint-energy-scenario-store", "data"),
     State("agg-select", "value"),
     State("vintage-select", "value"),
 )
 def compute_live_aggregate_tax_scenario(
     scenario_store,
     conditional_store,
+    joint_store,
     aggregate_run_id,
     vintage,
 ):
-    # This callback is downstream only of explicit scenario actions. Route,
-    # aggregate-dropdown and vintage navigation are deliberately States so
-    # browsing the dashboard can never launch a new aggregate calculation.
+    """Materialize one canonical Energy scenario for downstream propagation.
+
+    Single conditional and tax-only behavior is preserved. When the active
+    assumptions require the Joint Energy engine (conditional + tax, or more
+    than one conditional), this callback reuses the already-built Joint Energy
+    payload after validating its exact dashboard input signature. It never
+    recomputes the joint package here.
+    """
     conditional_summaries = conditional_set_summary(conditional_store)
     tax_summaries = scenario_set_summary(scenario_store)
-    if conditional_summaries and tax_summaries:
-        return None, html.Div(
+    requires_joint = bool(
+        (conditional_summaries and tax_summaries)
+        or len(conditional_summaries) > 1
+    )
+
+    if requires_joint:
+        try:
+            recipe = _joint_energy_dashboard_recipe(
+                conditional_store=conditional_store,
+                tax_store=scenario_store,
+                vintage=vintage,
+                selected_aggregate_run_id=aggregate_run_id,
+            )
+        except Exception as exc:
+            return None, html.Div(
+                [
+                    html.Strong("Joint Energy propagation blocked: "),
+                    html.Span(str(exc)),
+                ],
+                className="banner-error",
+            )
+
+        payload = dict(joint_store or {})
+        meta = dict(payload.get("meta") or {})
+        bridge = dict(payload.get("headline_bridge") or {})
+        if not payload or not payload.get("ok"):
+            return None, html.Div(
+                [
+                    html.Strong("Joint Energy scenario required: "),
+                    html.Span(
+                        "multiple active Energy assumptions must first be built "
+                        "with Build / refresh Joint Energy scenario."
+                    ),
+                ],
+                className="banner-error",
+            )
+
+        observed_signature = str(meta.get("dashboard_input_signature") or "")
+        expected_signature = str(recipe["signature"])
+        if observed_signature != expected_signature:
+            return None, html.Div(
+                [
+                    html.Strong("Joint Energy scenario is stale: "),
+                    html.Span(
+                        "the active conditional/tax assumptions changed. "
+                        "Build / refresh Joint Energy scenario again before propagation."
+                    ),
+                ],
+                className="banner-error",
+            )
+
+        if str(meta.get("vintage") or "") != str(recipe["vintage"]):
+            return None, html.Div(
+                [
+                    html.Strong("Joint Energy propagation blocked: "),
+                    html.Span(
+                        f"joint vintage {meta.get('vintage') or 'missing'} "
+                        f"!= active vintage {recipe['vintage']}."
+                    ),
+                ],
+                className="banner-error",
+            )
+        if str(meta.get("aggregate_run_id") or "") != str(recipe["aggregate_run_id"]):
+            return None, html.Div(
+                [
+                    html.Strong("Joint Energy propagation blocked: "),
+                    html.Span(
+                        "the built Joint Energy package belongs to a different "
+                        "HICP Energy aggregate run."
+                    ),
+                ],
+                className="banner-error",
+            )
+        if (
+            str(bridge.get("contract") or "") != ENERGY_BRIDGE_CONTRACT_VERSION
+            or not bool(bridge.get("scenario_active", False))
+        ):
+            return None, html.Div(
+                [
+                    html.Strong("Joint Energy bridge is not propagation-ready: "),
+                    html.Span(
+                        "rebuild the Joint Energy package with the current bridge contract."
+                    ),
+                ],
+                className="banner-error",
+            )
+
+        canonical = dict(payload)
+        canonical_meta = dict(meta)
+        canonical_meta.update(
+            {
+                "scenario_type": "joint",
+                "aggregate_run_id": str(recipe["aggregate_run_id"]),
+                "aggregate_forecast_name": str(
+                    meta.get("forecast_name")
+                    or bridge.get("forecast_name")
+                    or "unconditional"
+                ),
+                "n_draws": int(
+                    meta.get("n_aggregate_draws_paired")
+                    or bridge.get("n_draws")
+                    or 0
+                ),
+                "scenario_components": list(
+                    bridge.get("scenario_components")
+                    or meta.get("active_models")
+                    or []
+                ),
+                "scenario_signature": bridge.get("scenario_signature"),
+                "scenario_starts": dict(
+                    bridge.get("scenario_starts")
+                    or meta.get("scenario_starts")
+                    or {}
+                ),
+                "canonical_propagation_source": "joint-energy-scenario-store",
+            }
+        )
+        canonical["meta"] = canonical_meta
+        return canonical, html.Div(
             [
-                html.Strong("Energy → Headline bridge blocked: "),
+                html.Strong("Joint Energy scenario linked"),
                 html.Span(
-                    "both a conditional scenario and a tax scenario are active. "
-                    "Clear one set first; the current contracts do not define an exact joint propagation."
+                    f" · {int(meta.get('scenario_count') or recipe['scenario_count'])} "
+                    f"assumptions · vintage {recipe['vintage']} · aggregate "
+                    f"{_short_run(recipe['aggregate_run_id'])} · "
+                    f"{int(canonical_meta.get('n_draws') or 0):,} paired aggregate draws"
+                ),
+                html.Span(
+                    " · reused from joint-energy-scenario-store; no aggregate or BVAR rerun"
                 ),
             ],
-            className="banner-error",
+            className="selection-banner",
         )
+
     if conditional_summaries:
         bridge_store, error = _conditional_headline_bridge_data(
             conditional_store,
@@ -14415,23 +13658,66 @@ def compute_live_aggregate_tax_scenario(
     summaries = tax_summaries
     if not summaries:
         return None, "No active component tax scenario. Configure one or more components in Scenarios."
-    set_vintage=None if not scenario_store else scenario_store.get("vintage")
+    set_vintage = None if not scenario_store else scenario_store.get("vintage")
     if set_vintage is None:
-        fp=scenario_set_payload(scenario_store,summaries[0]["model_id"]); set_vintage=dict((fp or {}).get("meta",{}) or {}).get("vintage")
-    if set_vintage is not None and str(set_vintage)!=str(vintage): return None,f"The active scenario set belongs to vintage {set_vintage}; selected aggregate is {vintage}."
-    tax_scenarios=_tax_scenarios_from_payload(scenario_store)
-    if not tax_scenarios: return None,"The active scenario set contains no non-zero VAT or excise change."
-    row=_selected_aggregate_row(vintage,aggregate_run_id)
-    if row is None: return None,"The selected aggregate is unavailable."
-    directory=Path(str(row["directory"])); metadata=_aggregate_metadata(directory); run_ids=_run_ids_from_aggregate_metadata(metadata)
-    if not run_ids: return None,"This aggregate does not record its component forecast stores, so an exact live propagation cannot be reproduced."
-    n_requested=int(metadata.get("n_aggregate_draws_requested") or 500); n_draws=min(500,max(1,n_requested)); pairing_seed=int(metadata.get("pairing_seed") or 2026); forecast_name=str(metadata.get("forecast_name") or "unconditional")
-    set_forecast=None if not scenario_store else scenario_store.get("forecast_name")
-    if set_forecast and str(set_forecast)!=forecast_name: return None,f"The active scenario set was built on {set_forecast!r}, while this aggregate uses {forecast_name!r}."
-    signature=scenario_set_signature(scenario_store); starts={str(x["label"]):x.get("scenario_start") for x in summaries if x.get("scenario_start") is not None}; parsed=[pd.Timestamp(x) for x in starts.values()]
-    combined_meta={"scenario_start":min(parsed).isoformat() if parsed else None,"scenario_starts":starts,"scenario_components":[x["model_id"] for x in summaries],"scenario_count":len(summaries),"scenario_signature":signature}
-    cache_key="agg-tax-scenario-v2::"+json.dumps({"aggregate_run_id":str(aggregate_run_id),"vintage":str(vintage),"scenario_set":signature,"forecast_name":forecast_name,"n_draws":n_draws,"pairing_seed":pairing_seed},sort_keys=True,default=str)
-    cached=_diskcache.get(cache_key)
+        fp = scenario_set_payload(scenario_store, summaries[0]["model_id"])
+        set_vintage = dict((fp or {}).get("meta", {}) or {}).get("vintage")
+    if set_vintage is not None and str(set_vintage) != str(vintage):
+        return None, (
+            f"The active scenario set belongs to vintage {set_vintage}; "
+            f"selected aggregate is {vintage}."
+        )
+    tax_scenarios = _tax_scenarios_from_payload(scenario_store)
+    if not tax_scenarios:
+        return None, "The active scenario set contains no non-zero VAT or excise change."
+    row = _selected_aggregate_row(vintage, aggregate_run_id)
+    if row is None:
+        return None, "The selected aggregate is unavailable."
+    directory = Path(str(row["directory"]))
+    metadata = _aggregate_metadata(directory)
+    run_ids = _run_ids_from_aggregate_metadata(metadata)
+    if not run_ids:
+        return None, (
+            "This aggregate does not record its component forecast stores, so an "
+            "exact live propagation cannot be reproduced."
+        )
+    n_requested = int(metadata.get("n_aggregate_draws_requested") or 500)
+    n_draws = min(500, max(1, n_requested))
+    pairing_seed = int(metadata.get("pairing_seed") or 2026)
+    forecast_name = str(metadata.get("forecast_name") or "unconditional")
+    set_forecast = None if not scenario_store else scenario_store.get("forecast_name")
+    if set_forecast and str(set_forecast) != forecast_name:
+        return None, (
+            f"The active scenario set was built on {set_forecast!r}, while this "
+            f"aggregate uses {forecast_name!r}."
+        )
+    signature = scenario_set_signature(scenario_store)
+    starts = {
+        str(x["label"]): x.get("scenario_start")
+        for x in summaries
+        if x.get("scenario_start") is not None
+    }
+    parsed = [pd.Timestamp(x) for x in starts.values()]
+    combined_meta = {
+        "scenario_start": min(parsed).isoformat() if parsed else None,
+        "scenario_starts": starts,
+        "scenario_components": [x["model_id"] for x in summaries],
+        "scenario_count": len(summaries),
+        "scenario_signature": signature,
+    }
+    cache_key = "agg-tax-scenario-v2::" + json.dumps(
+        {
+            "aggregate_run_id": str(aggregate_run_id),
+            "vintage": str(vintage),
+            "scenario_set": signature,
+            "forecast_name": forecast_name,
+            "n_draws": n_draws,
+            "pairing_seed": pairing_seed,
+        },
+        sort_keys=True,
+        default=str,
+    )
+    cached = _diskcache.get(cache_key)
     if (
         isinstance(cached, dict)
         and str(((cached.get("headline_bridge") or {}).get("contract")))
@@ -14440,14 +13726,57 @@ def compute_live_aggregate_tax_scenario(
         payload = cached
     else:
         try:
-            outcome=run_aggregate(str(vintage),project_root=PROJECT_ROOT,results_root=RESULTS_ROOT,forecast_name=forecast_name,run_ids=run_ids,n_aggregate_draws=n_draws,pairing_seed=pairing_seed,tax_scenarios=tax_scenarios,weekly_tax_mode="strict",persist=False)
-            payload=aggregate_live_scenario_payload(outcome,combined_meta); payload.setdefault("meta",{}).update({"aggregate_run_id":str(aggregate_run_id),"aggregate_forecast_name":forecast_name}); payload["headline_bridge"]=energy_outcome_headline_bridge(outcome,combined_meta); _diskcache.set(cache_key,payload,expire=3600)
+            outcome = run_aggregate(
+                str(vintage),
+                project_root=PROJECT_ROOT,
+                results_root=RESULTS_ROOT,
+                forecast_name=forecast_name,
+                run_ids=run_ids,
+                n_aggregate_draws=n_draws,
+                pairing_seed=pairing_seed,
+                tax_scenarios=tax_scenarios,
+                weekly_tax_mode="strict",
+                persist=False,
+            )
+            payload = aggregate_live_scenario_payload(outcome, combined_meta)
+            payload.setdefault("meta", {}).update(
+                {
+                    "aggregate_run_id": str(aggregate_run_id),
+                    "aggregate_forecast_name": forecast_name,
+                }
+            )
+            payload["headline_bridge"] = energy_outcome_headline_bridge(
+                outcome, combined_meta
+            )
+            _diskcache.set(cache_key, payload, expire=3600)
         except Exception as exc:
-            return None,html.Div([html.Strong("HICP Energy scenario propagation failed: "),html.Span(str(exc))],className="banner-error")
-    parts=[html.Strong(f"Combined scenario · {len(summaries)} component"+("s" if len(summaries)!=1 else ""))]
-    for item in summaries: parts.append(html.Span(f" · {item['label']}: VAT {item['vat_delta_pp']:+.2f} pp, excise {item['excise_delta']:+.3f} {item['excise_unit']}"))
-    parts.append(html.Span(f" · propagated with {payload.get('meta',{}).get('n_draws','—')} paired aggregate draws"))
-    return payload,html.Div(parts,className="selection-banner")
+            return None, html.Div(
+                [
+                    html.Strong("HICP Energy scenario propagation failed: "),
+                    html.Span(str(exc)),
+                ],
+                className="banner-error",
+            )
+    parts = [
+        html.Strong(
+            f"Combined scenario · {len(summaries)} component"
+            + ("s" if len(summaries) != 1 else "")
+        )
+    ]
+    for item in summaries:
+        parts.append(
+            html.Span(
+                f" · {item['label']}: VAT {item['vat_delta_pp']:+.2f} pp, "
+                f"excise {item['excise_delta']:+.3f} {item['excise_unit']}"
+            )
+        )
+    parts.append(
+        html.Span(
+            f" · propagated with {payload.get('meta', {}).get('n_draws', '—')} "
+            "paired aggregate draws"
+        )
+    )
+    return payload, html.Div(parts, className="selection-banner")
 
 
 @callback(
@@ -14649,15 +13978,6 @@ register_overview_callbacks(
     registry_store_id="registry-store",
 )
 
-if (
-    ECONOMIC_DATA_ENABLED
-    and _register_economic_data_callbacks is not None
-):
-    _register_economic_data_callbacks(
-        app,
-        project_root=PROJECT_ROOT,
-        registry_store_id="registry-store",
-    )
 
 
 if __name__ == "__main__":
