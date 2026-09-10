@@ -1,0 +1,23 @@
+{
+  "contract": "ecb-var-production-manifest-v1",
+  "energy_aggregate": {
+    "aggregate_run_id": "725bb35748e16e403dc8",
+    "forecast_name": "dashboard_12m_v1"
+  },
+  "energy_components": {
+    "car_fuels_diesel": "f9f27d1f9069fca386df1c9b191b1927d1b51993c9401d98891e4de4495a348f",
+    "car_fuels_petrol": "4d672951e6620759bcf6a75c8b59edcf4ec43ab024e60573a570ac97100147e9",
+    "electricity": "807c431b2aae4abbec1f2ad3f4b0c4cc19a80ace27293f1ab1cccf4afd4aa13d",
+    "gas": "9ce26b46de996d7f3682685b96e765c300696ddeeac6fb4450ef36de6333c4e2",
+    "heat_energy": "556eebd7a1779923f8310fb9b507264bac0cfcd25da9da634ec2c3b0841137ce",
+    "liquid_fuels": "1f1aa9e776b20347fe85fe11fcabe6019a63e269769b4e4b54208fba474b39ad",
+    "solid_fuels": "cb242e8e834162416552a8957f9464c8675c5c1d90665204f583bc5d2521fb65"
+  },
+  "forecast_name": "unconditional",
+  "headline": {
+    "model_id": "headline_joint",
+    "run_id": "390dd311c4055f48dc8caa283533bb6db8fb0361d54d595feb276a0634c4eab9"
+  },
+  "production_vintage": "20260816",
+  "schema_version": 1
+}

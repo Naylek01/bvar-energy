@@ -206,7 +206,23 @@ def build_export_xlsx(payload: dict[str, Any]) -> tuple[bytes, str]:
             str(payload.get("sheet_name") or "Table_Data"),
             used,
         )
-        sheets = [("Metadata", metadata, 1), (data_sheet_name, data_rows, 1 if headers else 0)]
+        sheets = [("Metadata", metadata, 1)]
+        for extra_sheet in list(payload.get("additional_sheets") or []):
+            if not isinstance(extra_sheet, dict):
+                raise ValueError("additional_sheets entries must be objects.")
+            extra_headers = list(extra_sheet.get("headers") or [])
+            extra_rows = [list(row) for row in (extra_sheet.get("rows") or [])]
+            extra_name = _sanitize_sheet(
+                str(extra_sheet.get("name") or "Sheet"),
+                used,
+            )
+            extra_data = [extra_headers] + extra_rows if extra_headers else extra_rows
+            sheets.append(
+                (extra_name, extra_data, 1 if extra_headers else 0)
+            )
+        sheets.append(
+            (data_sheet_name, data_rows, 1 if headers else 0)
+        )
         out = io.BytesIO()
         with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
             z.writestr("[Content_Types].xml", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>' + ''.join(f'<Override PartName="/xl/worksheets/sheet{i}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>' for i in range(1, len(sheets) + 1)) + '</Types>')

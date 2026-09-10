@@ -1,0 +1,17 @@
+{
+  "bvar_reestimated": false,
+  "contract": "ENERGY_12M_SAVED_POSTERIOR_MATERIALISATION_LOTB_V1",
+  "dashboard_calendar_end": "2027-07-01T00:00:00",
+  "dashboard_calendar_start": "2026-08-01T00:00:00",
+  "forecast_seed": 2026,
+  "materialized_H": 11,
+  "model_id": "heat_energy",
+  "n_forecast_draws": 1000,
+  "original_unconditional_overwritten": false,
+  "source_H": 4,
+  "source_forecast": "forecast://heat_energy/20260816/556eebd7a1779923f8310fb9b507264bac0cfcd25da9da634ec2c3b0841137ce/unconditional",
+  "source_replay_max_abs_error": 2.842170943040401e-14,
+  "source_replay_tolerance": 1e-08,
+  "source_run_id": "556eebd7a1779923f8310fb9b507264bac0cfcd25da9da634ec2c3b0841137ce",
+  "vintage": "20260816"
+}

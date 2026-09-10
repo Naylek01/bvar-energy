@@ -440,11 +440,11 @@ def scenario_tax_figure(payload: Mapping | None, *, uirevision: str = "tax-path"
         ), row=1, col=1)
     fig.add_trace(go.Scatter(
         x=tax["date"], y=tax["baseline_vat_percent"], mode="lines", name="VAT baseline",
-        line={"color": _BASE, "width": 2, "dash": "dash", "shape": "hv"},
+        line={"color": _BASE, "width": 2, "dash": 'solid', "shape": "hv"},
     ), row=1, col=1)
     fig.add_trace(go.Scatter(
         x=tax["date"], y=tax["scenario_vat_percent"], mode="lines", name="VAT scenario",
-        line={"color": _SCEN, "width": 2, "shape": "hv"},
+        line={"color": _SCEN, "width": 2, "shape": "hv", "dash": "dash"},
     ), row=1, col=1)
 
     if not history.empty and "applied_excise" in history:
@@ -459,11 +459,11 @@ def scenario_tax_figure(payload: Mapping | None, *, uirevision: str = "tax-path"
         ), row=2, col=1)
     fig.add_trace(go.Scatter(
         x=tax["date"], y=tax["baseline_excise"], mode="lines", name="Excise baseline",
-        line={"color": _BASE, "width": 2, "dash": "dash", "shape": "hv"},
+        line={"color": _BASE, "width": 2, "dash": 'solid', "shape": "hv"},
     ), row=2, col=1)
     fig.add_trace(go.Scatter(
         x=tax["date"], y=tax["scenario_excise"], mode="lines", name="Excise scenario",
-        line={"color": _SCEN, "width": 2, "shape": "hv"},
+        line={"color": _SCEN, "width": 2, "shape": "hv", "dash": "dash"},
     ), row=2, col=1)
 
     origin = pd.to_datetime(meta.get("forecast_origin"), errors="coerce")

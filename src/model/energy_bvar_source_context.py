@@ -80,43 +80,29 @@ def _parse_excel_date(value) -> pd.Timestamp:
     return pd.NaT if pd.isna(parsed) else pd.Timestamp(parsed).tz_localize(None).normalize()
 
 
-def _resolve_single_workbook(manifest: Mapping, manifest_path: Path) -> tuple[Path, Mapping]:
+def _resolve_single_workbook(
+    manifest: Mapping,
+    manifest_path: Path,
+) -> tuple[Path, Mapping]:
+    from inflation_path_portability import resolve_repo_reference
+
     raw_value = manifest.get("raw_workbook")
     if not raw_value:
         raise FileNotFoundError(
             "The processed manifest contains neither usable legacy source_files nor "
             "a v9 raw_workbook entry. Rebuild the processed vintage with the current builder."
         )
-    raw = Path(str(raw_value))
-    if not raw.is_absolute():
-        # Prefer the path exactly as recorded; relative manifests are resolved
-        # from the project-style processed directory as a conservative fallback.
-        candidate = (manifest_path.parent / raw).resolve()
-        if candidate.is_file():
-            raw = candidate
-    if not raw.is_file():
-        raise FileNotFoundError(
-            f"Raw single-workbook snapshot not found: {raw}. This legacy processed "
-            "vintage has no immutable source_context sidecars. Restore the exact "
-            "workbook recorded by its manifest, or rebuild the vintage with the "
-            "current builder."
+    try:
+        raw = resolve_repo_reference(
+            raw_value,
+            base=manifest_path.parent,
+            must_exist=True,
         )
-
-    # A living Excel workbook must never silently supply tax/HICP context to an
-    # older processed vintage. Current builders write immutable source_files
-    # sidecars, so this hash gate applies only to legacy workbook fallbacks.
-    expected_hash = str(manifest.get("raw_workbook_sha256") or "").strip().lower()
-    if expected_hash:
-        actual_hash = _sha256(raw).lower()
-        if actual_hash != expected_hash:
-            raise RuntimeError(
-                "Processed-vintage source context is not immutable: the workbook "
-                f"currently found at {raw} has SHA256 {actual_hash}, while the "
-                f"manifest records {expected_hash}. Refusing to mix vintages. "
-                "Restore the exact workbook or rebuild this processed vintage "
-                "with the current builder so source_context sidecars are persisted."
-            )
-
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            f"Raw single-workbook snapshot not found from persisted reference "
+            f"{raw_value!r}; portable rebasing to the current repository was attempted."
+        ) from exc
     sheets = manifest.get("sheet_mapping", {})
     if not isinstance(sheets, Mapping):
         raise ValueError("The v9 manifest has an invalid sheet_mapping entry.")
@@ -215,30 +201,23 @@ def load_manifest_source_frame(
     haver_ticker_map: Mapping[str, str] | None = None,
     simple_rename: Mapping[str, str] | None = None,
 ) -> tuple[pd.DataFrame, dict]:
-    """Load one immutable source context, with a guarded workbook fallback.
+    """Load one source from legacy/current manifests after portable rebasing."""
+    from inflation_path_portability import resolve_repo_reference
 
-    Current processed vintages should expose ``manifest['source_files']`` and
-    are therefore independent of subsequent edits to the living Excel workbook.
-    Legacy vintages may fall back to the workbook only when its SHA256 still
-    matches the hash frozen in the processed manifest.
-    """
     manifest, resolved_manifest_path = read_processed_manifest(dataset_path, manifest_path)
-
     legacy_value = manifest.get("source_files", {}).get(source)
     if legacy_value:
-        legacy_path = Path(str(legacy_value))
-        if not legacy_path.is_absolute():
-            legacy_path = (resolved_manifest_path.parent / legacy_path).resolve()
-        if legacy_path.is_file():
-            contract = manifest.get("source_context_contract", {})
-            mode = (
-                "processed_vintage_sidecar"
-                if isinstance(contract, Mapping)
-                and contract.get("mode") == "immutable_processed_vintage_sidecars"
-                else "legacy_source_csv"
+        try:
+            legacy_path = resolve_repo_reference(
+                legacy_value,
+                base=resolved_manifest_path.parent,
+                must_exist=True,
             )
+        except FileNotFoundError:
+            legacy_path = None
+        if legacy_path is not None and legacy_path.is_file():
             return _read_dated_csv(legacy_path), {
-                "mode": mode,
+                "mode": "legacy_source_csv",
                 "path": legacy_path,
                 "manifest_path": resolved_manifest_path,
             }
@@ -250,17 +229,14 @@ def load_manifest_source_frame(
             f"The v9 manifest does not record a sheet for source {source!r}. "
             f"Available mappings: {dict(sheets)}"
         )
-
     if source == "haver":
         if not haver_ticker_map:
-            raise ValueError("haver_ticker_map is required when reading Haver from the v9 workbook.")
+            raise ValueError(
+                "haver_ticker_map is required when reading Haver from the v9 workbook."
+            )
         frame = _read_haver_excel_sheet(workbook, str(sheet_name), haver_ticker_map)
     else:
-        frame = _read_simple_excel_sheet(
-            workbook,
-            str(sheet_name),
-            rename=simple_rename,
-        )
+        frame = _read_simple_excel_sheet(workbook, str(sheet_name), rename=simple_rename)
     return frame, {
         "mode": "single_excel_workbook",
         "path": workbook,

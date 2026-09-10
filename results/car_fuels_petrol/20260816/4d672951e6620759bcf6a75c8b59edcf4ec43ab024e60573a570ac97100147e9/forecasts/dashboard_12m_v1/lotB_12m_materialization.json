@@ -1,0 +1,17 @@
+{
+  "bvar_reestimated": false,
+  "contract": "ENERGY_12M_SAVED_POSTERIOR_MATERIALISATION_LOTB_V1",
+  "dashboard_calendar_end": "2027-07-01T00:00:00",
+  "dashboard_calendar_start": "2026-08-01T00:00:00",
+  "forecast_seed": 123,
+  "materialized_H": 50,
+  "model_id": "car_fuels_petrol",
+  "n_forecast_draws": 500,
+  "original_unconditional_overwritten": false,
+  "source_H": 26,
+  "source_forecast": "forecast://car_fuels_petrol/20260816/4d672951e6620759bcf6a75c8b59edcf4ec43ab024e60573a570ac97100147e9/unconditional",
+  "source_replay_max_abs_error": 9.094947017729282e-13,
+  "source_replay_tolerance": 1e-08,
+  "source_run_id": "4d672951e6620759bcf6a75c8b59edcf4ec43ab024e60573a570ac97100147e9",
+  "vintage": "20260816"
+}

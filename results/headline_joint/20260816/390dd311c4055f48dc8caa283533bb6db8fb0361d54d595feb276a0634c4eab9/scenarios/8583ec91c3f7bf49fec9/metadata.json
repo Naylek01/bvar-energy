@@ -1,0 +1,103 @@
+{
+  "scenario_contract_version": "headline-conditional-v2",
+  "headline_vintage": "20260816",
+  "headline_run_id": "390dd311c4055f48dc8caa283533bb6db8fb0361d54d595feb276a0634c4eab9",
+  "condition_variables": [
+    "hicp_energy"
+  ],
+  "condition_dates": [
+    "2026-10-01T00:00:00",
+    "2026-11-01T00:00:00",
+    "2026-12-01T00:00:00",
+    "2027-01-01T00:00:00",
+    "2027-02-01T00:00:00",
+    "2027-03-01T00:00:00",
+    "2027-04-01T00:00:00",
+    "2027-05-01T00:00:00",
+    "2027-06-01T00:00:00"
+  ],
+  "condition_values": {
+    "hicp_energy": [
+      148.035,
+      149.445,
+      148.17000000000002,
+      149.355,
+      150.24,
+      267.85,
+      165.495,
+      163.5,
+      160.48499999999999
+    ]
+  },
+  "condition_horizon": 9,
+  "computational_horizon": 12,
+  "n_draws": 1000,
+  "forecast_seed": 2026,
+  "simulate_future_outliers": true,
+  "paired_baseline_conditional": true,
+  "baseline_source": "persisted_unconditional",
+  "baseline_reference_contract": "headline-persisted-unconditional-v1",
+  "bvar_reestimated": false,
+  "lineage_verification_status": "verified_at_estimation",
+  "publication_horizon_max_months": 12,
+  "condition_start": 3,
+  "condition_end": 11,
+  "condition_start_offset": 3,
+  "condition_end_offset": 11,
+  "condition_mask_hash": "4bb03b8b9bd0c9ada968fce2dd113b0376a446731d38aaaa45533197e8f72b5b",
+  "conditioned_horizon_months": 9,
+  "free_before_condition_months": 2,
+  "free_after_condition_months": 1,
+  "free_propagation_horizon_months": 3,
+  "source_type": "manual",
+  "condition_variable": "hicp_energy",
+  "condition_metric": "yoy",
+  "condition_input_values": "50, 50, 50, 50, 50, 150, 50, 50, 50",
+  "energy_path_uncertainty_propagated": false,
+  "impact_reference": "unconditional",
+  "impact_definition": "manual_minus_unconditional",
+  "impact_baseline_label": "Headline unconditional",
+  "impact_scenario_label": "Manual conditional",
+  "impact_interpretation": "conditional-forecast effect",
+  "headline_observed_anchor_date": "2026-07-01T00:00:00",
+  "headline_observed_anchor_yoy": 2.921527570046867,
+  "scenario_id": "8583ec91c3f7bf49fec9",
+  "persisted_baseline_replay_verified": true,
+  "baseline_replay_status": "pass",
+  "baseline_replay_max_abs_error": 1.1368683772161603e-13,
+  "baseline_replay_machine_tolerance": 3.3245223404262506e-12,
+  "baseline_replay_hard_tolerance": 1e-09,
+  "baseline_replay_channel_diagnostics": {
+    "native_level_paths": {
+      "max_abs_error": 1.1368683772161603e-13,
+      "machine_tolerance": 3.3245223404262506e-12,
+      "status": "pass",
+      "bit_identical": false
+    },
+    "component_yoy_paths": {
+      "max_abs_error": 1.1191048088221578e-13,
+      "machine_tolerance": 1.7592145196759129e-12,
+      "status": "pass",
+      "bit_identical": false
+    },
+    "headline_level_paths": {
+      "max_abs_error": 5.684341886080802e-14,
+      "machine_tolerance": 1.6516718732717881e-12,
+      "status": "pass",
+      "bit_identical": false
+    },
+    "headline_yoy_paths": {
+      "max_abs_error": 6.661338147750939e-14,
+      "machine_tolerance": 1.95491109013785e-13,
+      "status": "pass",
+      "bit_identical": false
+    },
+    "headline_yoy_contribution_paths": {
+      "max_abs_error": 5.639932965095795e-14,
+      "machine_tolerance": 1.602506115975777e-13,
+      "status": "pass",
+      "bit_identical": false
+    }
+  },
+  "persisted_baseline_bit_identical": false
+}

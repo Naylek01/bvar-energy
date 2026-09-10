@@ -1,7 +1,7 @@
 {
   "available": true,
   "cache_version": "energy-bvar-fitted-v8",
-  "cache_path": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\results\\hicp_energy_aggregate\\20260816\\f83d1b28a3ad4ee8dcca\\bvar_fitted_v3.parquet",
+  "cache_path": "C:\\Users\\kelya\\bvar-energy\\results\\hicp_energy_aggregate\\20260816\\f83d1b28a3ad4ee8dcca\\bvar_fitted_v3.parquet",
   "persisted": true,
   "canonical_discriminator": "basis",
   "fitted_contract": {
@@ -192,7 +192,7 @@
       "n_months": 305
     }
   },
-  "created_at_utc": "2026-08-16T15:22:22.552901+00:00",
+  "created_at_utc": "2026-08-20T13:40:30.033016+00:00",
   "source_signature": {
     "cache_version": "energy-bvar-fitted-v8",
     "aggregate_run_id": "f83d1b28a3ad4ee8dcca",
@@ -204,86 +204,86 @@
     "components": {
       "diesel": {
         "metadata": {
-          "path": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\results\\car_fuels_diesel\\20260816\\f9f27d1f9069fca386df1c9b191b1927d1b51993c9401d98891e4de4495a348f\\metadata.json",
+          "path": "C:\\Users\\kelya\\bvar-energy\\results\\car_fuels_diesel\\20260816\\f9f27d1f9069fca386df1c9b191b1927d1b51993c9401d98891e4de4495a348f\\metadata.json",
           "size": 1827,
-          "mtime_ns": 1786855989281813900
+          "mtime_ns": 1787231833380156400
         },
         "draws": {
-          "path": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\results\\car_fuels_diesel\\20260816\\f9f27d1f9069fca386df1c9b191b1927d1b51993c9401d98891e4de4495a348f\\draws.npz",
+          "path": "C:\\Users\\kelya\\bvar-energy\\results\\car_fuels_diesel\\20260816\\f9f27d1f9069fca386df1c9b191b1927d1b51993c9401d98891e4de4495a348f\\draws.npz",
           "size": 152088048,
-          "mtime_ns": 1786856002898559400
+          "mtime_ns": 1787232043004420800
         }
       },
       "electricity": {
         "metadata": {
-          "path": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\results\\electricity\\20260816\\807c431b2aae4abbec1f2ad3f4b0c4cc19a80ace27293f1ab1cccf4afd4aa13d\\metadata.json",
+          "path": "C:\\Users\\kelya\\bvar-energy\\results\\electricity\\20260816\\807c431b2aae4abbec1f2ad3f4b0c4cc19a80ace27293f1ab1cccf4afd4aa13d\\metadata.json",
           "size": 1462,
-          "mtime_ns": 1786839499109335500
+          "mtime_ns": 1787231833431608200
         },
         "draws": {
-          "path": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\results\\electricity\\20260816\\807c431b2aae4abbec1f2ad3f4b0c4cc19a80ace27293f1ab1cccf4afd4aa13d\\draws.npz",
+          "path": "C:\\Users\\kelya\\bvar-energy\\results\\electricity\\20260816\\807c431b2aae4abbec1f2ad3f4b0c4cc19a80ace27293f1ab1cccf4afd4aa13d\\draws.npz",
           "size": 25376359,
-          "mtime_ns": 1786839501246995500
+          "mtime_ns": 1787231983602827400
         }
       },
       "gas": {
         "metadata": {
-          "path": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\results\\gas\\20260816\\9ce26b46de996d7f3682685b96e765c300696ddeeac6fb4450ef36de6333c4e2\\metadata.json",
+          "path": "C:\\Users\\kelya\\bvar-energy\\results\\gas\\20260816\\9ce26b46de996d7f3682685b96e765c300696ddeeac6fb4450ef36de6333c4e2\\metadata.json",
           "size": 1256,
-          "mtime_ns": 1786839369716388400
+          "mtime_ns": 1787231833472134600
         },
         "draws": {
-          "path": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\results\\gas\\20260816\\9ce26b46de996d7f3682685b96e765c300696ddeeac6fb4450ef36de6333c4e2\\draws.npz",
+          "path": "C:\\Users\\kelya\\bvar-energy\\results\\gas\\20260816\\9ce26b46de996d7f3682685b96e765c300696ddeeac6fb4450ef36de6333c4e2\\draws.npz",
           "size": 25112638,
-          "mtime_ns": 1786839371814994700
+          "mtime_ns": 1787231983904847100
         }
       },
       "heat_energy": {
         "metadata": {
-          "path": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\results\\heat_energy\\20260816\\556eebd7a1779923f8310fb9b507264bac0cfcd25da9da634ec2c3b0841137ce\\metadata.json",
+          "path": "C:\\Users\\kelya\\bvar-energy\\results\\heat_energy\\20260816\\556eebd7a1779923f8310fb9b507264bac0cfcd25da9da634ec2c3b0841137ce\\metadata.json",
           "size": 1288,
-          "mtime_ns": 1786839807236541200
+          "mtime_ns": 1787231833581170500
         },
         "draws": {
-          "path": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\results\\heat_energy\\20260816\\556eebd7a1779923f8310fb9b507264bac0cfcd25da9da634ec2c3b0841137ce\\draws.npz",
+          "path": "C:\\Users\\kelya\\bvar-energy\\results\\heat_energy\\20260816\\556eebd7a1779923f8310fb9b507264bac0cfcd25da9da634ec2c3b0841137ce\\draws.npz",
           "size": 43912922,
-          "mtime_ns": 1786839811003184200
+          "mtime_ns": 1787231936063208100
         }
       },
       "liquid_fuels": {
         "metadata": {
-          "path": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\results\\liquid_fuels\\20260816\\1f1aa9e776b20347fe85fe11fcabe6019a63e269769b4e4b54208fba474b39ad\\metadata.json",
+          "path": "C:\\Users\\kelya\\bvar-energy\\results\\liquid_fuels\\20260816\\1f1aa9e776b20347fe85fe11fcabe6019a63e269769b4e4b54208fba474b39ad\\metadata.json",
           "size": 1827,
-          "mtime_ns": 1786864628913720200
+          "mtime_ns": 1787231833612712100
         },
         "draws": {
-          "path": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\results\\liquid_fuels\\20260816\\1f1aa9e776b20347fe85fe11fcabe6019a63e269769b4e4b54208fba474b39ad\\draws.npz",
+          "path": "C:\\Users\\kelya\\bvar-energy\\results\\liquid_fuels\\20260816\\1f1aa9e776b20347fe85fe11fcabe6019a63e269769b4e4b54208fba474b39ad\\draws.npz",
           "size": 152279964,
-          "mtime_ns": 1786864642117478000
+          "mtime_ns": 1787232042723349100
         }
       },
       "petrol": {
         "metadata": {
-          "path": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\results\\car_fuels_petrol\\20260816\\4d672951e6620759bcf6a75c8b59edcf4ec43ab024e60573a570ac97100147e9\\metadata.json",
+          "path": "C:\\Users\\kelya\\bvar-energy\\results\\car_fuels_petrol\\20260816\\4d672951e6620759bcf6a75c8b59edcf4ec43ab024e60573a570ac97100147e9\\metadata.json",
           "size": 1834,
-          "mtime_ns": 1786847320857311300
+          "mtime_ns": 1787231833401601700
         },
         "draws": {
-          "path": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\results\\car_fuels_petrol\\20260816\\4d672951e6620759bcf6a75c8b59edcf4ec43ab024e60573a570ac97100147e9\\draws.npz",
+          "path": "C:\\Users\\kelya\\bvar-energy\\results\\car_fuels_petrol\\20260816\\4d672951e6620759bcf6a75c8b59edcf4ec43ab024e60573a570ac97100147e9\\draws.npz",
           "size": 124168529,
-          "mtime_ns": 1786847331470760100
+          "mtime_ns": 1787232032607691800
         }
       },
       "solid_fuels": {
         "metadata": {
-          "path": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\results\\solid_fuels\\20260816\\cb242e8e834162416552a8957f9464c8675c5c1d90665204f583bc5d2521fb65\\metadata.json",
+          "path": "C:\\Users\\kelya\\bvar-energy\\results\\solid_fuels\\20260816\\cb242e8e834162416552a8957f9464c8675c5c1d90665204f583bc5d2521fb65\\metadata.json",
           "size": 1288,
-          "mtime_ns": 1786840097567558100
+          "mtime_ns": 1787231833640604000
         },
         "draws": {
-          "path": "C:\\Users\\kelyan.gane\\Project\\Python\\Bayesian_model\\bvar-energy\\results\\solid_fuels\\20260816\\cb242e8e834162416552a8957f9464c8675c5c1d90665204f583bc5d2521fb65\\draws.npz",
+          "path": "C:\\Users\\kelya\\bvar-energy\\results\\solid_fuels\\20260816\\cb242e8e834162416552a8957f9464c8675c5c1d90665204f583bc5d2521fb65\\draws.npz",
           "size": 43344485,
-          "mtime_ns": 1786840101363598500
+          "mtime_ns": 1787231935080109900
         }
       }
     }

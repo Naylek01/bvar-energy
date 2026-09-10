@@ -1,0 +1,402 @@
+{
+  "available": true,
+  "cache_version": "energy-bvar-fitted-v8",
+  "cache_path": "C:\\Users\\kelya\\bvar-energy\\results\\hicp_energy_aggregate\\20260816\\725bb35748e16e403dc8\\bvar_fitted_v3.parquet",
+  "persisted": true,
+  "canonical_discriminator": "basis",
+  "fitted_contract": {
+    "basis": [
+      "aggregate_bvar_fitted",
+      "component_bvar_fitted",
+      "source_bvar_fitted"
+    ],
+    "source_bvars": [
+      "gas",
+      "electricity",
+      "heat_energy",
+      "solid_fuels",
+      "petrol",
+      "diesel",
+      "liquid_fuels"
+    ],
+    "source_fit_windows": {
+      "gas": {
+        "fit_start": "2004-08-01 00:00:00",
+        "fit_end": "2026-06-01 00:00:00",
+        "n_months": 263
+      },
+      "electricity": {
+        "fit_start": "2004-08-01 00:00:00",
+        "fit_end": "2026-06-01 00:00:00",
+        "n_months": 263
+      },
+      "heat_energy": {
+        "fit_start": "2001-02-01 00:00:00",
+        "fit_end": "2026-06-01 00:00:00",
+        "n_months": 305
+      },
+      "solid_fuels": {
+        "fit_start": "2001-02-01 00:00:00",
+        "fit_end": "2026-06-01 00:00:00",
+        "n_months": 305
+      },
+      "petrol": {
+        "fit_start": "2017-01-01 00:00:00",
+        "fit_end": "2026-07-01 00:00:00",
+        "n_months": 115
+      },
+      "diesel": {
+        "fit_start": "2017-01-01 00:00:00",
+        "fit_end": "2026-07-01 00:00:00",
+        "n_months": 115
+      },
+      "liquid_fuels": {
+        "fit_start": "2005-09-01 00:00:00",
+        "fit_end": "2026-07-01 00:00:00",
+        "n_months": 251
+      }
+    },
+    "components": [
+      "car_fuels",
+      "liquid_fuels",
+      "gas",
+      "electricity",
+      "heat_energy",
+      "solid_fuels"
+    ],
+    "metrics": [
+      "level",
+      "yoy"
+    ],
+    "fit_start": "2017-01-01 00:00:00",
+    "fit_end": "2026-06-01 00:00:00",
+    "n_months": 114,
+    "aggregate_fit_start": "2017-01-01 00:00:00",
+    "aggregate_fit_end": "2026-06-01 00:00:00",
+    "aggregate_n_months": 114,
+    "component_fit_windows": {
+      "car_fuels": {
+        "fit_start": "2017-01-01 00:00:00",
+        "fit_end": "2026-06-01 00:00:00",
+        "n_months": 114
+      },
+      "liquid_fuels": {
+        "fit_start": "2005-09-01 00:00:00",
+        "fit_end": "2026-07-01 00:00:00",
+        "n_months": 251
+      },
+      "gas": {
+        "fit_start": "2004-08-01 00:00:00",
+        "fit_end": "2026-06-01 00:00:00",
+        "n_months": 263
+      },
+      "electricity": {
+        "fit_start": "2004-08-01 00:00:00",
+        "fit_end": "2026-06-01 00:00:00",
+        "n_months": 263
+      },
+      "heat_energy": {
+        "fit_start": "2001-02-01 00:00:00",
+        "fit_end": "2026-06-01 00:00:00",
+        "n_months": 305
+      },
+      "solid_fuels": {
+        "fit_start": "2001-02-01 00:00:00",
+        "fit_end": "2026-06-01 00:00:00",
+        "n_months": 305
+      }
+    },
+    "minimum_positive_summary_draws": 300,
+    "leading_unavailable_yoy_rows": 33
+  },
+  "definition": "posterior one-step conditional fitted target levels; no in-sample innovation is added; tax/frequency/HICP adapters match aggregate forecasting",
+  "source_bvar_overlay_definition": "seven source Energy BVAR posterior one-step fitted HICP targets; Petrol and Diesel remain separate source models; Car fuels is not counted as a source BVAR",
+  "source_bvar_fit_windows": {
+    "gas": {
+      "fit_start": "2004-08-01T00:00:00",
+      "fit_end": "2026-06-01T00:00:00",
+      "n_months": 263
+    },
+    "electricity": {
+      "fit_start": "2004-08-01T00:00:00",
+      "fit_end": "2026-06-01T00:00:00",
+      "n_months": 263
+    },
+    "heat_energy": {
+      "fit_start": "2001-02-01T00:00:00",
+      "fit_end": "2026-06-01T00:00:00",
+      "n_months": 305
+    },
+    "solid_fuels": {
+      "fit_start": "2001-02-01T00:00:00",
+      "fit_end": "2026-06-01T00:00:00",
+      "n_months": 305
+    },
+    "petrol": {
+      "fit_start": "2017-01-01T00:00:00",
+      "fit_end": "2026-07-01T00:00:00",
+      "n_months": 115
+    },
+    "diesel": {
+      "fit_start": "2017-01-01T00:00:00",
+      "fit_end": "2026-07-01T00:00:00",
+      "n_months": 115
+    },
+    "liquid_fuels": {
+      "fit_start": "2005-09-01T00:00:00",
+      "fit_end": "2026-07-01T00:00:00",
+      "n_months": 251
+    }
+  },
+  "component_overlay_definition": "six HICP component posterior fitted summaries over each component's full natural valid history; the same deterministic aggregate-pairing draw indices are used on every component; Car fuels combines fitted Petrol/Diesel with observed Other transport fuels",
+  "aggregate_overlay_definition": "draw-wise Laspeyres aggregation of the six fitted HICP component paths; quantiles are computed only after aggregation",
+  "deterministic_accounting_reconstruction": "audit_only_not_plotted_as_model_fit",
+  "cross_model_dependence": "independent posterior chains; deterministic random draw pairing",
+  "pairing_seed": 2026,
+  "n_aggregate_fitted_draws": 300,
+  "history_policy": "full_natural_valid_history",
+  "requested_start_date": null,
+  "fit_start": "2017-01-01T00:00:00",
+  "fit_end": "2026-06-01T00:00:00",
+  "aggregate_fit_start": "2017-01-01T00:00:00",
+  "aggregate_fit_end": "2026-06-01T00:00:00",
+  "component_fit_windows": {
+    "car_fuels": {
+      "fit_start": "2017-01-01T00:00:00",
+      "fit_end": "2026-06-01T00:00:00",
+      "n_months": 114
+    },
+    "liquid_fuels": {
+      "fit_start": "2005-09-01T00:00:00",
+      "fit_end": "2026-07-01T00:00:00",
+      "n_months": 251
+    },
+    "gas": {
+      "fit_start": "2004-08-01T00:00:00",
+      "fit_end": "2026-06-01T00:00:00",
+      "n_months": 263
+    },
+    "electricity": {
+      "fit_start": "2004-08-01T00:00:00",
+      "fit_end": "2026-06-01T00:00:00",
+      "n_months": 263
+    },
+    "heat_energy": {
+      "fit_start": "2001-02-01T00:00:00",
+      "fit_end": "2026-06-01T00:00:00",
+      "n_months": 305
+    },
+    "solid_fuels": {
+      "fit_start": "2001-02-01T00:00:00",
+      "fit_end": "2026-06-01T00:00:00",
+      "n_months": 305
+    }
+  },
+  "created_at_utc": "2026-08-20T18:10:39.912883+00:00",
+  "source_signature": {
+    "cache_version": "energy-bvar-fitted-v8",
+    "aggregate_run_id": "725bb35748e16e403dc8",
+    "vintage": "20260816",
+    "max_draws": 300,
+    "pairing_seed": 2026,
+    "start_date": null,
+    "history_policy": "full_natural_valid_history",
+    "components": {
+      "diesel": {
+        "metadata": {
+          "path": "C:\\Users\\kelya\\bvar-energy\\results\\car_fuels_diesel\\20260816\\f9f27d1f9069fca386df1c9b191b1927d1b51993c9401d98891e4de4495a348f\\metadata.json",
+          "size": 1827,
+          "mtime_ns": 1787231833380156400
+        },
+        "draws": {
+          "path": "C:\\Users\\kelya\\bvar-energy\\results\\car_fuels_diesel\\20260816\\f9f27d1f9069fca386df1c9b191b1927d1b51993c9401d98891e4de4495a348f\\draws.npz",
+          "size": 152088048,
+          "mtime_ns": 1787232043004420800
+        }
+      },
+      "electricity": {
+        "metadata": {
+          "path": "C:\\Users\\kelya\\bvar-energy\\results\\electricity\\20260816\\807c431b2aae4abbec1f2ad3f4b0c4cc19a80ace27293f1ab1cccf4afd4aa13d\\metadata.json",
+          "size": 1462,
+          "mtime_ns": 1787231833431608200
+        },
+        "draws": {
+          "path": "C:\\Users\\kelya\\bvar-energy\\results\\electricity\\20260816\\807c431b2aae4abbec1f2ad3f4b0c4cc19a80ace27293f1ab1cccf4afd4aa13d\\draws.npz",
+          "size": 25376359,
+          "mtime_ns": 1787231983602827400
+        }
+      },
+      "gas": {
+        "metadata": {
+          "path": "C:\\Users\\kelya\\bvar-energy\\results\\gas\\20260816\\9ce26b46de996d7f3682685b96e765c300696ddeeac6fb4450ef36de6333c4e2\\metadata.json",
+          "size": 1256,
+          "mtime_ns": 1787231833472134600
+        },
+        "draws": {
+          "path": "C:\\Users\\kelya\\bvar-energy\\results\\gas\\20260816\\9ce26b46de996d7f3682685b96e765c300696ddeeac6fb4450ef36de6333c4e2\\draws.npz",
+          "size": 25112638,
+          "mtime_ns": 1787231983904847100
+        }
+      },
+      "heat_energy": {
+        "metadata": {
+          "path": "C:\\Users\\kelya\\bvar-energy\\results\\heat_energy\\20260816\\556eebd7a1779923f8310fb9b507264bac0cfcd25da9da634ec2c3b0841137ce\\metadata.json",
+          "size": 1288,
+          "mtime_ns": 1787231833581170500
+        },
+        "draws": {
+          "path": "C:\\Users\\kelya\\bvar-energy\\results\\heat_energy\\20260816\\556eebd7a1779923f8310fb9b507264bac0cfcd25da9da634ec2c3b0841137ce\\draws.npz",
+          "size": 43912922,
+          "mtime_ns": 1787231936063208100
+        }
+      },
+      "liquid_fuels": {
+        "metadata": {
+          "path": "C:\\Users\\kelya\\bvar-energy\\results\\liquid_fuels\\20260816\\1f1aa9e776b20347fe85fe11fcabe6019a63e269769b4e4b54208fba474b39ad\\metadata.json",
+          "size": 1827,
+          "mtime_ns": 1787231833612712100
+        },
+        "draws": {
+          "path": "C:\\Users\\kelya\\bvar-energy\\results\\liquid_fuels\\20260816\\1f1aa9e776b20347fe85fe11fcabe6019a63e269769b4e4b54208fba474b39ad\\draws.npz",
+          "size": 152279964,
+          "mtime_ns": 1787232042723349100
+        }
+      },
+      "petrol": {
+        "metadata": {
+          "path": "C:\\Users\\kelya\\bvar-energy\\results\\car_fuels_petrol\\20260816\\4d672951e6620759bcf6a75c8b59edcf4ec43ab024e60573a570ac97100147e9\\metadata.json",
+          "size": 1834,
+          "mtime_ns": 1787231833401601700
+        },
+        "draws": {
+          "path": "C:\\Users\\kelya\\bvar-energy\\results\\car_fuels_petrol\\20260816\\4d672951e6620759bcf6a75c8b59edcf4ec43ab024e60573a570ac97100147e9\\draws.npz",
+          "size": 124168529,
+          "mtime_ns": 1787232032607691800
+        }
+      },
+      "solid_fuels": {
+        "metadata": {
+          "path": "C:\\Users\\kelya\\bvar-energy\\results\\solid_fuels\\20260816\\cb242e8e834162416552a8957f9464c8675c5c1d90665204f583bc5d2521fb65\\metadata.json",
+          "size": 1288,
+          "mtime_ns": 1787231833640604000
+        },
+        "draws": {
+          "path": "C:\\Users\\kelya\\bvar-energy\\results\\solid_fuels\\20260816\\cb242e8e834162416552a8957f9464c8675c5c1d90665204f583bc5d2521fb65\\draws.npz",
+          "size": 43344485,
+          "mtime_ns": 1787231935080109900
+        }
+      }
+    }
+  },
+  "preparation_audit": {
+    "gas": {
+      "model_id": "gas",
+      "run_id": "9ce26b46de996d7f3682685b96e765c300696ddeeac6fb4450ef36de6333c4e2",
+      "target": "gas_pre_tax",
+      "posterior_draws_used": 300,
+      "missing_data_method": "linear",
+      "conditioning_history": "observed_or_linear_effective_history",
+      "fit_start": "2004-08-01T00:00:00",
+      "fit_end": "2026-06-01T00:00:00"
+    },
+    "electricity": {
+      "model_id": "electricity",
+      "run_id": "807c431b2aae4abbec1f2ad3f4b0c4cc19a80ace27293f1ab1cccf4afd4aa13d",
+      "target": "electricity_pre_tax",
+      "posterior_draws_used": 300,
+      "missing_data_method": "linear",
+      "conditioning_history": "observed_or_linear_effective_history",
+      "fit_start": "2004-08-01T00:00:00",
+      "fit_end": "2026-06-01T00:00:00"
+    },
+    "heat_energy": {
+      "model_id": "heat_energy",
+      "run_id": "556eebd7a1779923f8310fb9b507264bac0cfcd25da9da634ec2c3b0841137ce",
+      "target": "hicp_heat_energy",
+      "posterior_draws_used": 300,
+      "missing_data_method": "linear",
+      "conditioning_history": "observed_or_linear_effective_history",
+      "fit_start": "2001-02-01T00:00:00",
+      "fit_end": "2026-06-01T00:00:00"
+    },
+    "solid_fuels": {
+      "model_id": "solid_fuels",
+      "run_id": "cb242e8e834162416552a8957f9464c8675c5c1d90665204f583bc5d2521fb65",
+      "target": "hicp_solid_fuels",
+      "posterior_draws_used": 300,
+      "missing_data_method": "linear",
+      "conditioning_history": "observed_or_linear_effective_history",
+      "fit_start": "2001-02-01T00:00:00",
+      "fit_end": "2026-06-01T00:00:00"
+    },
+    "petrol": {
+      "model_id": "car_fuels_petrol",
+      "run_id": "4d672951e6620759bcf6a75c8b59edcf4ec43ab024e60573a570ac97100147e9",
+      "target": "wob_petrol_pre_tax",
+      "posterior_draws_used": 300,
+      "missing_data_method": "dk",
+      "conditioning_history": "draw_specific_DK_completed_history",
+      "fit_start": "2009-10-12T00:00:00",
+      "fit_end": "2026-08-10T00:00:00"
+    },
+    "diesel": {
+      "model_id": "car_fuels_diesel",
+      "run_id": "f9f27d1f9069fca386df1c9b191b1927d1b51993c9401d98891e4de4495a348f",
+      "target": "wob_diesel_pre_tax",
+      "posterior_draws_used": 300,
+      "missing_data_method": "dk",
+      "conditioning_history": "draw_specific_DK_completed_history",
+      "fit_start": "2005-09-26T00:00:00",
+      "fit_end": "2026-08-10T00:00:00"
+    },
+    "liquid_fuels": {
+      "model_id": "liquid_fuels",
+      "run_id": "1f1aa9e776b20347fe85fe11fcabe6019a63e269769b4e4b54208fba474b39ad",
+      "target": "wob_heating_oil_pre_tax",
+      "posterior_draws_used": 300,
+      "missing_data_method": "dk",
+      "conditioning_history": "draw_specific_DK_completed_history",
+      "fit_start": "2005-09-26T00:00:00",
+      "fit_end": "2026-08-10T00:00:00"
+    }
+  },
+  "weekly_hicp_rebase_audit": {
+    "petrol": {
+      "anchor_date": "2016-12-01T00:00:00",
+      "fitted_start_month": "2017-01-01T00:00:00",
+      "bridge_method": "proportional_rebase_to_latest_common_hicp"
+    },
+    "diesel": {
+      "anchor_date": "2016-12-01T00:00:00",
+      "fitted_start_month": "2017-01-01T00:00:00",
+      "bridge_method": "proportional_rebase_to_latest_common_hicp"
+    },
+    "liquid_fuels": {
+      "anchor_date": "2005-08-01T00:00:00",
+      "fitted_start_month": "2005-09-01T00:00:00",
+      "bridge_method": "proportional_rebase_to_latest_common_hicp"
+    }
+  },
+  "car_fuels_residual_policy": {
+    "component": "hicp_other_transport_fuels",
+    "modelled": false,
+    "production_chain_link_anchor": "2016-12-01T00:00:00",
+    "earliest_honest_fitted_month": "2017-01-01T00:00:00",
+    "historical_fitted_policy": "published observed HICP only; trim leading/trailing ragged edge; hard-fail on any interior missing/non-positive month",
+    "forecast_policy_is_different": "future aggregate forecasting may hold the latest published residual level constant; that convention is not used for historical fitted diagnostics",
+    "published_start": "2016-12-01T00:00:00",
+    "published_end": "2026-06-01T00:00:00",
+    "trimmed_leading_months": 0,
+    "trimmed_trailing_months": 1,
+    "effective_transport_fit_start": "2017-01-01T00:00:00",
+    "effective_transport_fit_end": "2026-06-01T00:00:00"
+  },
+  "aggregate_pairing_pool_indices_recorded": {
+    "car_fuels": 300,
+    "liquid_fuels": 300,
+    "gas": 300,
+    "electricity": 300,
+    "heat_energy": 300,
+    "solid_fuels": 300
+  }
+}

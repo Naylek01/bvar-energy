@@ -1,0 +1,17 @@
+{
+  "bvar_reestimated": false,
+  "contract": "ENERGY_12M_SAVED_POSTERIOR_MATERIALISATION_LOTB_V1",
+  "dashboard_calendar_end": "2027-07-01T00:00:00",
+  "dashboard_calendar_start": "2026-08-01T00:00:00",
+  "forecast_seed": 123,
+  "materialized_H": 50,
+  "model_id": "liquid_fuels",
+  "n_forecast_draws": 500,
+  "original_unconditional_overwritten": false,
+  "source_H": 26,
+  "source_forecast": "forecast://liquid_fuels/20260816/1f1aa9e776b20347fe85fe11fcabe6019a63e269769b4e4b54208fba474b39ad/unconditional",
+  "source_replay_max_abs_error": 4.547473508864641e-13,
+  "source_replay_tolerance": 1e-08,
+  "source_run_id": "1f1aa9e776b20347fe85fe11fcabe6019a63e269769b4e4b54208fba474b39ad",
+  "vintage": "20260816"
+}

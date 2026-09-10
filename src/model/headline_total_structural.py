@@ -354,15 +354,27 @@ def _structural_contract_gate(
         f"Contract {HEADLINE_TOTAL_STRUCTURAL_IRF_CONTRACT_VERSION} currently supports only "
         f"identification={HEADLINE_TOTAL_STRUCTURAL_IDENTIFICATION!r}.",
     )
+    # HEADLINE_TOTAL_LEVEL_SUPPORT_H4_V1
     _require(
-        str(shock_unit) == HEADLINE_TOTAL_STRUCTURAL_SHOCK_UNIT,
-        f"Contract {HEADLINE_TOTAL_STRUCTURAL_IRF_CONTRACT_VERSION} currently supports only "
-        f"shock_unit={HEADLINE_TOTAL_STRUCTURAL_SHOCK_UNIT!r}.",
+        str(shock_unit) in {"structural_std", "level"},
+        f"Contract {HEADLINE_TOTAL_STRUCTURAL_IRF_CONTRACT_VERSION} supports "
+        "shock_unit in {'structural_std', 'level'}; "
+        f"found {shock_unit!r}.",
     )
+    # HEADLINE_TOTAL_ARBITRARY_SHOCK_SIZE_V1
+    try:
+        resolved_shock_size = float(shock_size)
+    except (TypeError, ValueError, OverflowError):
+        raise HeadlineTotalStructuralError(
+            f"Contract {HEADLINE_TOTAL_STRUCTURAL_IRF_CONTRACT_VERSION} requires "
+            f"a finite strictly positive structural-standard-deviation shock size; "
+            f"found {shock_size!r}."
+        ) from None
     _require(
-        float(shock_size) == HEADLINE_TOTAL_STRUCTURAL_SHOCK_SIZE,
-        f"Contract {HEADLINE_TOTAL_STRUCTURAL_IRF_CONTRACT_VERSION} currently supports only "
-        f"shock_size={HEADLINE_TOTAL_STRUCTURAL_SHOCK_SIZE:g}.",
+        np.isfinite(resolved_shock_size) and resolved_shock_size > 0.0,
+        f"Contract {HEADLINE_TOTAL_STRUCTURAL_IRF_CONTRACT_VERSION} requires "
+        f"a finite strictly positive structural-standard-deviation shock size; "
+        f"found {shock_size!r}.",
     )
     _require(
         not bool(include_outlier_scale),

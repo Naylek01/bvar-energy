@@ -153,16 +153,14 @@ def _component_run_directories(
     aggregate_directory: Path,
     aggregate_metadata: Mapping,
 ) -> dict[str, Path]:
+    """Resolve all seven run directories from legacy or logical store refs."""
+    from inflation_path_portability import resolve_forecast_store_reference
+
     stores = dict(aggregate_metadata.get("component_forecast_stores", {}) or {})
     if not stores:
         raise FittedMaterialisationError(
             "Aggregate metadata does not record component_forecast_stores."
         )
-
-    vintage = str(
-        aggregate_metadata.get("vintage")
-        or aggregate_directory.parent.name
-    )
     results_root = _results_root_from_aggregate(aggregate_directory)
     out: dict[str, Path] = {}
     missing: list[str] = []
@@ -170,29 +168,22 @@ def _component_run_directories(
     for aggregate_key, canonical_model_id in _COMPONENT_RUN_IDS.items():
         raw = stores.get(aggregate_key)
         if raw is None:
-            # Backward compatibility: a few experimental stores used canonical
-            # model ids rather than aggregation keys for petrol/diesel.
             raw = stores.get(canonical_model_id)
         if raw is None:
             missing.append(aggregate_key)
             continue
-
-        store_path = Path(str(raw))
         try:
-            run_id = store_path.parents[1].name
-        except IndexError:
-            run_id = ""
-
-        candidate = (
-            store_path.parents[1] if len(store_path.parents) >= 2 else None
-        )
-        if (candidate is None or not candidate.is_dir()) and run_id:
-            candidate = results_root / canonical_model_id / vintage / run_id
-
-        if candidate is None or not candidate.is_dir():
-            missing.append(
-                f"{aggregate_key} (run directory not found from {raw!s})"
+            store_path = resolve_forecast_store_reference(
+                raw,
+                results_root_value=results_root,
+                must_exist=True,
             )
+            candidate = store_path.parent.parent
+        except Exception as exc:
+            missing.append(f"{aggregate_key} ({exc})")
+            continue
+        if not candidate.is_dir():
+            missing.append(f"{aggregate_key} (run directory missing)")
             continue
         if not (candidate / "metadata.json").is_file():
             missing.append(f"{aggregate_key} (metadata.json missing)")

@@ -674,26 +674,54 @@ def build_panel(
 # ---------------------------------------------------------------------------
 
 
-def forecast_horizon(name: str, last_date, *, spec_overrides: Mapping | None = None) -> int:
-    """Horizon in native periods, reproducing the notebooks' conventions.
+PRODUCTION_DASHBOARD_HORIZON_MONTHS = 12
+ENERGY_PRODUCTION_CALENDAR_HORIZON_V1 = True
 
-    Monthly models forecast to the end of the current calendar year with a
-    floor of three months; weekly models use a fixed 26-week horizon.
-    """
+def forecast_horizon(
+    name: str,
+    last_date,
+    *,
+    spec_overrides: Mapping | None = None,
+) -> int:
+    # Native forecast periods required to cover 12 dashboard calendar months.
     spec = model_spec(name, **(spec_overrides or {}))
-    if spec.horizon_rule == "fixed":
-        if spec.horizon_fixed is None:
-            raise PipelineError(f"{spec.model_id}: horizon_fixed is not set.")
-        return int(spec.horizon_fixed)
-    if spec.horizon_rule != "to_year_end":
-        raise PipelineError(f"Unknown horizon rule {spec.horizon_rule!r}.")
     stamp = pd.Timestamp(last_date)
-    months_to_year_end = 12 - int(stamp.month)
-    # A December origin has zero months left in the year; the notebooks roll it
-    # forward to a full twelve rather than collapsing onto the floor of three.
-    if months_to_year_end == 0:
-        months_to_year_end = 12
-    return int(max(spec.horizon_floor, months_to_year_end))
+
+    months = int(PRODUCTION_DASHBOARD_HORIZON_MONTHS)
+    if months < 1:
+        raise PipelineError(
+            "PRODUCTION_DASHBOARD_HORIZON_MONTHS must be positive."
+        )
+
+    # The month containing last_date is the first common dashboard month.
+    # The native predictive path therefore reaches the end of month +11.
+    origin_month = stamp.to_period("M").to_timestamp(how="start")
+    final_month = origin_month + pd.DateOffset(months=months - 1)
+    final_month_end = final_month + pd.offsets.MonthEnd(0)
+
+    if spec.frequency == "monthly":
+        first_future = origin_month + pd.DateOffset(months=1)
+        if first_future > final_month:
+            native = 0
+        else:
+            native = (
+                (final_month.year - first_future.year) * 12
+                + final_month.month
+                - first_future.month
+                + 1
+            )
+        return int(max(int(spec.horizon_floor), int(native)))
+
+    if spec.frequency == "weekly":
+        first_future = stamp + pd.Timedelta(weeks=1)
+        # _future_dates() uses W-MON, so count that exact production calendar.
+        native = len(pd.date_range(first_future, final_month_end, freq="W-MON"))
+        floor = int(spec.horizon_fixed or 0)
+        return int(max(floor, native))
+
+    raise PipelineError(
+        f"{spec.model_id}: unsupported forecast frequency {spec.frequency!r}."
+    )
 
 
 def forecast_draws(name: str, n_posterior_draws: int, *, spec_overrides: Mapping | None = None) -> int:

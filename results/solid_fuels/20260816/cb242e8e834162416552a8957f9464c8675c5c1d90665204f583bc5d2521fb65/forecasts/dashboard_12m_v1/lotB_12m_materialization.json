@@ -1,0 +1,17 @@
+{
+  "bvar_reestimated": false,
+  "contract": "ENERGY_12M_SAVED_POSTERIOR_MATERIALISATION_LOTB_V1",
+  "dashboard_calendar_end": "2027-07-01T00:00:00",
+  "dashboard_calendar_start": "2026-08-01T00:00:00",
+  "forecast_seed": 2026,
+  "materialized_H": 11,
+  "model_id": "solid_fuels",
+  "n_forecast_draws": 1000,
+  "original_unconditional_overwritten": false,
+  "source_H": 4,
+  "source_forecast": "forecast://solid_fuels/20260816/cb242e8e834162416552a8957f9464c8675c5c1d90665204f583bc5d2521fb65/unconditional",
+  "source_replay_max_abs_error": 5.684341886080802e-14,
+  "source_replay_tolerance": 1e-08,
+  "source_run_id": "cb242e8e834162416552a8957f9464c8675c5c1d90665204f583bc5d2521fb65",
+  "vintage": "20260816"
+}

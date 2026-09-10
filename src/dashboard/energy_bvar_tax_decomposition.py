@@ -261,12 +261,31 @@ def _monthly_gas_electricity_shares_history(
     return _normalised_shares(pre, excise_inclusive, gross_price)
 
 
-def _forecast_store(metadata: Mapping[str, Any], key: str) -> Path:
+def _forecast_store(
+    metadata: Mapping[str, Any],
+    key: str,
+    *,
+    project_root: str | Path,
+) -> Path:
+    from inflation_path_portability import resolve_forecast_store_reference
+
     stores = dict(metadata.get("component_forecast_stores", {}) or {})
     raw = stores.get(key)
     if raw is None:
-        raise TaxDecompositionError(f"Aggregate metadata does not record forecast store {key!r}.")
-    return Path(str(raw))
+        raise TaxDecompositionError(
+            f"Aggregate metadata does not record forecast store {key!r}."
+        )
+    try:
+        return resolve_forecast_store_reference(
+            raw,
+            project_root_value=project_root,
+            must_exist=True,
+        )
+    except Exception as exc:
+        raise TaxDecompositionError(
+            f"Could not resolve the saved forecast store for {key!r} "
+            f"from reference {raw!r}: {type(exc).__name__}: {exc}"
+        ) from exc
 
 
 def _monthly_model_tax_shares_forecast(
@@ -275,6 +294,8 @@ def _monthly_model_tax_shares_forecast(
     arrays: Mapping[str, np.ndarray],
     aggregate_dates: pd.DatetimeIndex,
     processed_dir: Path,
+    *,
+    project_root: str | Path,
 ) -> dict[str, np.ndarray]:
     from energy_bvar_io import load_energy_bvar_forecast
     from energy_bvar_pipeline import model_spec
@@ -294,7 +315,9 @@ def _monthly_model_tax_shares_forecast(
     else:
         raise TaxDecompositionError(f"Unsupported monthly taxed model {model!r}.")
 
-    forecast = load_energy_bvar_forecast(_forecast_store(metadata, model))
+    forecast = load_energy_bvar_forecast(
+        _forecast_store(metadata, model, project_root=project_root)
+    )
     source_dates = pd.DatetimeIndex(forecast["path_dates"], name="date")
     variables = list(forecast["variables"])
     if target not in variables:
@@ -337,13 +360,17 @@ def _weekly_model_tax_shares_forecast(
     arrays: Mapping[str, np.ndarray],
     aggregate_dates: pd.DatetimeIndex,
     processed_dir: Path,
+    *,
+    project_root: str | Path,
 ) -> dict[str, np.ndarray]:
     from energy_bvar_aggregate import weekly_paths_with_history_to_monthly_mean
     from energy_bvar_io import load_energy_bvar_forecast
     from energy_bvar_pipeline import model_spec
     from energy_bvar_weekly_fuels import load_weekly_tax_context, reattribute_weekly_taxes
 
-    forecast = load_energy_bvar_forecast(_forecast_store(metadata, model))
+    forecast = load_energy_bvar_forecast(
+        _forecast_store(metadata, model, project_root=project_root)
+    )
     context = load_weekly_tax_context(
         processed_dir / model_spec(model).dataset_file,
         model=model,
@@ -903,19 +930,19 @@ def build_tax_contribution_decomposition(
     # Forecast tax shares on the exact saved aggregate pairing.
     forecast_shares = {
         "gas": _monthly_model_tax_shares_forecast(
-            "gas", metadata, arrays, dates, processed_dir
+            "gas", metadata, arrays, dates, processed_dir, project_root=root
         ),
         "electricity": _monthly_model_tax_shares_forecast(
-            "electricity", metadata, arrays, dates, processed_dir
+            "electricity", metadata, arrays, dates, processed_dir, project_root=root
         ),
         "liquid_fuels": _weekly_model_tax_shares_forecast(
-            "liquid_fuels", metadata, arrays, dates, processed_dir
+            "liquid_fuels", metadata, arrays, dates, processed_dir, project_root=root
         ),
         "petrol": _weekly_model_tax_shares_forecast(
-            "petrol", metadata, arrays, dates, processed_dir
+            "petrol", metadata, arrays, dates, processed_dir, project_root=root
         ),
         "diesel": _weekly_model_tax_shares_forecast(
-            "diesel", metadata, arrays, dates, processed_dir
+            "diesel", metadata, arrays, dates, processed_dir, project_root=root
         ),
     }
 

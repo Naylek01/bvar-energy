@@ -1,0 +1,17 @@
+{
+  "bvar_reestimated": false,
+  "contract": "ENERGY_12M_SAVED_POSTERIOR_MATERIALISATION_LOTB_V1",
+  "dashboard_calendar_end": "2027-07-01T00:00:00",
+  "dashboard_calendar_start": "2026-08-01T00:00:00",
+  "forecast_seed": 2026,
+  "materialized_H": 11,
+  "model_id": "electricity",
+  "n_forecast_draws": 1000,
+  "original_unconditional_overwritten": false,
+  "source_H": 4,
+  "source_forecast": "forecast://electricity/20260816/807c431b2aae4abbec1f2ad3f4b0c4cc19a80ace27293f1ab1cccf4afd4aa13d/unconditional",
+  "source_replay_max_abs_error": 0.0,
+  "source_replay_tolerance": 1e-08,
+  "source_run_id": "807c431b2aae4abbec1f2ad3f4b0c4cc19a80ace27293f1ab1cccf4afd4aa13d",
+  "vintage": "20260816"
+}

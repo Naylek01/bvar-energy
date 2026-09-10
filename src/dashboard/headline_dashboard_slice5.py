@@ -12,7 +12,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-from dash import Input, Output, State, dcc, html
+from dash import Input, Output, State, ctx, dcc, html, no_update
 from dash.exceptions import PreventUpdate
 
 from dashboard_snapshot_cache import frame_from_store as snapshot_frame_from_store, get_or_build as snapshot_get_or_build
@@ -1531,47 +1531,126 @@ def _promote_if_supported(results_root,registry_path,vintage,run_id):
 def register_headline_slice5_callbacks(app, *, results_root, registry_path=None, background_manager=None, store_id="data-store", vintage_selector_id="vintage-select"):
     results_root=Path(results_root).resolve(); registry_path=None if registry_path is None else Path(registry_path).resolve()
 
-    @app.callback(Output("h5-forecast-graph","figure"),Output("h5-forecast-summary-table","data"),Input(store_id,"data"),Input("h5-forecast-series","value"),Input("h5-forecast-metric","value"),Input("h5-forecast-horizon","value"),Input("h5-forecast-fan","value"),Input("h6-headline-scenario-store","data"))
-    def forecast(store,series,metric,horizon,fan,conditional_store):
-        f=_frame_from_store(store)
-        if f.empty:
-            return _empty("Select a Headline run."), []
-        series=series or "hicp_total"; metric=metric or "yoy"; horizon=int(horizon or 3)
-        fig=headline_forecast_figure(f,series=series,metric=metric,horizon=horizon,fan_mode=fan or "68",statistic="mean")
-        fig=overlay_headline_conditional_forecast(fig,conditional_store,series=series,metric=metric,horizon=horizon)
-        return fig, forecast_summary_records(
-            f, series=series, metric=metric, max_months=horizon
+    # HEADLINE_FORECAST_SINGLE_WORKSPACE_CALLBACK_V1
+    @app.callback(
+        Output("h5-forecast-graph", "figure"),
+        Output("h5-forecast-summary-table", "data"),
+        Output("h5-components-graph", "figure"),
+        Output("h5-contributions-graph", "figure"),
+        Input(store_id, "data"),
+        Input("h5-forecast-series", "value"),
+        Input("h5-forecast-metric", "value"),
+        Input("h5-forecast-horizon", "value"),
+        Input("h5-forecast-fan", "value"),
+        Input("h6-headline-scenario-store", "data"),
+        Input("h5-contrib-display", "value"),
+        Input("h5-contrib-labels", "value"),
+        Input("url", "pathname"),
+    )
+    def forecast_workspace(
+        store,
+        series,
+        metric,
+        horizon,
+        fan,
+        conditional_store,
+        display_mode,
+        labels,
+        pathname,
+    ):
+        if (pathname or "") not in {"/forecast/headline", "/headline", "/headline/overview", "/headline/forecast", "/headline/contributions", "/headline/components"}:
+            raise PreventUpdate
+        frame = _frame_from_store(store)
+        h = int(horizon or 3)
+        trigger = ctx.triggered_id
+
+        update_forecast = trigger is None or trigger in {
+            store_id,
+            "h5-forecast-series",
+            "h5-forecast-metric",
+            "h5-forecast-horizon",
+            "h5-forecast-fan",
+            "h6-headline-scenario-store",
+            "url",
+        }
+        update_components = trigger is None or trigger in {
+            store_id,
+            "h5-forecast-horizon",
+            "url",
+        }
+        update_contributions = trigger is None or trigger in {
+            store_id,
+            "h5-forecast-horizon",
+            "h5-contrib-display",
+            "h5-contrib-labels",
+            "url",
+        }
+
+        forecast_fig = no_update
+        summary_data = no_update
+        components_fig = no_update
+        contributions_fig = no_update
+
+        if update_forecast:
+            if frame.empty:
+                forecast_fig = _empty("Select a Headline run.")
+                summary_data = []
+            else:
+                selected_series = series or "hicp_total"
+                selected_metric = metric or "yoy"
+                forecast_fig = headline_forecast_figure(
+                    frame,
+                    series=selected_series,
+                    metric=selected_metric,
+                    horizon=h,
+                    fan_mode=fan or "68",
+                    statistic="mean",
+                )
+                forecast_fig = overlay_headline_conditional_forecast(
+                    forecast_fig,
+                    conditional_store,
+                    series=selected_series,
+                    metric=selected_metric,
+                    horizon=h,
+                )
+                summary_data = forecast_summary_records(
+                    frame,
+                    series=selected_series,
+                    metric=selected_metric,
+                    max_months=h,
+                )
+
+        if update_components:
+            components_fig = (
+                _empty("Select a Headline run.")
+                if frame.empty
+                else components_figure(frame, h)
+            )
+
+        if update_contributions:
+            contributions_fig = (
+                _empty("Select a Headline run.")
+                if frame.empty
+                else contribution_decomposition_figure(
+                    frame,
+                    horizon=h,
+                    display_mode=display_mode or "bars",
+                    show_latest="latest" in (labels or []),
+                )
+            )
+
+        return (
+            forecast_fig,
+            summary_data,
+            components_fig,
+            contributions_fig,
         )
 
-    @app.callback(
-        Output("h5-components-graph","figure"),
-        Input(store_id,"data"),
-        Input("h5-forecast-horizon","value"),
-    )
-    def components(store,horizon):
-        f=_frame_from_store(store); h=int(horizon or 3)
-        return _empty("Select a Headline run.") if f.empty else components_figure(f,h)
 
-    @app.callback(
-        Output("h5-contributions-graph","figure"),
-        Input(store_id,"data"),
-        Input("h5-forecast-horizon","value"),
-        Input("h5-contrib-display","value"),
-        Input("h5-contrib-labels","value"),
-    )
-    def contributions(store,horizon,display_mode,labels):
-        f=_frame_from_store(store); h=int(horizon or 3)
-        if f.empty:
-            return _empty("Select a Headline run.")
-        return contribution_decomposition_figure(
-            f,
-            horizon=h,
-            display_mode=display_mode or "bars",
-            show_latest="latest" in (labels or []),
-        )
-
-    @app.callback(Output("h5-estimation-diagnostics","children"),Input(store_id,"data"),Input("h5-estimate-result","data"))
-    def diagnostics(store,_): return _diagnostic_summary(results_root,store)
+    @app.callback(Output("h5-estimation-diagnostics","children"),Input(store_id,"data"),Input("h5-estimate-result","data"),Input("url","pathname"))
+    def diagnostics(store,_,pathname):
+        if (pathname or "") not in {"/estimation/headline", "/headline/diagnostics", "/headline/estimation"}: raise PreventUpdate
+        return _diagnostic_summary(results_root,store)
 
     @app.callback(Output("h5-estimate-result-banner","children"),Input("h5-estimate-result","data"))
     def banner(r):

@@ -84,7 +84,8 @@ from headline_bvar_conditional import energy_level_paths_headline_bridge
 
 
 # JOINT_ENERGY_TO_HEADLINE_CONTRACT_V1
-CONDITIONAL_CONTRACT_VERSION = 'energy-conditional-observable-v4'
+CONDITIONAL_CONTRACT_VERSION = 'energy-conditional-observable-v5'
+CONDITIONAL_MONTHLY_AGGREGATE_ADMISSIBILITY_V1 = True
 BASELINE_REPLAY_TOLERANCE = 1e-8
 AGGREGATE_REPLAY_TOLERANCE = 1e-8
 PAIRING_TOLERANCE = 1e-12
@@ -162,26 +163,28 @@ def _forecast_directory_for_model(
     aggregate_metadata: Mapping[str, Any],
     model_id: str,
 ) -> Path:
+    """Resolve one component forecast on the current clone."""
+    from inflation_path_portability import resolve_forecast_store_reference
+
     stores = dict(aggregate_metadata.get("component_forecast_stores", {}) or {})
     spec = model_spec(model_id)
-    candidates = [
-        str(getattr(spec, "aggregate_key", "")),
-        str(model_id),
-    ]
+    candidates = [str(getattr(spec, "aggregate_key", "")), str(model_id)]
     candidates += [str(x) for x in getattr(spec, "aliases", ())]
+    failures: list[str] = []
 
     for key in candidates:
-        if key and key in stores:
-            path = Path(str(stores[key]))
-            if path.is_dir():
-                return path
-            raise ConditionalScenarioError(
-                f"Aggregate metadata points to a missing forecast store: {path}"
-            )
+        if not key or key not in stores:
+            continue
+        try:
+            return resolve_forecast_store_reference(stores[key], must_exist=True)
+        except Exception as exc:
+            failures.append(f"{key}: {exc}")
 
-    # Defensive fallback for paths whose parent run metadata identifies model_id.
     for raw in stores.values():
-        path = Path(str(raw))
+        try:
+            path = resolve_forecast_store_reference(raw, must_exist=True)
+        except Exception:
+            continue
         meta_path = path.parent.parent / "metadata.json"
         if not meta_path.is_file():
             continue
@@ -192,8 +195,10 @@ def _forecast_directory_for_model(
         if str(meta.get("model_id")) == str(model_id):
             return path
 
+    detail = (" · " + " | ".join(failures)) if failures else ""
     raise ConditionalScenarioError(
-        f"The aggregate does not record a forecast store for {model_id!r}."
+        f"The aggregate does not contain a resolvable forecast store for "
+        f"{model_id!r} on the current clone.{detail}"
     )
 
 
@@ -235,12 +240,18 @@ def _aggregate_dates(
 def _aggregate_forecast_origin(
     aggregate_metadata: Mapping[str, Any],
 ) -> pd.Timestamp | None:
-    """Latest first-future month across the aggregate's component forecasts."""
+    """Latest first-future month across portable component-store references."""
+    from inflation_path_portability import resolve_forecast_store_reference
+
     starts: list[pd.Timestamp] = []
     for raw in dict(
         aggregate_metadata.get("component_forecast_stores", {}) or {}
     ).values():
-        path = Path(str(raw)) / "forecast_metadata.json"
+        try:
+            directory = resolve_forecast_store_reference(raw, must_exist=True)
+        except Exception:
+            continue
+        path = directory / "forecast_metadata.json"
         if not path.is_file():
             continue
         try:
@@ -249,9 +260,7 @@ def _aggregate_forecast_origin(
             if not future:
                 continue
             starts.append(
-                pd.Timestamp(future[0])
-                .to_period("M")
-                .to_timestamp(how="start")
+                pd.Timestamp(future[0]).to_period("M").to_timestamp(how="start")
             )
         except Exception:
             continue
@@ -618,37 +627,173 @@ def _max_abs_difference(left, right) -> float:
     return float(np.max(np.abs(a[valid] - b[valid])))
 
 
-def _build_condition_path(result: Mapping[str, Any], forecast: Mapping[str, Any], *, variable: str, path_mode: str, path_value: float, condition_start: int=1, condition_end: int | None=None) -> tuple[np.ndarray, float, pd.Timestamp]:
-    """Build a partial hard LEVEL condition on an inclusive forecast window."""
-    variables = list(result['variables'])
+# ENERGY_CONDITIONAL_VECTOR_PATH_E1_V1
+def conditional_path_signature_fields(
+    *,
+    path_value: Any = None,
+    path_values: Sequence[float] | None = None,
+) -> dict[str, Any]:
+    if path_values is None:
+        try:
+            value = float(path_value)
+        except (TypeError, ValueError) as exc:
+            raise ConditionalScenarioError("Scenario path_value is invalid.") from exc
+        if not np.isfinite(value):
+            raise ConditionalScenarioError("Scenario path_value must be finite.")
+        return {"path_value": value}
+
+    try:
+        values = [float(x) for x in list(path_values)]
+    except (TypeError, ValueError) as exc:
+        raise ConditionalScenarioError(
+            "Scenario path_values must be a finite numeric sequence."
+        ) from exc
+    if not values:
+        raise ConditionalScenarioError("Scenario path_values cannot be empty.")
+    if not np.all(np.isfinite(np.asarray(values, dtype=float))):
+        raise ConditionalScenarioError("Scenario path_values must all be finite.")
+
+    first = float(values[0])
+    if all(float(x) == first for x in values[1:]):
+        return {"path_value": first}
+
+    return {
+        "path_signature_version": 2,
+        "path_values": values,
+    }
+
+
+def _conditional_signature_item(
+    model_id: str,
+    spec: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "model_id": str(model_id),
+        "condition_variable": str(spec["condition_variable"]),
+        "path_mode": str(spec["path_mode"]),
+        **conditional_path_signature_fields(
+            path_value=spec.get("path_value"),
+            path_values=spec.get("path_values"),
+        ),
+        "condition_start": int(spec.get("condition_start") or 1),
+        "condition_end": (
+            None
+            if spec.get("condition_end") is None
+            else int(spec.get("condition_end"))
+        ),
+        "condition_mask_hash": spec.get("condition_mask_hash"),
+    }
+
+
+def _conditional_path_description(
+    *,
+    path_mode: str,
+    path_fields: Mapping[str, Any],
+    condition_target_level: float,
+    unit: str,
+) -> str:
+    mode = str(path_mode).strip().lower()
+    if "path_value" in path_fields:
+        value = float(path_fields["path_value"])
+        if mode == "percent":
+            return f"{value:+.2f}% vs last observed"
+        return f"{float(condition_target_level):.6g} {unit}".strip()
+
+    values = [float(x) for x in list(path_fields.get("path_values") or [])]
+    payload = json.dumps(
+        dict(path_fields),
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    token = __import__("hashlib").sha256(
+        payload.encode("utf-8")
+    ).hexdigest()[:10]
+    if mode == "percent":
+        return (
+            f"custom % path {values[0]:+.2f}%→{values[-1]:+.2f}% "
+            f"vs last observed · profile {token}"
+        )
+    return (
+        f"custom level path {values[0]:.6g}→{values[-1]:.6g} {unit}".strip()
+        + f" · profile {token}"
+    )
+
+def _build_condition_path(
+    result: Mapping[str, Any],
+    forecast: Mapping[str, Any],
+    *,
+    variable: str,
+    path_mode: str,
+    path_value: float | None = None,
+    path_values: Sequence[float] | None = None,
+    condition_start: int = 1,
+    condition_end: int | None = None,
+) -> tuple[np.ndarray, float, pd.Timestamp]:
+    variables = list(result["variables"])
     if variable not in variables:
-        raise ConditionalScenarioError(f'Condition variable {variable!r} is absent from {variables}.')
-    levels_original = result['prep'].get('levels_original', result['prep']['levels'])
+        raise ConditionalScenarioError(
+            f"Condition variable {variable!r} is absent from {variables}."
+        )
+
+    levels_original = result["prep"].get(
+        "levels_original", result["prep"]["levels"]
+    )
     history = pd.DataFrame(levels_original)[variable].astype(float).dropna()
     if history.empty:
-        raise ConditionalScenarioError(f'No observed history is available for {variable!r}.')
+        raise ConditionalScenarioError(
+            f"No observed history is available for {variable!r}."
+        )
     last_value = float(history.iloc[-1])
     last_date = pd.Timestamp(history.index[-1])
+
     mode = str(path_mode).strip().lower()
-    value = float(path_value)
-    if not np.isfinite(value):
-        raise ConditionalScenarioError('Scenario path value must be finite.')
-    if mode == 'percent':
-        target_level = last_value * (1.0 + value / 100.0)
-    elif mode == 'level':
-        target_level = value
-    else:
+    if mode not in {"percent", "level"}:
         raise ConditionalScenarioError("path_mode must be 'percent' or 'level'.")
-    if not np.isfinite(target_level):
-        raise ConditionalScenarioError('Imposed future level is non-finite.')
-    H = int(forecast.get('H') or len(forecast['future_dates']))
+
+    H = int(forecast.get("H") or len(forecast["future_dates"]))
     start = int(condition_start or 1)
     end = H if condition_end is None else int(condition_end)
     if start < 1 or end < start or end > H:
-        raise ConditionalScenarioError(f'Condition window must satisfy 1 <= start <= end <= {H}; received start={start}, end={end}.')
+        raise ConditionalScenarioError(
+            f"Condition window must satisfy 1 <= start <= end <= {H}; "
+            f"received start={start}, end={end}."
+        )
+
+    path_fields = conditional_path_signature_fields(
+        path_value=path_value,
+        path_values=path_values,
+    )
     path = np.full(H, np.nan, dtype=float)
-    path[start - 1:end] = target_level
-    return (path, last_value, last_date)
+    n_window = end - start + 1
+
+    if "path_value" in path_fields:
+        value = float(path_fields["path_value"])
+        if mode == "percent":
+            target_level = last_value * (1.0 + value / 100.0)
+        else:
+            target_level = value
+        if not np.isfinite(target_level):
+            raise ConditionalScenarioError("Imposed future level is non-finite.")
+        path[start - 1:end] = target_level
+        return path, last_value, last_date
+
+    values = np.asarray(path_fields["path_values"], dtype=float)
+    if values.ndim != 1 or len(values) != n_window:
+        raise ConditionalScenarioError(
+            "Scenario path_values length must equal the inclusive condition "
+            f"window ({n_window}); received {len(values)}."
+        )
+    if mode == "percent":
+        target_levels = last_value * (1.0 + values / 100.0)
+    else:
+        target_levels = values
+    if not np.all(np.isfinite(target_levels)):
+        raise ConditionalScenarioError(
+            "Imposed future levels contain a non-finite value."
+        )
+    path[start - 1:end] = target_levels
+    return path, last_value, last_date
 
 
 def _paired_forecasts(result: Mapping[str, Any], saved_forecast: Mapping[str, Any], *, condition_variable: str, condition_path: np.ndarray, forecast_seed: int) -> tuple[dict[str, Any], dict[str, Any], dict[str, float]]:
@@ -999,33 +1144,106 @@ def _conditioned_component_for_aggregate(
 
     if model_id not in WEEKLY_MODEL_IDS:
         base_all = _align_paths(
-            pair_hicp["baseline"], pair_hicp["dates"], aggregate_dates
+            pair_hicp["baseline"],
+            pair_hicp["dates"],
+            aggregate_dates,
         )
         scen_all = _align_paths(
-            pair_hicp["scenario"], pair_hicp["dates"], aggregate_dates
+            pair_hicp["scenario"],
+            pair_hicp["dates"],
+            aggregate_dates,
         )
         if final_pair.max(initial=-1) >= len(base_all):
             raise ConditionalScenarioError(
-                f"{model_id}: saved final pairing points outside component pool."
+                f"{model_id}: saved aggregate pairing exceeds the available "
+                "monthly HICP draw pool."
             )
-        keep = np.arange(n_agg, dtype=int)
+
         baseline_component = base_all[final_pair]
         scenario_component = scen_all[final_pair]
+
         audit = _max_abs_difference(
             baseline_component,
             stored_components[:, :, component_col],
         )
         if audit > AGGREGATE_REPLAY_TOLERANCE:
             raise ConditionalScenarioError(
-                f"{model_id}: mapped baseline HICP component does not reproduce "
-                f"the saved aggregate component (max error={audit:.3e})."
+                f"{model_id}: mapped monthly baseline does not reproduce the "
+                f"saved aggregate component (max error={audit:.3e})."
             )
+
+        # Persisted baseline validity is a hard production contract. Do not
+        # silently turn a latent baseline defect into scenario admissibility.
+        if (
+            np.any(~np.isfinite(baseline_component))
+            or np.any(baseline_component <= 0)
+        ):
+            raise ConditionalScenarioError(
+                f"{model_id}: mapped persisted baseline HICP component contains "
+                "non-finite or non-positive values; refusing scenario filtering."
+            )
+
+        # NONFINITE has a different causal meaning from a finite non-positive
+        # economic path. Preserve it as a hard diagnostic failure.
+        if np.any(~np.isfinite(scenario_component)):
+            raise ConditionalScenarioError(
+                f"{model_id}: mapped conditional HICP component contains "
+                "non-finite values; refusing admissibility filtering."
+            )
+
+        # Apply the existing complete-draw admissibility helper only AFTER the
+        # monthly posterior rows have been mapped into saved aggregate-row space.
+        # This preserves the saved cross-model pairing and rejects no individual
+        # cell. Since baseline validity was asserted above, any rejection here is
+        # caused by a finite non-positive scenario HICP path.
+        filtered = filter_positive_price_draws(
+            baseline_component,
+            scenario_component,
+            max_rejection_rate=None,
+            label=f"{model_id}-conditional-aggregate-hicp",
+        )
+        keep = np.asarray(filtered["draw_indices"], dtype=int)
+        valid_mask = np.asarray(filtered["valid_mask"], dtype=bool)
+        diagnostics = dict(filtered.get("diagnostics", {}))
+        diagnostics.update(
+            {
+                "model_id": str(model_id),
+                "scope": "mapped_aggregate_component_hicp",
+                "aggregate_draws_before_filter": int(n_agg),
+                "aggregate_draws_after_filter": int(len(keep)),
+                "rejected_aggregate_rows_0based": [
+                    int(x)
+                    for x in np.flatnonzero(~valid_mask).tolist()
+                ],
+                "baseline_validity_policy": (
+                    "hard fail if mapped persisted baseline is non-finite "
+                    "or non-positive"
+                ),
+                "scenario_nonfinite_policy": "hard fail before admissibility filter",
+                "scenario_nonpositive_policy": (
+                    "reject complete mapped aggregate row from both baseline "
+                    "and scenario comparison"
+                ),
+                "distribution_interpretation": (
+                    "posterior predictive conditional on the mapped conditional "
+                    "HICP component path being finite and strictly positive; "
+                    "persisted baseline HICP validity remains a hard contract"
+                ),
+            }
+        )
+
         return {
             "keep": keep,
             "affected_component": affected,
-            "baseline_component": stored_components[:, :, component_col],
-            "scenario_component": scenario_component,
+            "baseline_component": stored_components[
+                keep, :, component_col
+            ],
+            "scenario_component": np.asarray(
+                filtered["scenario_paths"],
+                dtype=float,
+            ),
             "component_replay_max_abs_error": audit,
+            "filter_diagnostics": diagnostics,
         }
 
     short = WEEKLY_MODEL_IDS[model_id]
@@ -1398,31 +1616,31 @@ def _normalise_joint_conditional_specs(
             raise ConditionalScenarioError(
                 f"{model_id}: scenario aggregate {spec_aggregate} != selected aggregate {aggregate_run_id}."
             )
+
         condition_variable = str(spec.get("condition_variable") or "")
         path_mode = str(spec.get("path_mode") or "")
         if not condition_variable or not path_mode:
             raise ConditionalScenarioError(
                 f"{model_id}: joint conditional recipe is incomplete."
             )
-        try:
-            path_value = float(spec.get("path_value"))
-        except (TypeError, ValueError) as exc:
-            raise ConditionalScenarioError(
-                f"{model_id}: joint conditional path_value is invalid."
-            ) from exc
-        if not np.isfinite(path_value):
-            raise ConditionalScenarioError(
-                f"{model_id}: joint conditional path_value is non-finite."
-            )
-        out[model_id] = {
+
+        path_fields = conditional_path_signature_fields(
+            path_value=spec.get("path_value"),
+            path_values=spec.get("path_values"),
+        )
+        normalised = {
             **spec,
             "model_id": model_id,
             "vintage": str(vintage),
             "aggregate_run_id": str(aggregate_run_id),
             "condition_variable": condition_variable,
             "path_mode": path_mode,
-            "path_value": path_value,
         }
+        normalised.pop("path_value", None)
+        normalised.pop("path_values", None)
+        normalised.pop("path_signature_version", None)
+        normalised.update(path_fields)
+        out[model_id] = normalised
     return out
 
 
@@ -1455,23 +1673,88 @@ def _joint_pair_hicp_for_model(*, aggregate_metadata: Mapping[str, Any], aggrega
     target = str(panel.target)
     pairing_audit: dict[str, Any] = {}
     condition_meta: dict[str, Any] = {}
+
     if conditional_spec:
         condition_variable = str(conditional_spec['condition_variable'])
         if condition_variable == target:
-            raise ConditionalScenarioError(f'{model_id}: the joint scenario cannot condition the model target itself.')
-        condition_path, last_condition, last_condition_date = _build_condition_path(result, saved_forecast, variable=condition_variable, path_mode=str(conditional_spec['path_mode']), path_value=float(conditional_spec['path_value']), condition_start=int(conditional_spec.get('condition_start') or 1), condition_end=conditional_spec.get('condition_end'))
+            raise ConditionalScenarioError(
+                f'{model_id}: the joint scenario cannot condition the model target itself.'
+            )
+        path_fields = conditional_path_signature_fields(
+            path_value=conditional_spec.get('path_value'),
+            path_values=conditional_spec.get('path_values'),
+        )
+        condition_path, last_condition, last_condition_date = _build_condition_path(
+            result,
+            saved_forecast,
+            variable=condition_variable,
+            path_mode=str(conditional_spec['path_mode']),
+            path_value=path_fields.get('path_value'),
+            path_values=path_fields.get('path_values'),
+            condition_start=int(conditional_spec.get('condition_start') or 1),
+            condition_end=conditional_spec.get('condition_end'),
+        )
         forecast_seed = int(getattr(model_spec(model_id), 'forecast_seed', 123))
-        baseline, scenario, pairing_audit = _paired_forecasts(result, saved_forecast, condition_variable=condition_variable, condition_path=condition_path, forecast_seed=forecast_seed)
-        condition_meta = {'condition_variable': condition_variable, 'path_mode': str(conditional_spec['path_mode']), 'path_value': float(conditional_spec['path_value']), 'last_condition_observed': float(last_condition), 'last_condition_observed_date': pd.Timestamp(last_condition_date).isoformat(), 'scenario_start': pd.Timestamp(pd.DatetimeIndex(baseline['future_dates'])[0]).isoformat(), 'scenario_end': pd.Timestamp(pd.DatetimeIndex(baseline['future_dates'])[-1]).isoformat()}
+        baseline, scenario, pairing_audit = _paired_forecasts(
+            result,
+            saved_forecast,
+            condition_variable=condition_variable,
+            condition_path=condition_path,
+            forecast_seed=forecast_seed,
+        )
+        condition_meta = {
+            'condition_variable': condition_variable,
+            'path_mode': str(conditional_spec['path_mode']),
+            **path_fields,
+            'last_condition_observed': float(last_condition),
+            'last_condition_observed_date': pd.Timestamp(last_condition_date).isoformat(),
+            'scenario_start': pd.Timestamp(pd.DatetimeIndex(baseline['future_dates'])[0]).isoformat(),
+            'scenario_end': pd.Timestamp(pd.DatetimeIndex(baseline['future_dates'])[-1]).isoformat(),
+        }
     else:
         baseline = saved_forecast
         scenario = saved_forecast
+
     if model_id in WEEKLY_MODEL_IDS:
-        pair_hicp = _weekly_pair_hicp(baseline, scenario, model_id=model_id, processed_dir=processed_dir, indices=indices, tax_scenario=tax_scenario)
+        pair_hicp = _weekly_pair_hicp(
+            baseline,
+            scenario,
+            model_id=model_id,
+            processed_dir=processed_dir,
+            indices=indices,
+            tax_scenario=tax_scenario,
+        )
     else:
-        pair_hicp = _monthly_pair_hicp(baseline, scenario, result=result, model_id=model_id, processed_dir=processed_dir, tax_scenario=tax_scenario)
-    mapped = _conditioned_component_for_aggregate(model_id=model_id, pair_hicp=pair_hicp, aggregate_metadata=aggregate_metadata, aggregate_arrays=aggregate_arrays, aggregate_dates=aggregate_dates, component_names=component_names, processed_dir=processed_dir, model_history=model_history, indices=indices, weights=weights)
-    return {'model_id': model_id, 'result_info': result_info, 'pair_hicp': pair_hicp, 'mapped': mapped, 'condition_meta': condition_meta, 'pairing_audit': pairing_audit, 'tax_scenario_active': bool(tax_scenario)}
+        pair_hicp = _monthly_pair_hicp(
+            baseline,
+            scenario,
+            result=result,
+            model_id=model_id,
+            processed_dir=processed_dir,
+            tax_scenario=tax_scenario,
+        )
+
+    mapped = _conditioned_component_for_aggregate(
+        model_id=model_id,
+        pair_hicp=pair_hicp,
+        aggregate_metadata=aggregate_metadata,
+        aggregate_arrays=aggregate_arrays,
+        aggregate_dates=aggregate_dates,
+        component_names=component_names,
+        processed_dir=processed_dir,
+        model_history=model_history,
+        indices=indices,
+        weights=weights,
+    )
+    return {
+        'model_id': model_id,
+        'result_info': result_info,
+        'pair_hicp': pair_hicp,
+        'mapped': mapped,
+        'condition_meta': condition_meta,
+        'pairing_audit': pairing_audit,
+        'tax_scenario_active': bool(tax_scenario),
+    }
 
 
 def _joint_car_fuels_for_aggregate(
@@ -1782,7 +2065,10 @@ def compute_joint_energy_scenario(aggregate_directory: str | Path, *, project_ro
     max_additivity = float(np.max(np.abs(additivity[finite]))) if finite.any() else 0.0
     if max_additivity > 1e-10:
         raise ConditionalScenarioError(f'Joint Energy scenario contributions are not additive to numerical precision (max error={max_additivity:.3e}).')
-    conditional_signature = [{'model_id': model_id, 'condition_variable': spec['condition_variable'], 'path_mode': spec['path_mode'], 'path_value': float(spec['path_value']), 'condition_start': int(spec.get('condition_start') or 1), 'condition_end': None if spec.get('condition_end') is None else int(spec.get('condition_end')), 'condition_mask_hash': spec.get('condition_mask_hash')} for model_id, spec in sorted(conditional_by_model.items())]
+    conditional_signature = [
+        _conditional_signature_item(model_id, spec)
+        for model_id, spec in sorted(conditional_by_model.items())
+    ]
     tax_signature = []
     scenario_starts: dict[str, str] = {}
     for model_id, scenario in sorted(tax_by_model.items()):
@@ -1810,7 +2096,7 @@ def compute_joint_energy_scenario(aggregate_directory: str | Path, *, project_ro
         raise ConditionalScenarioError('Joint scenario contribution array is incompatible with component names.')
     contribution_impact = scenario_contributions - baseline_contributions
     contribution_payload = {str(name): _fan_rows(contribution_impact[:, :, j], aggregate_dates) for j, name in enumerate(contribution_names)}
-    return {'ok': True, 'contract_version': JOINT_ENERGY_SCENARIO_CONTRACT_VERSION, 'meta': {'vintage': vintage, 'aggregate_run_id': aggregate_run_id, 'forecast_name': forecast_name, 'scenario_count': int(len(conditional_signature) + len(tax_signature)), 'conditional_count': int(len(conditional_signature)), 'tax_count': int(len(tax_signature)), 'active_models': active_models, 'affected_components': affected_components, 'aggregate_forecast_origin': pd.Timestamp(aggregate_forecast_origin).isoformat(), 'n_aggregate_draws_original': int(stored_component_paths.shape[0]), 'n_aggregate_draws_paired': int(len(common_keep)), 'baseline_level_replay_max_abs_error': float(baseline_level_replay), 'baseline_yoy_replay_max_abs_error': float(baseline_yoy_replay), 'maximum_drawwise_contribution_additivity_error': float(max_additivity), 'conditional_signature': conditional_signature, 'tax_signature': tax_signature, 'scenario_starts': scenario_starts, 'joint_effect_interpretation': 'all active Energy scenarios are applied to component HICP paths first and HICP Energy is then aggregated once draw by draw', 'marginal_effects_summed': False}, 'headline_bridge': headline_bridge, 'aggregate_history_yoy': _history_rows(aggregate_history_yoy), 'aggregate_baseline_level': _fan_rows(baseline_energy['level_paths'], aggregate_dates), 'aggregate_scenario_level': _fan_rows(scenario_energy['level_paths'], aggregate_dates), 'aggregate_baseline_yoy': _fan_rows(baseline_yoy['yoy_paths'], aggregate_dates), 'aggregate_scenario_yoy': _fan_rows(scenario_yoy['yoy_paths'], aggregate_dates), 'aggregate_impact_yoy': _fan_rows(aggregate_impact_yoy, aggregate_dates), 'aggregate_contribution_impact_yoy': contribution_payload}
+    return {'ok': True, 'contract_version': JOINT_ENERGY_SCENARIO_CONTRACT_VERSION, 'meta': {'vintage': vintage, 'aggregate_run_id': aggregate_run_id, 'forecast_name': forecast_name, 'scenario_count': int(len(conditional_signature) + len(tax_signature)), 'conditional_count': int(len(conditional_signature)), 'tax_count': int(len(tax_signature)), 'active_models': active_models, 'affected_components': affected_components, 'aggregate_forecast_origin': pd.Timestamp(aggregate_forecast_origin).isoformat(), 'n_aggregate_draws_original': int(stored_component_paths.shape[0]), 'n_aggregate_draws_paired': int(len(common_keep)), 'component_price_admissibility': {str(mapping['affected_component']): dict(mapping.get('filter_diagnostics', {})) for mapping in mappings if mapping.get('filter_diagnostics')}, 'baseline_level_replay_max_abs_error': float(baseline_level_replay), 'baseline_yoy_replay_max_abs_error': float(baseline_yoy_replay), 'maximum_drawwise_contribution_additivity_error': float(max_additivity), 'conditional_signature': conditional_signature, 'tax_signature': tax_signature, 'scenario_starts': scenario_starts, 'joint_effect_interpretation': 'all active Energy scenarios are applied to component HICP paths first and HICP Energy is then aggregated once draw by draw', 'marginal_effects_summed': False}, 'headline_bridge': headline_bridge, 'aggregate_history_yoy': _history_rows(aggregate_history_yoy), 'aggregate_baseline_level': _fan_rows(baseline_energy['level_paths'], aggregate_dates), 'aggregate_scenario_level': _fan_rows(scenario_energy['level_paths'], aggregate_dates), 'aggregate_baseline_yoy': _fan_rows(baseline_yoy['yoy_paths'], aggregate_dates), 'aggregate_scenario_yoy': _fan_rows(scenario_yoy['yoy_paths'], aggregate_dates), 'aggregate_impact_yoy': _fan_rows(aggregate_impact_yoy, aggregate_dates), 'aggregate_contribution_impact_yoy': contribution_payload}
 
 
 
@@ -1888,7 +2174,7 @@ def joint_energy_contribution_impact_figure(
         height=430,
     )
 
-def compute_conditional_scenario(aggregate_directory: str | Path, *, project_root: str | Path, model_id: str, condition_variable: str, path_mode: str='percent', path_value: float=10.0, condition_start: int=1, condition_end: int | None=None) -> dict[str, Any]:
+def compute_conditional_scenario(aggregate_directory: str | Path, *, project_root: str | Path, model_id: str, condition_variable: str, path_mode: str='percent', path_value: float | None=10.0, path_values: Sequence[float] | None=None, condition_start: int=1, condition_end: int | None=None) -> dict[str, Any]:
     """Compute one exact paired conditional path and its HICP Energy effect."""
     aggregate_directory = Path(aggregate_directory)
     aggregate_meta = _aggregate_metadata(aggregate_directory)
@@ -1906,7 +2192,9 @@ def compute_conditional_scenario(aggregate_directory: str | Path, *, project_roo
     target = str(panel.target)
     if condition_variable == target:
         raise ConditionalScenarioError('V1 only conditions non-target observable/upstream variables. Conditioning the consumer-price target itself is intentionally hidden.')
-    condition_path, last_condition, last_condition_date = _build_condition_path(result, saved_forecast, variable=condition_variable, path_mode=path_mode, path_value=path_value, condition_start=condition_start, condition_end=condition_end)
+    condition_path, last_condition, last_condition_date = _build_condition_path(result, saved_forecast, variable=condition_variable, path_mode=path_mode, path_value=path_value, path_values=path_values, condition_start=condition_start, condition_end=condition_end)
+
+    path_signature_fields = conditional_path_signature_fields(path_value=path_value, path_values=path_values)
     forecast_seed = int(getattr(model_spec(model_id), 'forecast_seed', 123))
     baseline, conditional, pairing_audit = _paired_forecasts(result, saved_forecast, condition_variable=condition_variable, condition_path=condition_path, forecast_seed=forecast_seed)
     processed_dir = Path(project_root) / 'data' / 'processed' / str(result_info['vintage'])
@@ -1990,12 +2278,12 @@ def compute_conditional_scenario(aggregate_directory: str | Path, *, project_roo
     condition_mask_hash = __import__('hashlib').sha256(condition_mask.astype(np.uint8).tobytes()).hexdigest()
     period_prefix = 'W' if str(baseline['frequency']).lower() == 'weekly' else 'M'
     condition_target_level = float(condition_path[condition_end_index])
-    condition_description = f'{float(path_value):+.2f}% vs last observed' if str(path_mode).lower() == 'percent' else f"{condition_target_level:.6g} {units.get(condition_variable, '')}".strip()
+    condition_description = _conditional_path_description(path_mode=path_mode, path_fields=path_signature_fields, condition_target_level=condition_target_level, unit=str(units.get(condition_variable, '')))
     condition_description = f'{condition_description} · {period_prefix}+{condition_start_index + 1}→{period_prefix}+{condition_end_index + 1}'
     aggregate_run_id = str(aggregate_meta.get('aggregate_run_id') or aggregate_directory.name)
     forecast_name = str(aggregate_meta.get('forecast_name') or saved_forecast.get('forecast_name') or 'unconditional')
-    headline_bridge = energy_level_paths_headline_bridge(dates=aggregate_dates, baseline_level_paths=np.asarray(baseline_energy['level_paths'], dtype=float), scenario_level_paths=np.asarray(scenario_energy['level_paths'], dtype=float), vintage=str(result_info['vintage']), aggregate_run_id=aggregate_run_id, forecast_name=forecast_name, scenario_active=True, lineage={'source_kind': 'conditional_observable', 'source_label': f"Conditional · {getattr(panel.spec, 'label', model_id)} · {condition_variable.replace('_', ' ')} {condition_description}", 'scenario_signature': {'model_id': str(model_id), 'condition_variable': str(condition_variable), 'path_mode': str(path_mode), 'path_value': float(path_value), 'condition_start': condition_start_index + 1, 'condition_end': condition_end_index + 1, 'condition_mask_hash': condition_mask_hash}, 'scenario_components': [str(model_id)], 'scenario_starts': {str(getattr(panel.spec, 'label', model_id)): condition_start_date.isoformat()}, 'model_id': str(model_id), 'model_label': str(getattr(panel.spec, 'label', model_id)), 'condition_variable': str(condition_variable), 'condition_description': condition_description})
-    return {'ok': True, 'contract_version': CONDITIONAL_CONTRACT_VERSION, 'meta': {'aggregate_run_id': aggregate_run_id, 'vintage': str(result_info['vintage']), 'forecast_name': forecast_name, 'model_id': str(model_id), 'model_label': str(getattr(panel.spec, 'label', model_id)), 'run_id': str(result_info['run_id']), 'frequency': str(baseline['frequency']), 'target': target, 'target_unit': str(units.get(target, '')), 'condition_variable': str(condition_variable), 'condition_unit': str(units.get(condition_variable, '')), 'path_mode': str(path_mode), 'path_value': float(path_value), 'condition_level': condition_target_level, 'condition_description': condition_description, 'last_condition_observed': last_condition, 'last_condition_observed_date': last_condition_date.isoformat(), 'scenario_start': condition_start_date.isoformat(), 'scenario_end': condition_end_date.isoformat(), 'aggregate_forecast_origin': pd.Timestamp(aggregate_forecast_origin).isoformat(), 'affected_hicp_component': affected, 'n_forecast_draws': int(len(baseline['draw_indices'])), 'n_aggregate_draws_original': int(np.asarray(arrays['component_index_paths']).shape[0]), 'n_aggregate_draws_paired': int(len(keep)), 'forecast_seed': forecast_seed, 'outlier_support_source': str(result_info['outlier_support_source']), 'baseline_replay_max_abs_error': float(pairing_audit['baseline_replay_max_abs_error']), 'condition_exact_max_abs_error': float(pairing_audit['condition_exact_max_abs_error']), 'future_sv_pairing_max_abs_error': float(pairing_audit['future_sv_pairing_max_abs_error']), 'future_outlier_pairing_max_abs_error': float(pairing_audit['future_outlier_pairing_max_abs_error']), 'component_replay_max_abs_error': float(mapped['component_replay_max_abs_error']), 'aggregate_level_replay_max_abs_error': float(aggregate_level_replay_error), 'aggregate_yoy_replay_max_abs_error': float(aggregate_yoy_replay_error), 'maximum_drawwise_contribution_additivity_error': float(max_additivity), 'weekly_joint_filter': dict(pair_hicp.get('filter_diagnostics', {})), 'target_terminal_impact': target_terminal, 'component_terminal_yoy_impact': component_terminal, 'aggregate_terminal_yoy_impact': aggregate_terminal, 'condition_start': condition_start_index + 1, 'condition_end': condition_end_index + 1, 'condition_mask_hash': condition_mask_hash, 'condition_periods': condition_end_index - condition_start_index + 1}, 'headline_bridge': headline_bridge, 'condition_history': _history_rows(condition_history), 'condition_baseline_nowcast': condition_baseline_nowcast, 'condition_scenario_nowcast': condition_scenario_nowcast, 'condition_baseline': _fan_rows(baseline_condition, future_dates), 'condition_path': [{'date': pd.Timestamp(date).isoformat(), 'value': float(value)} for date, value in zip(future_dates, condition_path) if np.isfinite(value)], 'target_history': _history_rows(target_history), 'target_baseline_nowcast': target_baseline_nowcast, 'target_scenario_nowcast': target_scenario_nowcast, 'target_baseline': _fan_rows(baseline_target, future_dates), 'target_scenario': _fan_rows(scenario_target, future_dates), 'target_impact': _fan_rows(target_impact, future_dates), 'component_history_yoy': _history_rows(component_history_yoy), 'component_baseline_yoy': _fan_rows(base_component_yoy, aggregate_dates), 'component_scenario_yoy': _fan_rows(scen_component_yoy, aggregate_dates), 'component_impact_yoy': _fan_rows(component_impact_yoy, aggregate_dates), 'aggregate_history_yoy': _history_rows(aggregate_history_yoy), 'aggregate_baseline_level': _fan_rows(baseline_energy['level_paths'], aggregate_dates), 'aggregate_scenario_level': _fan_rows(scenario_energy['level_paths'], aggregate_dates), 'aggregate_baseline_yoy': _fan_rows(baseline_energy_yoy['yoy_paths'], aggregate_dates), 'aggregate_scenario_yoy': _fan_rows(scenario_energy_yoy['yoy_paths'], aggregate_dates), 'aggregate_impact_yoy': _fan_rows(aggregate_impact_yoy, aggregate_dates)}
+    headline_bridge = energy_level_paths_headline_bridge(dates=aggregate_dates, baseline_level_paths=np.asarray(baseline_energy['level_paths'], dtype=float), scenario_level_paths=np.asarray(scenario_energy['level_paths'], dtype=float), vintage=str(result_info['vintage']), aggregate_run_id=aggregate_run_id, forecast_name=forecast_name, scenario_active=True, lineage={'source_kind': 'conditional_observable', 'source_label': f"Conditional · {getattr(panel.spec, 'label', model_id)} · {condition_variable.replace('_', ' ')} {condition_description}", 'scenario_signature': {'model_id': str(model_id), 'condition_variable': str(condition_variable), 'path_mode': str(path_mode), **path_signature_fields, 'condition_start': condition_start_index + 1, 'condition_end': condition_end_index + 1, 'condition_mask_hash': condition_mask_hash}, 'scenario_components': [str(model_id)], 'scenario_starts': {str(getattr(panel.spec, 'label', model_id)): condition_start_date.isoformat()}, 'model_id': str(model_id), 'model_label': str(getattr(panel.spec, 'label', model_id)), 'condition_variable': str(condition_variable), 'condition_description': condition_description})
+    return {'ok': True, 'contract_version': CONDITIONAL_CONTRACT_VERSION, 'meta': {'aggregate_run_id': aggregate_run_id, 'vintage': str(result_info['vintage']), 'forecast_name': forecast_name, 'model_id': str(model_id), 'model_label': str(getattr(panel.spec, 'label', model_id)), 'run_id': str(result_info['run_id']), 'frequency': str(baseline['frequency']), 'target': target, 'target_unit': str(units.get(target, '')), 'condition_variable': str(condition_variable), 'condition_unit': str(units.get(condition_variable, '')), 'path_mode': str(path_mode), **path_signature_fields, 'condition_level': condition_target_level, 'condition_description': condition_description, 'last_condition_observed': last_condition, 'last_condition_observed_date': last_condition_date.isoformat(), 'scenario_start': condition_start_date.isoformat(), 'scenario_end': condition_end_date.isoformat(), 'aggregate_forecast_origin': pd.Timestamp(aggregate_forecast_origin).isoformat(), 'affected_hicp_component': affected, 'n_forecast_draws': int(len(baseline['draw_indices'])), 'n_aggregate_draws_original': int(np.asarray(arrays['component_index_paths']).shape[0]), 'n_aggregate_draws_paired': int(len(keep)), 'forecast_seed': forecast_seed, 'outlier_support_source': str(result_info['outlier_support_source']), 'baseline_replay_max_abs_error': float(pairing_audit['baseline_replay_max_abs_error']), 'condition_exact_max_abs_error': float(pairing_audit['condition_exact_max_abs_error']), 'future_sv_pairing_max_abs_error': float(pairing_audit['future_sv_pairing_max_abs_error']), 'future_outlier_pairing_max_abs_error': float(pairing_audit['future_outlier_pairing_max_abs_error']), 'component_replay_max_abs_error': float(mapped['component_replay_max_abs_error']), 'aggregate_level_replay_max_abs_error': float(aggregate_level_replay_error), 'aggregate_yoy_replay_max_abs_error': float(aggregate_yoy_replay_error), 'maximum_drawwise_contribution_additivity_error': float(max_additivity), 'weekly_joint_filter': dict(pair_hicp.get('filter_diagnostics', {})), 'component_price_admissibility': dict(mapped.get('filter_diagnostics', pair_hicp.get('filter_diagnostics', {}))), 'target_terminal_impact': target_terminal, 'component_terminal_yoy_impact': component_terminal, 'aggregate_terminal_yoy_impact': aggregate_terminal, 'condition_start': condition_start_index + 1, 'condition_end': condition_end_index + 1, 'condition_mask_hash': condition_mask_hash, 'condition_periods': condition_end_index - condition_start_index + 1}, 'headline_bridge': headline_bridge, 'condition_history': _history_rows(condition_history), 'condition_baseline_nowcast': condition_baseline_nowcast, 'condition_scenario_nowcast': condition_scenario_nowcast, 'condition_baseline': _fan_rows(baseline_condition, future_dates), 'condition_path': [{'date': pd.Timestamp(date).isoformat(), 'value': float(value)} for date, value in zip(future_dates, condition_path) if np.isfinite(value)], 'target_history': _history_rows(target_history), 'target_baseline_nowcast': target_baseline_nowcast, 'target_scenario_nowcast': target_scenario_nowcast, 'target_baseline': _fan_rows(baseline_target, future_dates), 'target_scenario': _fan_rows(scenario_target, future_dates), 'target_impact': _fan_rows(target_impact, future_dates), 'component_history_yoy': _history_rows(component_history_yoy), 'component_baseline_yoy': _fan_rows(base_component_yoy, aggregate_dates), 'component_scenario_yoy': _fan_rows(scen_component_yoy, aggregate_dates), 'component_impact_yoy': _fan_rows(component_impact_yoy, aggregate_dates), 'aggregate_history_yoy': _history_rows(aggregate_history_yoy), 'aggregate_baseline_level': _fan_rows(baseline_energy['level_paths'], aggregate_dates), 'aggregate_scenario_level': _fan_rows(scenario_energy['level_paths'], aggregate_dates), 'aggregate_baseline_yoy': _fan_rows(baseline_energy_yoy['yoy_paths'], aggregate_dates), 'aggregate_scenario_yoy': _fan_rows(scenario_energy_yoy['yoy_paths'], aggregate_dates), 'aggregate_impact_yoy': _fan_rows(aggregate_impact_yoy, aggregate_dates)}
 
 
 
@@ -2457,9 +2745,48 @@ def conditional_path_figure(
             color="#d4a24c", prefix="Unconditional nowcast",
             legendgroup="nowcast-base",
         )
+        # ENERGY_CONDITIONAL_SAFE_JOIN_V1_2
+        base_now_dates = base_now["date"]
+        base_now_values = base_now["q50"]
+        if not history.empty:
+            last_observed_date = pd.Timestamp(history["date"].iloc[-1])
+            first_model_date = pd.Timestamp(base_now["date"].iloc[0])
+            frequency = str(meta.get("frequency") or "").strip().lower()
+
+            if frequency == "weekly":
+                contiguous = (
+                    first_model_date - last_observed_date
+                    == pd.Timedelta(days=7)
+                )
+            else:
+                last_observed_month = (
+                    last_observed_date
+                    .to_period("M")
+                    .to_timestamp(how="start")
+                )
+                first_model_month = (
+                    first_model_date
+                    .to_period("M")
+                    .to_timestamp(how="start")
+                )
+                contiguous = (
+                    first_model_month
+                    == last_observed_month + pd.offsets.MonthBegin(1)
+                )
+
+            if contiguous:
+                base_now_dates = pd.DatetimeIndex(
+                    [last_observed_date, *list(base_now["date"])]
+                )
+                base_now_values = np.r_[
+                    float(history["value"].iloc[-1]),
+                    base_now["q50"].to_numpy(dtype=float),
+                ]
+
         fig.add_trace(
             go.Scatter(
-                x=base_now["date"], y=base_now["q50"],
+                x=base_now_dates,
+                y=base_now_values,
                 mode="lines+markers",
                 name="Unconditional nowcast median",
                 line={"color": "#a66b00", "width": 2.2},
@@ -2503,10 +2830,50 @@ def conditional_path_figure(
         legendgroup="baseline",
     )
     if not baseline.empty:
+        baseline_dates = baseline["date"]
+        baseline_values = baseline["q50"]
+
+        # If a real nowcast exists, it is the first model segment and owns
+        # the observed/model join. Never bridge directly across that nowcast.
+        if base_now.empty and not history.empty:
+            last_observed_date = pd.Timestamp(history["date"].iloc[-1])
+            first_model_date = pd.Timestamp(baseline["date"].iloc[0])
+            frequency = str(meta.get("frequency") or "").strip().lower()
+
+            if frequency == "weekly":
+                contiguous = (
+                    first_model_date - last_observed_date
+                    == pd.Timedelta(days=7)
+                )
+            else:
+                last_observed_month = (
+                    last_observed_date
+                    .to_period("M")
+                    .to_timestamp(how="start")
+                )
+                first_model_month = (
+                    first_model_date
+                    .to_period("M")
+                    .to_timestamp(how="start")
+                )
+                contiguous = (
+                    first_model_month
+                    == last_observed_month + pd.offsets.MonthBegin(1)
+                )
+
+            if contiguous:
+                baseline_dates = pd.DatetimeIndex(
+                    [last_observed_date, *list(baseline["date"])]
+                )
+                baseline_values = np.r_[
+                    float(history["value"].iloc[-1]),
+                    baseline["q50"].to_numpy(dtype=float),
+                ]
+
         fig.add_trace(
             go.Scatter(
-                x=baseline["date"],
-                y=baseline["q50"],
+                x=baseline_dates,
+                y=baseline_values,
                 mode="lines",
                 name="Unconditional forecast median",
                 line={"color": _BASE, "width": 2},

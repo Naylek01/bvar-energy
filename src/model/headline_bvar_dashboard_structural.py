@@ -527,7 +527,7 @@ def relative_volatility_state_figure(
 ) -> go.Figure:
     snap = reference_volatility_snapshot(payload, reference_date)
     if not snap.get("ok") or not snap.get("cards"):
-        return _empty_figure("No joint SV state is available.", height=250)
+        return _empty_figure("UNAVAILABLE · No joint SV state is available for this run.", height=170)
     cards = list(snap["cards"])
     labels = [card["label"] for card in cards]
     values = [float(card["relative_variance"]) for card in cards]
@@ -875,6 +875,30 @@ def _layout(
     return fig
 
 
+# STRUCTURAL_FINAL_HEADLINE_PRESENTATION_V1
+def _headline_structural_loading_figure(label: str, *, height: int):
+    fig = _empty_figure("", height=height)
+    fig.update_xaxes(visible=False, fixedrange=True)
+    fig.update_yaxes(visible=False, fixedrange=True)
+    fig.update_layout(
+        annotations=[{
+            "text": f"COMPUTING · {label}",
+            "xref": "paper", "yref": "paper",
+            "x": 0.5, "y": 0.57,
+            "showarrow": False,
+            "font": {"size": 12},
+        }],
+    )
+    for y, x1 in ((0.44, 0.82), (0.36, 0.68), (0.28, 0.76)):
+        fig.add_shape(
+            type="line",
+            xref="paper", yref="paper",
+            x0=0.18, x1=x1, y0=y, y1=y,
+            opacity=0.10,
+            line={"width": 10},
+        )
+    return fig
+
 def irf_figure(
     payload: Mapping[str, Any] | None,
     *,
@@ -884,7 +908,7 @@ def irf_figure(
     fan_mode: str = "68",
 ) -> go.Figure:
     if not payload:
-        return _empty_figure("Loading Headline structural analysis…", height=470)
+        return _headline_structural_loading_figure("Component IRF", height=470)
     if not payload.get("ok"):
         return _empty_figure(
             "Headline Structural failed: " + str(payload.get("error", "unknown error")),
@@ -911,7 +935,7 @@ def irf_figure(
         fig.add_trace(go.Scatter(
             x=part["horizon"], y=part["q05"], mode="lines",
             line={"width": 0}, fill="tonexty",
-            fillcolor="rgba(37,99,235,0.10)", name="90% interval",
+            fillcolor="rgba(37,99,235,0.10)", name="90% posterior structural interval",
             hoverinfo="skip",
         ))
     if fan_mode in {"68", "both"}:
@@ -922,7 +946,7 @@ def irf_figure(
         fig.add_trace(go.Scatter(
             x=part["horizon"], y=part["q16"], mode="lines",
             line={"width": 0}, fill="tonexty",
-            fillcolor="rgba(37,99,235,0.22)", name="68% interval",
+            fillcolor="rgba(37,99,235,0.22)", name="68% posterior structural interval",
             hoverinfo="skip",
         ))
     fig.add_trace(go.Scatter(
@@ -973,7 +997,7 @@ def fevd_figure(
     response: str | None,
 ) -> go.Figure:
     if not payload:
-        return _empty_figure("Loading Headline structural analysis…", height=420)
+        return _headline_structural_loading_figure("FEVD", height=420)
     if not payload.get("ok"):
         return _empty_figure(
             "Headline Structural failed: " + str(payload.get("error", "unknown error")),
@@ -988,17 +1012,15 @@ def fevd_figure(
         return _empty_figure("No FEVD summary is available.", height=420)
 
     # Display-only focus. The full FEVD remains in the table.
-    cross = part.loc[part["shock"] != response].copy()
+    cross = part.copy()
     if cross.empty:
-        return _empty_figure("No cross-shock FEVD shares are available.", height=420)
+        return _empty_figure('No FEVD shares are available.', height=420)
 
     labels = dict(payload.get("labels", {}) or {})
     variables = list(payload.get("variables") or [])
 
     fig = go.Figure()
     for j, shock in enumerate(variables):
-        if shock == response:
-            continue
         block = cross.loc[cross["shock"] == shock].sort_values("horizon")
         if block.empty:
             continue
@@ -1027,7 +1049,7 @@ def fevd_figure(
     response_label = labels.get(response, _label(response))
     result = _layout(
         fig,
-        y_title="Cross-shock forecast-error variance share",
+        y_title='Forecast-error variance share',
         height=420,
         uirevision=(
             f"{payload.get('run_id')}::headline-fevd-cross::{response}::"
@@ -1036,8 +1058,7 @@ def fevd_figure(
     )
     result.update_layout(
         title=(
-            f"Cross-shock FEVD — {response_label} · "
-            "own shock excluded from chart"
+            f"Forecast error variance decomposition — {response_label}"
         ),
         title_x=0.0,
         title_xanchor="left",
@@ -1126,7 +1147,7 @@ def historical_decomposition_figure(
     relayout_data: Mapping[str, Any] | None = None,
 ) -> go.Figure:
     if not payload:
-        return _empty_figure("Loading Headline structural analysis…", height=560)
+        return _headline_structural_loading_figure("Historical decomposition", height=560)
     if not payload.get("ok"):
         return _empty_figure(
             "Headline Structural failed: " + str(payload.get("error", "unknown error")),
@@ -1214,6 +1235,7 @@ def _stat_card(title: str, value_id: str, subtitle_id: str) -> html.Div:
 # HEADLINE_STRUCTURAL_LABELS_LOTA_V1
 # HEADLINE_STRUCTURAL_LAYOUT_LOTB_V1
 # HEADLINE_STRUCTURAL_FOLLOWUP_V1_2
+# HEADLINE_STRUCTURAL_SCIENTIFIC_READABILITY_S4B_V1_2
 def headline_structural_page() -> html.Div:
     """Energy-style Structural workspace for the Headline joint BVAR."""
     badge_style = {
@@ -1247,18 +1269,66 @@ def headline_structural_page() -> html.Div:
                     ),
                     html.Div(
                         [
-                            html.Span("Recursive / Cholesky", style=badge_style),
-                            html.Span(
-                                "Energy → Food → NEIG → Services",
-                                style=badge_style,
+                            html.Div(
+                                "IDENTIFICATION CONTRACT",
+                                style={
+                                    "fontSize": "10px",
+                                    "fontWeight": 800,
+                                    "letterSpacing": "0.08em",
+                                    "color": "#475569",
+                                    "marginBottom": "5px",
+                                },
                             ),
-                            html.Span("H ≤ 12m", style=badge_style),
+                            html.Div(
+                                [
+                                    html.Strong(
+                                        "Recursive / Cholesky",
+                                        style={"fontSize": "14px"},
+                                    ),
+                                    html.Span(
+                                        "Energy → Food → NEIG → Services",
+                                        style={
+                                            "fontSize": "13px",
+                                            "fontWeight": 700,
+                                            "color": "#1E3A8A",
+                                        },
+                                    ),
+                                    html.Span(
+                                        "H ≤ 12m",
+                                        style={
+                                            "fontSize": "12px",
+                                            "fontWeight": 700,
+                                            "color": "#475569",
+                                        },
+                                    ),
+                                ],
+                                style={
+                                    "display": "flex",
+                                    "gap": "10px",
+                                    "alignItems": "center",
+                                    "flexWrap": "wrap",
+                                },
+                            ),
+                            html.Div(
+                                "h=0 contemporaneous restrictions follow this ordering · "
+                                "IRF/FEVD use the regular SV state at the selected reference date "
+                                "with outlier multipliers excluded · HD uses the realised historical "
+                                "SV/outlier path.",
+                                style={
+                                    "fontSize": "11px",
+                                    "lineHeight": "1.45",
+                                    "color": "#64748B",
+                                    "marginTop": "5px",
+                                },
+                            ),
                         ],
                         style={
-                            "display": "flex",
-                            "gap": "8px",
-                            "flexWrap": "wrap",
-                            "justifyContent": "flex-end",
+                            "minWidth": "390px",
+                            "maxWidth": "560px",
+                            "padding": "10px 12px",
+                            "borderRadius": "10px",
+                            "border": "1px solid #CBD5E1",
+                            "background": "#F8FAFC",
                         },
                     ),
                 ],
@@ -1338,7 +1408,7 @@ def headline_structural_page() -> html.Div:
                                                 id="headline-structural-shock-size",
                                                 type="number",
                                                 min=1e-6,
-                                                step=0.1,
+                                                step="any",
                                                 value=DEFAULT_SHOCK_SIZE,
                                                 className="est-profile-name-input",
                                                 style={
@@ -1381,6 +1451,15 @@ def headline_structural_page() -> html.Div:
                         id="headline-structural-shock-interpretation",
                         className="selection-banner",
                         style={"marginTop": "12px", "marginBottom": "2px"},
+                    ),
+                    html.Div(
+                        id="headline-structural-sigma-context",
+                        className="panel-subtitle",
+                        style={
+                            "marginTop": "7px",
+                            "marginBottom": "2px",
+                            "fontWeight": 600,
+                        },
                     ),
                     html.Div(
                         [
@@ -1433,7 +1512,7 @@ def headline_structural_page() -> html.Div:
                             html.Div(
                                 [
                                     html.Div(
-                                        "Idle",
+                                        "Regular structural bundle",
                                         id="headline-structural-phase",
                                         className="estimation-phase",
                                     ),
@@ -1634,10 +1713,6 @@ def headline_structural_page() -> html.Div:
                                                 className="panel-title",
                                             ),
                                             html.P(
-                                                'Structural timing: the shock hits at the reference date; h=0 is the contemporaneous impact.',
-                                                className="panel-subtitle",
-                                            ),
-                                            html.P(
                                                 "A 1σ IRF uses the shocked equation's √λ at the computed reference date. "
                                                 "Level-impact IRFs are normalised in 100 × log points and are exactly invariant "
                                                 "to the selected SV date.",
@@ -1691,11 +1766,11 @@ def headline_structural_page() -> html.Div:
                                                         id="headline-structural-irf-metric",
                                                         options=[
                                                             {
-                                                                "label": "Cumulative level",
+                                                                "label": "Cumulative state response",
                                                                 "value": "cumulative",
                                                             },
                                                             {
-                                                                "label": "Period change",
+                                                                "label": "Period state response",
                                                                 "value": "change",
                                                             },
                                                         ],
@@ -1742,6 +1817,11 @@ def headline_structural_page() -> html.Div:
                                 className="panel-heading",
                             ),
                             readable_table("headline-structural-irf-table", IRF_COLUMNS, page_size=7),
+                            html.Div(
+                                id="headline-structural-irf-state",
+                                className="selection-banner",
+                                style={"marginBottom": "8px"},
+                            ),
                             dcc.Loading(
                                 dcc.Graph(
                                     id="headline-structural-irf",
@@ -1763,16 +1843,6 @@ def headline_structural_page() -> html.Div:
                                             html.H3(
                                                 "Headline Total response",
                                                 className="panel-title",
-                                            ),
-                                            html.P(
-                                                'Structural timing: the shock hits at the reference date; h=0 is the contemporaneous impact.',
-                                                className="panel-subtitle",
-                                            ),
-                                            html.P(
-                                                "Exact nonlinear re-aggregation of the four component structural responses "
-                                                "through the production Headline chain-link engine. Response is always "
-                                                "Headline HICP Total; no aggregate FEVD or historical decomposition is constructed.",
-                                                className="panel-subtitle",
                                             ),
                                         ]
                                     ),
@@ -1809,7 +1879,7 @@ def headline_structural_page() -> html.Div:
                                             ),
                                             html.Div(
                                                 [
-                                                    html.Label("Posterior band", className="control-label"),
+                                                    html.Label("Posterior structural interval", className="control-label"),
                                                     dcc.RadioItems(
                                                         id="headline-total-structural-fan",
                                                         options=[
@@ -1841,7 +1911,7 @@ def headline_structural_page() -> html.Div:
                                 id="headline-total-structural-weights",
                                 className="panel-subtitle",
                             ),
-                            readable_table("headline-total-structural-table", [{'name': 'Horizon', 'id': 'horizon'}, {'name': 'Model horizon', 'id': 'model_h'}, {'name': 'Posterior mean', 'id': 'mean'}, {'name': '68% interval', 'id': 'interval68'}], page_size=13),
+                            readable_table("headline-total-structural-table", [{'name': 'Horizon', 'id': 'horizon'}, {'name': 'Model horizon', 'id': 'model_h'}, {'name': 'Posterior mean', 'id': 'mean'}, {'name': '68% posterior interval', 'id': 'interval68'}], page_size=13),
                             html.P(
                                 id="headline-total-structural-yoy-base-note",
                                 className="panel-subtitle",
@@ -1866,15 +1936,18 @@ def headline_structural_page() -> html.Div:
                                             className="panel-title",
                                         ),
                                         html.P(
-                                            "The table reports the full posterior-median FEVD. "
-                                            "The chart isolates cross-shock transmission and excludes "
-                                            "the response variable\'s own shock.",
+                                            'Posterior-median shares, shown as 100% stacked bars. The selected reference date changes FEVD through the joint relative structural-variance state; shares still depend on the full VAR dynamics and contemporaneous impact matrix.',
                                             className="panel-subtitle",
                                         ),
                                     ],
                                     className="panel-heading",
                                 ),
                                 readable_table("headline-structural-fevd-table", [{"name":"Shock","id":"shock"}], page_size=12),
+                                html.Div(
+                                    id="headline-structural-fevd-state",
+                                    className="selection-banner",
+                                    style={"marginBottom": "8px"},
+                                ),
                                 dcc.Loading(
                                     dcc.Graph(
                                         id="headline-structural-fevd",
@@ -1947,6 +2020,11 @@ def headline_structural_page() -> html.Div:
                         className="panel-heading",
                     ),
                     readable_table("headline-structural-hd-table", HD_COLUMNS, page_size=20),
+                    html.Div(
+                        id="headline-structural-hd-state",
+                        className="selection-banner",
+                        style={"marginBottom": "8px"},
+                    ),
                     dcc.Loading(
                         dcc.Graph(
                             id="headline-structural-hd",
@@ -1984,6 +2062,8 @@ def _selected_run_directory(
     )
 
 
+# HEADLINE_STRUCTURAL_STATE_TRUTH_S4A_V1
+# HEADLINE_STRUCTURAL_STARTUP_STATE_S4A2_V1
 def register_headline_structural_callbacks(
     app,
     *,
@@ -2083,12 +2163,22 @@ def register_headline_structural_callbacks(
         Output("headline-structural-reference-date", "value"),
         Input("headline-structural-reference-regime", "value"),
         Input(store_id, "data"),
+        Input("url", "pathname"),
         State("headline-structural-live-store", "data"),
         State("headline-structural-reference-date", "options"),
         State("headline-structural-reference-date", "value"),
         prevent_initial_call=False,
     )
-    def reference_regime(regime, store, structural_store, options, current):
+    def reference_regime(
+        regime,
+        store,
+        pathname,
+        structural_store,
+        options,
+        current,
+    ):
+        if (pathname or "") not in {"/structural/headline", "/headline/structural"}:
+            raise PreventUpdate
         values = [
             item.get("value")
             for item in (options or [])
@@ -2164,12 +2254,119 @@ def register_headline_structural_callbacks(
             ),
         )
 
+    # HEADLINE_STRUCTURAL_SCIENTIFIC_READABILITY_S4B_V1_2
+    @app.callback(
+        Output("headline-structural-sigma-context", "children"),
+        Input("headline-structural-live-store", "data"),
+        Input("headline-structural-phase", "children"),
+        Input("headline-structural-shock", "value"),
+        Input("headline-structural-reference-date", "value"),
+        Input("headline-structural-horizon", "value"),
+        Input("headline-structural-draws", "value"),
+        Input("headline-structural-shock-unit", "value"),
+        Input("headline-structural-shock-size", "value"),
+        Input("headline-structural-hd-options", "value"),
+    )
+    def structural_sigma_context(
+        structural_store,
+        phase,
+        shock,
+        reference_date,
+        horizon,
+        posterior_draws,
+        shock_unit,
+        shock_size,
+        hd_options,
+    ):
+        state, detail, current, _ = _headline_regular_bundle_state(
+            structural_store,
+            phase,
+            reference_date,
+            horizon,
+            posterior_draws,
+            shock_unit,
+            shock_size,
+            hd_options,
+        )
+        if not current:
+            return (
+                f"Reference structural σ · {state} · "
+                "the numerical σ context will update with the current regular "
+                "structural bundle."
+            )
+
+        snap = reference_volatility_snapshot(
+            structural_store,
+            reference_date,
+        )
+        cards = list(snap.get("cards") or [])
+        selected = next(
+            (
+                card
+                for card in cards
+                if str(card.get("variable")) == str(shock)
+            ),
+            None,
+        )
+        if not selected:
+            return (
+                "Reference structural σ · CURRENT · unavailable for the "
+                "selected shock."
+            )
+
+        label = str(selected.get("label") or _label(str(shock)))
+        ref = str(snap.get("reference_date") or "")[:7] or "—"
+        q16 = float(selected.get("persistent_q16", np.nan))
+        q50 = float(selected.get("persistent_q50", np.nan))
+        q84 = float(selected.get("persistent_q84", np.nan))
+        if not np.isfinite(q50):
+            return (
+                f"Reference structural σ · CURRENT · {label} · {ref} · "
+                "posterior median unavailable."
+            )
+
+        band = (
+            f" · posterior 68% [{q16:.3f}, {q84:.3f}]"
+            if np.isfinite(q16) and np.isfinite(q84)
+            else ""
+        )
+        unit = str(shock_unit or DEFAULT_SHOCK_UNIT)
+        try:
+            size = float(shock_size)
+        except (TypeError, ValueError, OverflowError):
+            size = float("nan")
+
+        if unit == "level":
+            request = (
+                f"Level-impact target {size:g} 100×log pts · "
+                if np.isfinite(size)
+                else "Level-impact target invalid · "
+            )
+            interpretation = (
+                "reference σ is descriptive context only; level-impact "
+                "normalisation is invariant to the selected SV date."
+            )
+        else:
+            request = (
+                f"Requested shock {size:g}σ · "
+                if np.isfinite(size)
+                else "Requested shock invalid · "
+            )
+            interpretation = (
+                "IRFs remain normalised draw-by-draw; this posterior-median σ "
+                "is context, not a deterministic replacement."
+            )
+
+        return (
+            f"{request}{label} posterior-median structural σ at {ref}: "
+            f"{q50:.3f} 100×log pts{band} · {interpretation}"
+        )
+
     @app.callback(
         output=Output("headline-structural-live-store", "data"),
         inputs=[
             Input("headline-structural-run", "n_clicks"),
-            Input("url", "pathname"),
-            Input(store_id, "data"),
+            Input("headline-structural-run-banner", "children"),
             Input("headline-structural-reference-date", "value"),
             Input("headline-structural-horizon", "value"),
             Input("headline-structural-draws", "value"),
@@ -2178,6 +2375,8 @@ def register_headline_structural_callbacks(
             Input("headline-structural-hd-options", "value"),
         ],
         state=[
+            State("url", "pathname"),
+            State(store_id, "data"),
             State("headline-structural-live-store", "data"),
         ],
         background=True,
@@ -2201,22 +2400,23 @@ def register_headline_structural_callbacks(
         ],
         progress_default=(
             0,
-            "Idle",
+            "Regular structural bundle",
             "Opening Headline Structural automatically computes the default analysis once; unchanged revisits are no-ops.",
         ),
-        prevent_initial_call=False,
+        prevent_initial_call=True,
     )
     def compute(
         set_progress,
         n_clicks,
-        pathname,
-        store,
+        _activation,
         reference_date,
         horizon,
         posterior_draws,
         shock_unit,
         shock_size,
         hd_options,
+        pathname,
+        store,
         current_live_store,
     ):
         if (pathname or "") not in {"/structural/headline", "/headline/structural"}:
@@ -2225,10 +2425,30 @@ def register_headline_structural_callbacks(
         context = dict((store or {}).get("context") or {})
         if str(context.get("model_id") or "") != "headline_joint":
             raise PreventUpdate
+        # STRUCTURAL_NUMERIC_SHOCK_S1B_V1_HEADLINE
         try:
-            size = float(shock_size or DEFAULT_SHOCK_SIZE)
-        except (TypeError, ValueError):
-            size = float(DEFAULT_SHOCK_SIZE)
+            if shock_size is None:
+                raise ValueError("shock magnitude is empty or invalid")
+            size = float(shock_size)
+            if not np.isfinite(size) or size <= 0.0:
+                raise ValueError(
+                    f"shock magnitude must be finite and strictly positive, got {shock_size!r}"
+                )
+        except (TypeError, ValueError, OverflowError) as exc:
+            set_progress(
+                (
+                    0,
+                    "INVALID SETTINGS",
+                    "Enter a finite positive number. No structural calculation was run.",
+                )
+            )
+            return {
+                "ok": False,
+                "status": "invalid_input",
+                "contract_version": HEADLINE_STRUCTURAL_CONTRACT_VERSION,
+                "dashboard_request_signature": None,
+                "error": f"Invalid structural shock magnitude: {exc}",
+            }
         request_signature = {
             "vintage": str(context.get("vintage") or ""),
             "run_id": str(context.get("run_id") or ""),
@@ -2255,14 +2475,14 @@ def register_headline_structural_callbacks(
             set_progress(
                 (
                     10,
-                    "Loading posterior",
+                    "COMPUTING · Loading posterior",
                     "Reading the persisted Headline posterior and verified lineage.",
                 )
             )
             set_progress(
                 (
                     30,
-                    "Recursive identification",
+                    "COMPUTING · Recursive identification",
                     "Computing regular structural impact matrices, IRFs, FEVD and 12m HD.",
                 )
             )
@@ -2280,7 +2500,7 @@ def register_headline_structural_callbacks(
             set_progress(
                 (
                     100,
-                    "Structural analysis ready",
+                    "CURRENT",
                     "The selected structural state is frozen until one of its parameters changes.",
                 )
             )
@@ -2300,6 +2520,72 @@ def register_headline_structural_callbacks(
             }
 
 
+    # HEADLINE_STRUCTURAL_STATE_TRUTH_S4A_V1
+    def _headline_regular_bundle_state(store, phase, reference_date, horizon, draws, shock_unit, shock_size, hd_options):
+        phase_text=str(phase or "").strip()
+        computing=phase_text.upper().startswith("COMPUTING") or phase_text in {"Loading posterior","Recursive identification","Regular structural bundle"}
+        try:
+            if shock_size is None: raise ValueError("shock magnitude is empty")
+            size=float(shock_size)
+            if not np.isfinite(size) or size<=0: raise ValueError("shock magnitude must be finite and positive")
+            h=int(horizon or DEFAULT_HORIZON); d=int(draws or DEFAULT_STRUCTURAL_DRAWS)
+            if not 1<=h<=MAX_HORIZON: raise ValueError(f"horizon must lie in [1, {MAX_HORIZON}]")
+            if not 1<=d<=MAX_STRUCTURAL_DRAWS: raise ValueError(f"posterior draws must lie in [1, {MAX_STRUCTURAL_DRAWS}]")
+            unit=str(shock_unit or DEFAULT_SHOCK_UNIT)
+            if unit not in {"structural_std","level"}: raise ValueError(f"unsupported shock unit {unit!r}")
+            req={
+                "reference_date":None if reference_date in (None,"") else pd.Timestamp(reference_date).isoformat(),
+                "horizon":h,"posterior_draws":d,"shock_unit":unit,"shock_size":size,
+                "split_outlier_amplification":"split_outliers" in set(hd_options or []),
+            }
+        except (TypeError,ValueError,OverflowError) as exc:
+            return "INVALID SETTINGS",str(exc),False,{}
+        if not isinstance(store,dict):
+            return ("COMPUTING","Regular structural bundle is computing.",False,req) if computing else ("NO CURRENT RESULT","No regular structural bundle has completed yet.",False,req)
+        if not store.get("ok"):
+            if str(store.get("status") or "")=="invalid_input":
+                return "INVALID SETTINGS",str(store.get("error") or "Invalid structural settings."),False,req
+            return ("COMPUTING","Regular structural bundle is computing.",False,req) if computing else ("NO CURRENT RESULT",str(store.get("error") or "No valid regular structural result is available."),False,req)
+        sig=dict(store.get("dashboard_request_signature") or {})
+        comparable=all(k in sig for k in req)
+        match=comparable and all(sig.get(k)==v for k,v in req.items())
+        if match: return "CURRENT","IRF / FEVD / HD / SV match the current computation settings.",True,req
+        if computing: return "COMPUTING","Recomputing the regular structural bundle for the current settings.",False,req
+        return "STALE",("Displayed regular structural bundle was computed with previous settings." if comparable else "Displayed structural result has no comparable request signature."),False,req
+
+    def _headline_state_banner(state, detail):
+        p={
+            "CURRENT":("#166534","#F0FDF4","#BBF7D0"),
+            "STALE":("#92400E","#FFFBEB","#FCD34D"),
+            "COMPUTING":("#1D4ED8","#EFF6FF","#BFDBFE"),
+            "INVALID SETTINGS":("#991B1B","#FEF2F2","#FECACA"),
+            "NO CURRENT RESULT":("#475569","#F8FAFC","#CBD5E1"),
+        }
+        c,b,bd=p.get(str(state),p["NO CURRENT RESULT"])
+        return html.Div([html.Strong(str(state)),html.Span(f" · {detail}" if detail else "")],
+            style={"padding":"8px 10px","borderRadius":"9px","border":f"1px solid {bd}","background":b,"color":c,"fontSize":"11px"})
+
+    @app.callback(
+        Output("headline-structural-irf-state","children"),
+        Output("headline-structural-fevd-state","children"),
+        Output("headline-structural-hd-state","children"),
+        Input("headline-structural-live-store","data"),
+        Input("headline-structural-phase","children"),
+        Input("headline-structural-reference-date","value"),
+        Input("headline-structural-horizon","value"),
+        Input("headline-structural-draws","value"),
+        Input("headline-structural-shock-unit","value"),
+        Input("headline-structural-shock-size","value"),
+        Input("headline-structural-hd-options","value"),
+    )
+    def regular_bundle_panel_states(store,phase,reference_date,horizon,draws,shock_unit,shock_size,hd_options):
+        state,detail,_,_=_headline_regular_bundle_state(store,phase,reference_date,horizon,draws,shock_unit,shock_size,hd_options)
+        return (
+            _headline_state_banner(state,f"Component IRF · {detail}"),
+            _headline_state_banner(state,f"FEVD · {detail}"),
+            _headline_state_banner(state,f"Historical decomposition · {detail}"),
+        )
+
     @app.callback(
         Output("headline-structural-volatility-cards", "children"),
         Output(
@@ -2313,6 +2599,23 @@ def register_headline_structural_callbacks(
         Input("headline-structural-shock-unit", "value"),
     )
     def volatility_state(structural_store, reference_date, shock_unit):
+        if not structural_store:
+            return (
+                [],
+                _empty_figure("COMPUTING · Waiting for the regular structural bundle.",height=250),
+                [],
+                _headline_state_banner("COMPUTING","Relative structural-variance state is produced by the regular structural bundle."),
+            )
+        if not structural_store.get("ok"):
+            error=str(structural_store.get("error") or "")
+            status="INVALID SETTINGS" if str(structural_store.get("status") or "")=="invalid_input" else "NO CURRENT RESULT"
+            return (
+                [],
+                _empty_figure(f"{status} · No computed joint SV state.",height=250),
+                [],
+                _headline_state_banner(status,error or "No valid regular structural bundle is available."),
+            )
+
         if not structural_store or not structural_store.get("ok"):
             return (
                 [],
@@ -2541,65 +2844,66 @@ def register_headline_structural_callbacks(
         )
 
     @app.callback(
-        Output("headline-structural-stat-identification", "children"),
-        Output("headline-structural-stat-ordering", "children"),
-        Output("headline-structural-stat-reference", "children"),
-        Output("headline-structural-stat-frequency", "children"),
-        Output("headline-structural-stat-draws", "children"),
-        Output("headline-structural-stat-draws-total", "children"),
-        Output("headline-structural-stat-hd-error", "children"),
-        Output("headline-structural-stat-hd-error-note", "children"),
-        Output("headline-structural-stat-fevd-error", "children"),
-        Output("headline-structural-stat-fevd-error-note", "children"),
-        Output("headline-structural-stat-shock-scale", "children"),
-        Output("headline-structural-stat-shock-scale-note", "children"),
-        Input("headline-structural-live-store", "data"),
+        Output("headline-structural-stat-identification","children"),
+        Output("headline-structural-stat-ordering","children"),
+        Output("headline-structural-stat-reference","children"),
+        Output("headline-structural-stat-frequency","children"),
+        Output("headline-structural-stat-draws","children"),
+        Output("headline-structural-stat-draws-total","children"),
+        Output("headline-structural-stat-hd-error","children"),
+        Output("headline-structural-stat-hd-error-note","children"),
+        Output("headline-structural-stat-fevd-error","children"),
+        Output("headline-structural-stat-fevd-error-note","children"),
+        Output("headline-structural-stat-shock-scale","children"),
+        Output("headline-structural-stat-shock-scale-note","children"),
+        Input("headline-structural-live-store","data"),
+        Input("headline-structural-phase","children"),
+        Input("headline-structural-reference-date","value"),
+        Input("headline-structural-horizon","value"),
+        Input("headline-structural-draws","value"),
+        Input("headline-structural-shock-unit","value"),
+        Input("headline-structural-shock-size","value"),
+        Input("headline-structural-hd-options","value"),
     )
-    def stats(structural_store):
-        if not structural_store or not structural_store.get("ok"):
+    def stats(store,phase,reference_date,horizon,requested_draws,requested_unit,requested_size,hd_options):
+        state,_,current,_=_headline_regular_bundle_state(store,phase,reference_date,horizon,requested_draws,requested_unit,requested_size,hd_options)
+        ordering=" → ".join(_label(x) for x in STATE_VARIABLES)
+        try: ref="—" if reference_date in (None,"") else pd.Timestamp(reference_date).strftime("%Y-%m")
+        except Exception: ref=str(reference_date)
+        try: dtext=f"{int(requested_draws or DEFAULT_STRUCTURAL_DRAWS):,}"
+        except Exception: dtext="INVALID SETTINGS"
+        try:
+            size=float(requested_size)
+            if not np.isfinite(size) or size<=0: raise ValueError
+            level=str(requested_unit or DEFAULT_SHOCK_UNIT)=="level"
+            scale=f"{size:g} × 100-log pts" if level else f"{size:g}σ"
+        except Exception: scale="INVALID SETTINGS"
+
+        if current and isinstance(store,dict):
+            diag=dict(store.get("diagnostics",{}) or {}); labels=dict(store.get("labels",{}) or {})
+            ordering=" → ".join(labels.get(x,_label(x)) for x in store.get("recursive_ordering",STATE_VARIABLES))
+            ref=pd.Timestamp(store["reference_date"]).strftime("%Y-%m")
+            hd=diag.get("hd_posterior_mean_12m_reconstruction_error"); fe=diag.get("fevd_max_share_sum_error")
+            level=str(store.get("shock_unit"))=="level"; sz=float(store.get("shock_size",1.0))
             return (
-                "—", "", "—", "", "—", "",
-                "—", "", "—", "", "—", "",
+                "Recursive","CURRENT · "+ordering,
+                ref,"CURRENT · Monthly",
+                f"{int(store.get('posterior_draws',0)):,}",f"CURRENT · of {int(store.get('available_posterior_draws',0)):,} saved draws",
+                "—" if hd is None else f"{float(hd):.3e}","CURRENT · posterior-mean 12m additive error" if hd is not None else "NO CURRENT RESULT · HD diagnostic missing",
+                "—" if fe is None else f"{float(fe):.3e}","CURRENT · max draw-wise |sum FEVD shares − 1|" if fe is not None else "NO CURRENT RESULT · FEVD diagnostic missing",
+                f"{sz:g} × 100-log pts" if level else f"{sz:g}σ",
+                "CURRENT · IRF impact-normalised; FEVD remains 1σ" if level else "CURRENT · IRF in structural standard deviations; FEVD remains 1σ",
             )
-        diag = dict(structural_store.get("diagnostics", {}) or {})
-        labels = dict(structural_store.get("labels", {}) or {})
-        ordering = " → ".join(
-            labels.get(name, _label(name))
-            for name in structural_store.get("recursive_ordering", [])
-        )
-        ref = pd.Timestamp(
-            structural_store["reference_date"]
-        ).strftime("%Y-%m")
-        hd_error = diag.get(
-            "hd_posterior_mean_12m_reconstruction_error"
-        )
-        fevd_error = diag.get("fevd_max_share_sum_error")
-        shock_size = float(structural_store.get("shock_size", 1.0))
-        level = str(structural_store.get("shock_unit")) == "level"
+
+        heavy="COMPUTING" if state=="COMPUTING" else state
+        note=f"{state} · requested settings"
         return (
-            "Recursive",
-            ordering,
-            ref,
-            "Monthly",
-            f"{int(structural_store.get('posterior_draws', 0)):,}",
-            (
-                f"of {int(structural_store.get('available_posterior_draws', 0)):,} "
-                "saved draws"
-            ),
-            "—" if hd_error is None else f"{float(hd_error):.3e}",
-            "posterior-mean 12m additive error",
-            "—" if fevd_error is None else f"{float(fevd_error):.3e}",
-            "max draw-wise |sum FEVD shares − 1|",
-            (
-                f"{shock_size:g} × 100-log pts"
-                if level
-                else f"{shock_size:g}σ"
-            ),
-            (
-                "IRF impact-normalised; FEVD remains 1σ"
-                if level
-                else "IRF in structural standard deviations; FEVD remains 1σ"
-            ),
+            "Recursive",note+" · "+ordering,
+            ref,note+" · Monthly reference",
+            dtext,note+" · requested posterior draws",
+            heavy,"available only after the regular structural bundle completes",
+            heavy,"available only after the regular structural bundle completes",
+            scale,note+" · requested IRF shock scale",
         )
 
     @app.callback(
@@ -2732,20 +3036,27 @@ def register_headline_structural_callbacks(
             )
 
         resolved_unit = str(shock_unit or "").strip().lower()
-        if resolved_unit != "structural_std":
+        # HEADLINE_TOTAL_LEVEL_SUPPORT_H4_V1
+        if resolved_unit not in {"structural_std", "level"}:
             reasons.append(
-                "Shock definition is unsupported; Headline Total v1 requires "
-                "Standard deviation (structural_std)."
+                "Shock definition is unsupported; Headline Total requires "
+                "Standard deviation (structural_std) or Level."
             )
 
+        # HEADLINE_TOTAL_ARBITRARY_SHOCK_SIZE_V1
         try:
             resolved_size = float(shock_size)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             resolved_size = None
-            reasons.append("Shock size must equal 1 structural standard deviation.")
-        if resolved_size is not None and resolved_size != 1.0:
             reasons.append(
-                f"Shock size {resolved_size:g} is unsupported; Headline Total v1 requires 1σ."
+                "Shock size must be a finite positive structural shock magnitude."
+            )
+        if resolved_size is not None and (
+            not np.isfinite(resolved_size) or resolved_size <= 0.0
+        ):
+            reasons.append(
+                f"Shock size {resolved_size!r} is unsupported; Headline Total requires "
+                "a finite positive structural shock magnitude."
             )
 
         if reference_date in (None, ""):
@@ -2809,23 +3120,45 @@ def register_headline_structural_callbacks(
         except (TypeError, ValueError):
             display_h = 12
         display_h = max(1, min(12, display_h))
-        if not total_store or not total_store.get("ok"):
-            return (
-                "Headline Total computation contract: H=12 stored once; "
-                f"displayed through H={display_h} · Recursive/Cholesky · "
-                "1 structural std · current endpoint · future innovations=0 · "
-                "future outliers=0."
+
+        ui = dict((total_store or {}).get("ui") or {})
+        resolved_unit = str(
+            ui.get("shock_unit")
+            or (total_store or {}).get("shock_unit")
+            or "structural_std"
+        ).strip().lower()
+
+        try:
+            resolved_size = float(
+                ui.get("shock_size")
+                if ui.get("shock_size") is not None
+                else (total_store or {}).get("shock_size")
             )
-        meta = dict(total_store.get("meta") or {})
-        stored_h = int(meta.get("horizon", 12))
+        except (TypeError, ValueError, OverflowError):
+            resolved_size = None
+
+        if resolved_unit == "level":
+            magnitude = (
+                "selected Level magnitude"
+                if resolved_size is None
+                else f"Level={resolved_size:g} in 100 × log points"
+            )
+            shock_text = (
+                f"{magnitude}, normalized on the shocked variable "
+                "(not on Headline Total)"
+            )
+        else:
+            shock_text = (
+                "selected finite positive structural-std magnitude"
+                if resolved_size is None
+                else f"{resolved_size:g} structural std"
+            )
+
         return (
-            "Headline Total computation contract: "
-            f"stored H={stored_h} · displayed H={display_h} · Recursive/Cholesky · "
-            f"{float(meta.get('shock_size', 1.0)):g} structural std · "
-            f"endpoint {str(meta.get('reference_date') or '—')[:7]} · "
-            f"{int(meta.get('n_draws', 0)):,} posterior draws · "
-            "future innovations=0 · future outliers=0. "
-            "The band reflects saved posterior-draw uncertainty only."
+            "Headline Total computation contract: H=12 stored once; "
+            f"displayed through H={display_h} · Recursive/Cholesky · "
+            f"{shock_text} · current endpoint · "
+            "future innovations=0 · future outliers=0."
         )
 
     def _headline_total_records(total_store, *, shock, metric, horizon):
@@ -2915,7 +3248,7 @@ def register_headline_structural_callbacks(
             fig.add_trace(go.Scatter(
                 x=horizons, y=q16, mode="lines", line={"width": 0},
                 fill="tonexty", fillcolor="rgba(0,159,227,0.16)",
-                name="68% posterior interval", hoverinfo="skip",
+                name="68% posterior structural interval", hoverinfo="skip",
             ))
         fig.add_trace(go.Scatter(
             x=horizons, y=mean, mode="lines+markers",
@@ -2977,27 +3310,30 @@ def register_headline_structural_callbacks(
         )
         return fig
 
+    # HEADLINE_TOTAL_SHOCK_REACTIVITY_H3A_V1
     @app.callback(
         Output("headline-total-structural-store", "data"),
         Input("headline-structural-run", "n_clicks"),
         Input("url", "pathname"),
         Input(store_id, "data"),
+        Input("headline-structural-shock-unit", "value"),
+        Input("headline-structural-shock-size", "value"),
         State("headline-structural-horizon", "value"),
         State("headline-structural-draws", "value"),
-        State("headline-structural-shock-unit", "value"),
-        State("headline-structural-shock-size", "value"),
         State("headline-structural-reference-date", "value"),
+        State("headline-total-structural-store", "data"),
         prevent_initial_call=False,
     )
     def headline_total_compute(
         n_clicks,
         pathname,
         store,
-        horizon,
-        posterior_draws,
         shock_unit,
         shock_size,
+        horizon,
+        posterior_draws,
         reference_date,
+        current_total_store,
     ):
         import time
 
@@ -3019,6 +3355,33 @@ def register_headline_structural_callbacks(
                     "contract": "headline-total-structural-irf-v1.1",
                     "reasons": list(ui["reasons"]), "ui": ui,
                 }
+            # HEADLINE_TOTAL_CURRENT_CACHE_H5_V1
+            compare_keys = (
+                "run_directory",
+                "posterior_draws",
+                "shock_unit",
+                "shock_size",
+                "reference_date",
+            )
+            stored_ui = (
+                dict(current_total_store.get("ui") or {})
+                if isinstance(current_total_store, dict)
+                else {}
+            )
+            if (
+                isinstance(current_total_store, dict)
+                and current_total_store.get("ok")
+                and all(stored_ui.get(key) == ui.get(key) for key in compare_keys)
+            ):
+                raise PreventUpdate
+
+
+            # HEADLINE_TOTAL_LEVEL_CONVERSION_PLACEMENT_H4_1_V1
+            engine_shock_size = (
+                float(ui["shock_size"]) / 100.0
+                if str(ui["shock_unit"]) == "level"
+                else float(ui["shock_size"])
+            )
 
             from headline_total_structural import run_saved_headline_total_structural_irf
 
@@ -3029,8 +3392,9 @@ def register_headline_structural_callbacks(
                 horizon=12,
                 identification="recursive",
                 reference_date=ui["reference_date"],
-                shock_unit="structural_std",
-                shock_size=1.0,
+                shock_unit=str(ui["shock_unit"]),
+                # HEADLINE_TOTAL_ARBITRARY_SHOCK_SIZE_V1
+                shock_size=engine_shock_size,
                 include_outlier_scale=False,
                 seed=42,
                 project_root=project_root,
@@ -3040,6 +3404,9 @@ def register_headline_structural_callbacks(
             payload["ui"] = ui
             payload["compute_seconds"] = float(time.perf_counter() - started)
             return payload
+        # HEADLINE_TOTAL_PREVENTUPDATE_H5_1_V1
+        except PreventUpdate:
+            raise
         except Exception as exc:
             return {
                 "ok": False, "status": "error",
@@ -3076,6 +3443,7 @@ def register_headline_structural_callbacks(
         Input("headline-structural-shock-unit", "value"),
         Input("headline-structural-shock-size", "value"),
         Input("headline-structural-reference-date", "value"),
+        Input("url", "pathname"),
     )
     def headline_total_render(
         total_store,
@@ -3088,12 +3456,27 @@ def register_headline_structural_callbacks(
         shock_unit,
         shock_size,
         reference_date,
+        pathname,
     ):
+        if (pathname or "") not in {"/structural/headline", "/headline/structural"}:
+            raise PreventUpdate
+
         try:
             display_h = int(horizon)
         except (TypeError, ValueError):
             display_h = 12
         display_h = max(1, min(12, display_h))
+
+        if not total_store:
+            return (
+                html.Div([
+                    html.Strong("COMPUTING · Headline Total auto-calculates on page open. "),
+                    html.Span("Open or refresh Structural analysis with the supported Headline Total parameters."),
+                ]),
+                _headline_total_effective_text(None, display_h), "", [],
+                _empty_figure("Headline Total response"),
+            )
+
 
         try:
             directory = _selected_run_directory(results_root, store)
@@ -3107,7 +3490,7 @@ def register_headline_structural_callbacks(
             )
         except Exception as exc:
             return (
-                html.Div([html.Strong("Headline Total unavailable: "), html.Span(str(exc))],
+                html.Div([html.Strong("NO CURRENT RESULT · Headline Total unavailable: "), html.Span(str(exc))],
                          className="estimation-error-text"),
                 _headline_total_effective_text(None, display_h), "", [],
                 _empty_figure("Headline Total response"),
@@ -3121,18 +3504,9 @@ def register_headline_structural_callbacks(
                     html.Span(reason),
                 ], className="estimation-error-text"),
                 _headline_total_effective_text(None, display_h), "", [],
-                _empty_figure("Headline Total response · unsupported parameters"),
+                _empty_figure("Headline Total response · INVALID SETTINGS"),
             )
 
-        if not total_store:
-            return (
-                html.Div([
-                    html.Strong("Headline Total not calculated. "),
-                    html.Span("Open or refresh Structural analysis with the supported Headline Total parameters."),
-                ]),
-                _headline_total_effective_text(None, display_h), "", [],
-                _empty_figure("Headline Total response"),
-            )
 
         if not total_store.get("ok"):
             status = str(total_store.get("status") or "error")
@@ -3157,7 +3531,7 @@ def register_headline_structural_callbacks(
         if stale:
             return (
                 html.Div([
-                    html.Strong("Headline Total result is stale. "),
+                    html.Strong("STALE · Headline Total result was computed with previous settings. "),
                     html.Span(
                         "The selected run, draws, shock definition, magnitude, or reference state "
                         "changed after calculation; refresh Structural analysis."
@@ -3165,12 +3539,12 @@ def register_headline_structural_callbacks(
                 ], className="estimation-error-text"),
                 _headline_total_effective_text(total_store, display_h),
                 _headline_total_weights_note(total_store), [],
-                _empty_figure("Headline Total response · stale"),
+                _empty_figure("Headline Total response · STALE"),
             )
 
         elapsed = float(total_store.get("compute_seconds", 0.0) or 0.0)
         status = html.Div([
-            html.Strong("Headline Total response ready"),
+            html.Strong("CURRENT · Headline Total response"),
             html.Span(
                 f" · exact nonlinear re-aggregation · {elapsed:.2f}s"
                 if elapsed > 0 else " · exact nonlinear re-aggregation"

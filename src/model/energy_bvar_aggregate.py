@@ -1489,16 +1489,8 @@ def _model_weight_table_for_chain(annual_weights: pd.DataFrame) -> pd.DataFrame:
     return model_weights[list(MODEL_AGGREGATE_COMPONENTS)]
 
 
-def aggregate_component_draw_paths_laspeyres(
-    component_history: pd.DataFrame,
-    component_paths: Mapping[str, np.ndarray],
-    path_dates: Sequence[pd.Timestamp],
-    annual_weights: pd.DataFrame,
-    aggregate_history: pd.Series,
-    *,
-    components: Sequence[str],
-    carry_forward_weights: bool = True,
-) -> dict:
+# COMPONENT_HICP_PATH_GUARD_DIAGNOSTIC_V1
+def aggregate_component_draw_paths_laspeyres(component_history: pd.DataFrame, component_paths: Mapping[str, np.ndarray], path_dates: Sequence[pd.Timestamp], annual_weights: pd.DataFrame, aggregate_history: pd.Series, *, components: Sequence[str], carry_forward_weights: bool=True) -> dict:
     """Aggregate matched monthly HICP component paths draw by draw.
 
     ``component_history`` must contain observed component-index history through
@@ -1510,58 +1502,66 @@ def aggregate_component_draw_paths_laspeyres(
     December(y-1) chain base.
     """
     components = list(components)
-    dates = pd.DatetimeIndex(path_dates, name="date")
+    dates = pd.DatetimeIndex(path_dates, name='date')
     if len(dates) == 0:
-        raise ValueError("path_dates is empty.")
-    expected = pd.date_range(dates[0], dates[-1], freq="MS", name="date")
+        raise ValueError('path_dates is empty.')
+    expected = pd.date_range(dates[0], dates[-1], freq='MS', name='date')
     if not dates.equals(expected):
-        raise ValueError("path_dates must be a complete monthly MS calendar.")
-
+        raise ValueError('path_dates must be a complete monthly MS calendar.')
     missing_history = [name for name in components if name not in component_history.columns]
     missing_paths = [name for name in components if name not in component_paths]
     if missing_history or missing_paths:
-        raise KeyError(
-            f"Missing component history={missing_history}, paths={missing_paths}."
-        )
-
+        raise KeyError(f'Missing component history={missing_history}, paths={missing_paths}.')
     arrays = {name: np.asarray(component_paths[name], dtype=float) for name in components}
     n_draws = next(iter(arrays.values())).shape[0]
     for name, array in arrays.items():
         if array.shape != (n_draws, len(dates)):
-            raise ValueError(
-                f"{name}: expected shape {(n_draws, len(dates))}, found {array.shape}."
-            )
-        if np.any(~np.isfinite(array)) or np.any(array <= 0):
-            raise ValueError(f"{name}: component HICP paths must be finite and positive.")
-
+            raise ValueError(f'{name}: expected shape {(n_draws, len(dates))}, found {array.shape}.')
+        if np.any(~np.isfinite(array)):
+            import inspect as _inspect
+            _bad_mask = ~np.isfinite(array)
+            _bad_locs = np.argwhere(_bad_mask)
+            _first_bad_draw = int(_bad_locs[0, 0])
+            _first_bad_h = int(_bad_locs[0, 1])
+            _bad_draws_by_h = np.sum(_bad_mask, axis=0).astype(int)
+            _affected_draws = int(np.sum(np.any(_bad_mask, axis=1)))
+            _finite_values = array[np.isfinite(array)]
+            _finite_min = float(np.min(_finite_values)) if _finite_values.size else float('nan')
+            _finite_max = float(np.max(_finite_values)) if _finite_values.size else float('nan')
+            _first_bad_date = pd.Timestamp(dates[_first_bad_h]).isoformat()
+            _bad_by_h_text = ', '.join((f'M+{i + 1}@{pd.Timestamp(dates[i]).date()}={int(count)}' for i, count in enumerate(_bad_draws_by_h) if int(count) > 0))
+            _stack = _inspect.stack()
+            _caller_chain = ' > '.join((f'{frame.function}:{frame.lineno}' for frame in _stack[1:5]))
+            raise ValueError(f'{name}: component HICP paths contain non-finite values; kind=NONFINITE; shape={array.shape}; first_bad_draw_0based={_first_bad_draw}; first_bad_draw_1based={_first_bad_draw + 1}; first_bad_horizon=M+{_first_bad_h + 1}; first_bad_date={_first_bad_date}; bad_cells={int(np.sum(_bad_mask))}; affected_draws={_affected_draws}; bad_draws_by_horizon=[{_bad_by_h_text}]; finite_min={_finite_min:.12g}; finite_max={_finite_max:.12g}; caller_chain={_caller_chain}')
+        if np.any(array <= 0):
+            import inspect as _inspect
+            _bad_mask = array <= 0
+            _bad_locs = np.argwhere(_bad_mask)
+            _first_bad_draw = int(_bad_locs[0, 0])
+            _first_bad_h = int(_bad_locs[0, 1])
+            _bad_draws_by_h = np.sum(_bad_mask, axis=0).astype(int)
+            _affected_draws = int(np.sum(np.any(_bad_mask, axis=1)))
+            _finite_values = array[np.isfinite(array)]
+            _finite_min = float(np.min(_finite_values)) if _finite_values.size else float('nan')
+            _finite_max = float(np.max(_finite_values)) if _finite_values.size else float('nan')
+            _first_bad_date = pd.Timestamp(dates[_first_bad_h]).isoformat()
+            _bad_by_h_text = ', '.join((f'M+{i + 1}@{pd.Timestamp(dates[i]).date()}={int(count)}' for i, count in enumerate(_bad_draws_by_h) if int(count) > 0))
+            _stack = _inspect.stack()
+            _caller_chain = ' > '.join((f'{frame.function}:{frame.lineno}' for frame in _stack[1:5]))
+            raise ValueError(f'{name}: component HICP paths contain non-positive values; kind=NONPOSITIVE; shape={array.shape}; first_bad_draw_0based={_first_bad_draw}; first_bad_draw_1based={_first_bad_draw + 1}; first_bad_horizon=M+{_first_bad_h + 1}; first_bad_date={_first_bad_date}; bad_cells={int(np.sum(_bad_mask))}; affected_draws={_affected_draws}; bad_draws_by_horizon=[{_bad_by_h_text}]; finite_min={_finite_min:.12g}; finite_max={_finite_max:.12g}; caller_chain={_caller_chain}')
     history = component_history[components].astype(float).sort_index()
     first_year = dates[0].year
     anchor_date = pd.Timestamp(first_year - 1, 12, 1)
     if anchor_date not in history.index:
-        raise KeyError(
-            f"Component history must include the previous December {anchor_date.date()}."
-        )
+        raise KeyError(f'Component history must include the previous December {anchor_date.date()}.')
     aggregate_history = aggregate_history.astype(float).sort_index()
     if anchor_date not in aggregate_history.index or pd.isna(aggregate_history.loc[anchor_date]):
-        raise KeyError(
-            f"Published aggregate history must include {anchor_date.date()}."
-        )
-
-    # We need every month from January of the first path year to the end of the
-    # requested path. Months before path_dates[0] are observed history.
-    calculation_dates = pd.date_range(
-        pd.Timestamp(first_year, 1, 1), dates[-1], freq="MS", name="date"
-    )
-    missing_weight_columns = [
-        name for name in components if name not in annual_weights.columns
-    ]
+        raise KeyError(f'Published aggregate history must include {anchor_date.date()}.')
+    calculation_dates = pd.date_range(pd.Timestamp(first_year, 1, 1), dates[-1], freq='MS', name='date')
+    missing_weight_columns = [name for name in components if name not in annual_weights.columns]
     if missing_weight_columns:
-        raise KeyError(
-            "annual_weights is missing component columns "
-            f"{missing_weight_columns}."
-        )
+        raise KeyError(f'annual_weights is missing component columns {missing_weight_columns}.')
     weights_for_chain = annual_weights[components].astype(float).sort_index()
-
     full_component = {}
     for name in components:
         matrix = np.empty((n_draws, len(calculation_dates)), dtype=float)
@@ -1569,88 +1569,42 @@ def aggregate_component_draw_paths_laspeyres(
             if month < dates[0]:
                 value = history[name].get(month, np.nan)
                 if not np.isfinite(value) or value <= 0:
-                    raise ValueError(
-                        f"{name}: missing observed history at {month.date()}."
-                    )
+                    raise ValueError(f'{name}: missing observed history at {month.date()}.')
                 matrix[:, t] = float(value)
             else:
                 j = dates.get_loc(month)
                 matrix[:, t] = arrays[name][:, j]
         full_component[name] = matrix
-
-    term_paths = np.empty(
-        (n_draws, len(calculation_dates), len(components)), dtype=float
-    )
+    term_paths = np.empty((n_draws, len(calculation_dates), len(components)), dtype=float)
     aggregate_paths = np.empty((n_draws, len(calculation_dates)), dtype=float)
     weight_year_used = np.empty(len(calculation_dates), dtype=int)
-
     previous_december = anchor_date
-    previous_aggregate = np.full(
-        n_draws, float(aggregate_history.loc[anchor_date]), dtype=float
-    )
-
+    previous_aggregate = np.full(n_draws, float(aggregate_history.loc[anchor_date]), dtype=float)
     for year in range(first_year, calculation_dates[-1].year + 1):
-        shares, source_weight_year = _normalised_weight_row(
-            weights_for_chain,
-            year,
-            components,
-            carry_forward=carry_forward_weights,
-        )
-
+        shares, source_weight_year = _normalised_weight_row(weights_for_chain, year, components, carry_forward=carry_forward_weights)
         if previous_december < calculation_dates[0]:
             base = history.loc[previous_december, components].to_numpy(dtype=float)
             base = np.repeat(base[None, :], n_draws, axis=0)
         else:
             prev_pos = calculation_dates.get_loc(previous_december)
-            base = np.column_stack(
-                [full_component[name][:, prev_pos] for name in components]
-            )
-
+            base = np.column_stack([full_component[name][:, prev_pos] for name in components])
         year_months = calculation_dates[calculation_dates.year == year]
         for month in year_months:
             pos = calculation_dates.get_loc(month)
-            current = np.column_stack(
-                [full_component[name][:, pos] for name in components]
-            )
+            current = np.column_stack([full_component[name][:, pos] for name in components])
             relatives = current / base
-            terms = (
-                previous_aggregate[:, None]
-                * shares.to_numpy(dtype=float)[None, :]
-                * relatives
-            )
+            terms = previous_aggregate[:, None] * shares.to_numpy(dtype=float)[None, :] * relatives
             term_paths[:, pos, :] = terms
             aggregate_paths[:, pos] = terms.sum(axis=1)
             weight_year_used[pos] = source_weight_year
-
         december = pd.Timestamp(year, 12, 1)
         if december in calculation_dates:
             previous_aggregate = aggregate_paths[:, calculation_dates.get_loc(december)]
             previous_december = december
-
     path_positions = calculation_dates.get_indexer(dates)
     if (path_positions < 0).any():
-        raise RuntimeError("Internal path alignment failure.")
-
-    return {
-        "level_paths": aggregate_paths[:, path_positions],
-        "term_paths": term_paths[:, path_positions, :],
-        "path_dates": dates,
-        "components": components,
-        "weight_year_used": pd.Series(
-            weight_year_used[path_positions], index=dates, name="weight_year_used"
-        ),
-        "calculation_level_paths": aggregate_paths,
-        "calculation_term_paths": term_paths,
-        "calculation_dates": calculation_dates,
-        "anchor_date": anchor_date,
-        "anchor_level": float(aggregate_history.loc[anchor_date]),
-        "cross_component_dependence": "caller supplied matched draw paths",
-        "future_weight_policy": (
-            "latest published annual weights carried forward"
-            if carry_forward_weights
-            else "year-specific published weights required"
-        ),
-    }
+        raise RuntimeError('Internal path alignment failure.')
+    return {'level_paths': aggregate_paths[:, path_positions], 'term_paths': term_paths[:, path_positions, :], 'path_dates': dates, 'components': components, 'weight_year_used': pd.Series(weight_year_used[path_positions], index=dates, name='weight_year_used'), 'calculation_level_paths': aggregate_paths, 'calculation_term_paths': term_paths, 'calculation_dates': calculation_dates, 'anchor_date': anchor_date, 'anchor_level': float(aggregate_history.loc[anchor_date]), 'cross_component_dependence': 'caller supplied matched draw paths', 'future_weight_policy': 'latest published annual weights carried forward' if carry_forward_weights else 'year-specific published weights required'}
 
 
 

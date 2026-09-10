@@ -592,6 +592,7 @@ def run_aggregate(
     aggregation identities first, so a broken vintage fails before any
     predictive path is touched.
     """
+    from inflation_path_portability import portable_forecast_store_map
     if weekly_tax_mode not in {"strict", "pre_tax_proxy_fallback"}:
         raise AggregateError(
             "weekly_tax_mode must be 'strict' or 'pre_tax_proxy_fallback'."
@@ -894,6 +895,65 @@ def run_aggregate(
         name: scenario_unpaired[name][final_indices[name]]
         for name in baseline_components
     }
+    # H9C-3 MONTHLY TAX FINAL-PAIR ADMISSIBILITY START
+    # Monthly Gas/Electricity tax scenarios can push a tiny number of
+    # paired HICP paths to non-positive levels at long horizons. Reject
+    # COMPLETE final aggregate rows; never clip cells and never re-pair.
+    monthly_tax_filter_diagnostics: dict[str, dict] = {}
+    monthly_tax_keep = np.ones(int(n_effective), dtype=bool)
+    for monthly_tax_model in ("gas", "electricity"):
+        if tax_scenarios.get(monthly_tax_model) is None:
+            continue
+        monthly_tax_filter = filter_positive_price_draws(
+            np.asarray(baseline_components[monthly_tax_model], dtype=float),
+            np.asarray(scenario_components[monthly_tax_model], dtype=float),
+            max_rejection_rate=None,
+            label=f"{monthly_tax_model}-monthly-tax-final-pair",
+        )
+        model_keep = np.asarray(monthly_tax_filter["valid_mask"], dtype=bool)
+        if model_keep.shape != monthly_tax_keep.shape:
+            raise AggregateError(
+                f"{monthly_tax_model}: monthly-tax admissibility mask shape "
+                f"{model_keep.shape} differs from final-pair shape "
+                f"{monthly_tax_keep.shape}."
+            )
+        monthly_tax_keep &= model_keep
+        monthly_tax_filter_diagnostics[monthly_tax_model] = dict(
+            monthly_tax_filter.get("diagnostics", {})
+        )
+
+    monthly_tax_draws_before = int(n_effective)
+    monthly_tax_rejected_draws = (
+        int((~monthly_tax_keep).sum())
+        if monthly_tax_filter_diagnostics
+        else 0
+    )
+    if monthly_tax_filter_diagnostics:
+        monthly_tax_retained_draws = int(monthly_tax_keep.sum())
+        if monthly_tax_retained_draws < 1:
+            raise AggregateError(
+                "No admissible final paired draws remain after monthly "
+                "Gas/Electricity tax-scenario filtering."
+            )
+        if monthly_tax_retained_draws < int(n_effective):
+            baseline_components = {
+                name: np.asarray(paths, dtype=float)[monthly_tax_keep]
+                for name, paths in baseline_components.items()
+            }
+            scenario_components = {
+                name: np.asarray(paths, dtype=float)[monthly_tax_keep]
+                for name, paths in scenario_components.items()
+            }
+            final_indices = {
+                name: np.asarray(indices_, dtype=int)[monthly_tax_keep]
+                for name, indices_ in final_indices.items()
+            }
+        n_effective = monthly_tax_retained_draws
+    monthly_tax_rejection_rates = {
+        name: float(diag.get("rejection_rate", 0.0))
+        for name, diag in monthly_tax_filter_diagnostics.items()
+    }
+    # H9C-3 MONTHLY TAX FINAL-PAIR ADMISSIBILITY END
 
     # Per-component HICP index and YoY paths. run_aggregate is the only place
     # where the tax bridge, the weekly-to-monthly conversion and the HICP
@@ -1062,7 +1122,7 @@ def run_aggregate(
         "tax_scenarios": {
             k: (None if v is None else dict(v)) for k, v in tax_scenarios.items()
         },
-        "component_forecast_stores": {k: str(v) for k, v in stores.items()},
+        "component_forecast_stores": portable_forecast_store_map(stores),
         "wob_hicp_proxy_diagnostics": {
             name: diagnostic.as_dict() for name, diagnostic in proxy_diags.items()
         },
@@ -1087,6 +1147,26 @@ def run_aggregate(
             "latest published HICP level held constant over the forecast horizon"
         ),
     }
+    # H9C-3 MONTHLY TAX ADMISSIBILITY METADATA START
+    if monthly_tax_filter_diagnostics:
+        config["monthly_tax_final_pair_admissibility"] = {
+            "policy": (
+                "complete final-pair draw rejection; same mask applied to "
+                "baseline, scenario and final pairing indices; no cell clipping"
+            ),
+            "active_components": sorted(monthly_tax_filter_diagnostics),
+            "draws_before": int(monthly_tax_draws_before),
+            "draws_after": int(n_effective),
+            "rejected_draws": int(monthly_tax_rejected_draws),
+            "rejection_rates": monthly_tax_rejection_rates,
+            "component_diagnostics": monthly_tax_filter_diagnostics,
+        }
+        config["predictive_distribution_interpretation"] = (
+            str(config.get("predictive_distribution_interpretation", "")).rstrip(".")
+            + "; active monthly Gas/Electricity tax scenarios additionally "
+            + "condition on finite, strictly positive paired HICP paths."
+        )
+    # H9C-3 MONTHLY TAX ADMISSIBILITY METADATA END
     aggregate_run_id = hashlib.sha256(
         json.dumps(config, sort_keys=True, default=str).encode("utf-8")
     ).hexdigest()[:20]
@@ -1254,12 +1334,10 @@ def run_aggregate(
 
 
 def _run_id_from_forecast_store(path_value: object) -> str | None:
-    """Extract <run_id> from .../<run_id>/forecasts/<forecast_name>."""
-    text = str(path_value or "").replace("\\", "/").rstrip("/")
-    parts = [piece for piece in text.split("/") if piece]
-    if len(parts) >= 3 and parts[-2] == "forecasts":
-        return parts[-3]
-    return None
+    """Extract run_id from legacy paths or portable forecast:// references."""
+    from inflation_path_portability import run_id_from_forecast_store
+
+    return run_id_from_forecast_store(path_value)
 
 
 def _aggregate_metadata_matches(

@@ -690,34 +690,201 @@ def _compact_payload(
     }
 
 
+PERSISTED_HEADLINE_BASELINE_REFERENCE_V1 = True
+
 def _assert_persisted_baseline_identity(
     posterior: SavedHeadlinePosterior,
     baseline: Mapping[str, Any],
-) -> None:
-    """Hard runtime guard: scenario baseline cannot differ from display baseline."""
-    saved_path = posterior.run_directory / "forecasts" / "unconditional" / "headline_draws.npz"
+) -> dict[str, Any]:
+    """Return persisted unconditional A after validating its replay.
+
+    The persisted unconditional Headline artefact is the authoritative economic
+    and display baseline. ``baseline`` is a deterministic replay used only to
+    prove numerical reproducibility and draw ordering before pairing with B.
+    """
+    forecast_directory = posterior.run_directory / "forecasts" / "unconditional"
+    saved_path = forecast_directory / "headline_draws.npz"
+    metadata_path = forecast_directory / "headline_metadata.json"
+
     if not saved_path.is_file():
         raise HeadlineConditionalError(
             "Persisted Headline baseline draws are missing; cannot verify scenario pairing."
         )
-    with np.load(saved_path, allow_pickle=False) as archive:
-        if "native_level_paths" not in archive.files:
-            raise HeadlineConditionalError(
-                "Persisted Headline baseline has no native_level_paths."
-            )
-        saved_native = np.asarray(archive["native_level_paths"], dtype=float)
-    actual_native = np.asarray(baseline["native_level_paths"], dtype=float)
-    if not np.array_equal(actual_native, saved_native, equal_nan=True):
-        finite = np.isfinite(actual_native) & np.isfinite(saved_native)
-        maximum = (
-            float(np.max(np.abs(actual_native[finite] - saved_native[finite])))
-            if finite.any() and actual_native.shape == saved_native.shape
-            else float("inf")
-        )
+    if not metadata_path.is_file():
         raise HeadlineConditionalError(
-            "Scenario baseline is not bit-identical to the persisted H=12 baseline; "
-            f"max_abs_error={maximum:.3e}. Refusing to display a moving baseline."
+            "Persisted Headline baseline metadata are missing; cannot verify scenario calendar."
         )
+
+    try:
+        saved_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise HeadlineConditionalError(
+            "Persisted Headline baseline metadata are unreadable."
+        ) from exc
+    if not isinstance(saved_metadata, dict):
+        raise HeadlineConditionalError(
+            "Persisted Headline baseline metadata have invalid structure."
+        )
+
+    required = (
+        "native_level_paths",
+        "component_yoy_paths",
+        "headline_level_paths",
+        "headline_yoy_paths",
+        "headline_yoy_contribution_paths",
+    )
+    with np.load(saved_path, allow_pickle=False) as archive:
+        missing = [name for name in required if name not in archive.files]
+        if missing:
+            raise HeadlineConditionalError(
+                "Persisted Headline baseline is incomplete: " + ", ".join(missing)
+            )
+        saved_arrays = {
+            name: np.asarray(archive[name], dtype=float).copy()
+            for name in required
+        }
+
+    saved_tail = int(saved_metadata.get("tail_length") or 0)
+    replay_tail = int(baseline.get("tail_length") or 0)
+    if replay_tail != saved_tail:
+        raise HeadlineConditionalError(
+            "Headline baseline tail contract changed: "
+            f"replay={replay_tail}, persisted={saved_tail}."
+        )
+
+    saved_path_values = saved_metadata.get("path_dates")
+    replay_path_values = baseline.get("path_dates")
+    if saved_path_values is None or replay_path_values is None:
+        raise HeadlineConditionalError(
+            "Headline baseline path calendar is missing."
+        )
+    saved_path_dates = pd.DatetimeIndex(pd.to_datetime(saved_path_values))
+    replay_path_dates = pd.DatetimeIndex(pd.to_datetime(replay_path_values))
+    if len(saved_path_dates) < 1 or not saved_path_dates.equals(replay_path_dates):
+        raise HeadlineConditionalError(
+            "Headline baseline replay calendar differs from the persisted unconditional calendar."
+        )
+
+    saved_future_values = saved_metadata.get("future_dates")
+    replay_future_values = baseline.get("future_dates")
+    if saved_future_values is None or replay_future_values is None:
+        raise HeadlineConditionalError(
+            "Headline baseline future calendar is missing."
+        )
+    saved_future_dates = pd.DatetimeIndex(pd.to_datetime(saved_future_values))
+    replay_future_dates = pd.DatetimeIndex(pd.to_datetime(replay_future_values))
+    if len(saved_future_dates) < 1 or not saved_future_dates.equals(replay_future_dates):
+        raise HeadlineConditionalError(
+            "Headline baseline replay future calendar differs from the persisted unconditional calendar."
+        )
+
+    replay_aggregate, replay_contribution = _aggregate_pair(baseline, posterior)
+    replay_arrays = {
+        "native_level_paths": np.asarray(baseline["native_level_paths"], dtype=float),
+        "component_yoy_paths": np.asarray(baseline["component_yoy_paths"], dtype=float),
+        "headline_level_paths": np.asarray(
+            replay_aggregate["headline_level_paths"], dtype=float
+        ),
+        "headline_yoy_paths": np.asarray(
+            replay_aggregate["headline_yoy_paths"], dtype=float
+        ),
+        "headline_yoy_contribution_paths": np.asarray(
+            replay_contribution, dtype=float
+        ),
+    }
+
+    eps = float(np.finfo(float).eps)
+    machine_factor = 64.0
+    hard_tolerance = 1e-9
+    channel_audit: dict[str, dict[str, Any]] = {}
+    overall_max = 0.0
+    overall_machine_tolerance = 0.0
+    bit_identical = True
+    replay_status = "pass"
+
+    for name in required:
+        actual = replay_arrays[name]
+        saved = saved_arrays[name]
+        if actual.shape != saved.shape:
+            raise HeadlineConditionalError(
+                f"Headline baseline replay shape changed for {name}: "
+                f"{actual.shape} != {saved.shape}."
+            )
+        if not np.array_equal(np.isnan(actual), np.isnan(saved)):
+            raise HeadlineConditionalError(
+                f"Headline baseline NaN pattern changed for {name}."
+            )
+        if not np.array_equal(np.isposinf(actual), np.isposinf(saved)):
+            raise HeadlineConditionalError(
+                f"Headline baseline +inf pattern changed for {name}."
+            )
+        if not np.array_equal(np.isneginf(actual), np.isneginf(saved)):
+            raise HeadlineConditionalError(
+                f"Headline baseline -inf pattern changed for {name}."
+            )
+
+        finite = np.isfinite(actual) & np.isfinite(saved)
+        if finite.any():
+            maximum = float(np.max(np.abs(actual[finite] - saved[finite])))
+            scale = max(1.0, float(np.max(np.abs(saved[finite]))))
+        else:
+            maximum = 0.0
+            scale = 1.0
+        machine_tolerance = machine_factor * eps * scale
+
+        if not np.isfinite(maximum) or maximum > hard_tolerance:
+            raise HeadlineConditionalError(
+                "Scenario baseline replay differs materially from the persisted "
+                "unconditional Headline baseline; "
+                f"channel={name}, max_abs_error={maximum:.3e}, "
+                f"hard_tolerance={hard_tolerance:.3e}. "
+                "Refusing to display a moving baseline."
+            )
+
+        channel_status = "pass" if maximum <= machine_tolerance else "warning"
+        if channel_status == "warning":
+            replay_status = "warning"
+
+        channel_bit_identical = bool(np.array_equal(actual, saved, equal_nan=True))
+        bit_identical = bit_identical and channel_bit_identical
+        overall_max = max(overall_max, maximum)
+        overall_machine_tolerance = max(
+            overall_machine_tolerance, machine_tolerance
+        )
+        channel_audit[name] = {
+            "max_abs_error": maximum,
+            "machine_tolerance": machine_tolerance,
+            "status": channel_status,
+            "bit_identical": channel_bit_identical,
+        }
+
+    persisted_component = {
+        "tail_length": saved_tail,
+        "native_level_paths": saved_arrays["native_level_paths"],
+        "component_yoy_paths": saved_arrays["component_yoy_paths"],
+        "path_dates": saved_path_dates,
+        "future_dates": saved_future_dates,
+    }
+    persisted_aggregate = {
+        "headline_level_paths": saved_arrays["headline_level_paths"],
+        "headline_yoy_paths": saved_arrays["headline_yoy_paths"],
+    }
+
+    return {
+        "component": persisted_component,
+        "aggregate": persisted_aggregate,
+        "contribution": saved_arrays["headline_yoy_contribution_paths"],
+        "audit": {
+            "status": replay_status,
+            "verified": True,
+            "bit_identical": bool(bit_identical),
+            "max_abs_error": float(overall_max),
+            "machine_tolerance": float(overall_machine_tolerance),
+            "hard_tolerance": float(hard_tolerance),
+            "machine_factor_eps": float(machine_factor),
+            "channels": channel_audit,
+        },
+    }
 
 
 def headline_energy_baseline_cache_key(*, vintage: str, headline_run_id: str, source_aggregate_run_id: str, forecast_name: str, condition_statistic: str, condition_horizon: int, condition_start: int=1) -> tuple[Any, ...]:
@@ -945,75 +1112,267 @@ def run_saved_headline_energy_marginal(run_directory: str | Path, *, energy_stor
     return payload
 
 
-def run_saved_headline_conditional(run_directory: str | Path, *, native_level_conditions: Mapping[str, Sequence[float]], H: int, lineage: Mapping[str, Any] | None=None, n_draws: int | None=None, seed: int | None=None, project_root: str | Path | None=None, persist: bool=True, condition_start: int=1) -> dict[str, Any]:
-    """Paired H=12 baseline/conditional forecast from one saved posterior.
+def run_saved_headline_conditional(
+    run_directory: str | Path,
+    *,
+    native_level_conditions: Mapping[str, Sequence[float]],
+    H: int,
+    lineage: Mapping[str, Any] | None = None,
+    n_draws: int | None = None,
+    seed: int | None = None,
+    project_root: str | Path | None = None,
+    persist: bool = True,
+    condition_start: int = 1,
+) -> dict[str, Any]:
+    """Paired H=12 conditional forecast against persisted unconditional A.
 
-    ``H`` is the *condition horizon* only. The stochastic forecast is always
-    solved over the locked 12-month computational horizon so the baseline is
-    invariant to the UI display/condition horizon.
+    ``H`` is the condition horizon only. The replayed unconditional forecast is
+    an integrity/pairing object; the persisted unconditional forecast is the
+    authoritative A used in summaries, impacts and saved scenario artefacts.
     """
     condition_horizon = int(H)
     condition_start_offset = int(condition_start or 1)
     condition_end_offset = condition_start_offset + condition_horizon - 1
-    if condition_horizon < 1 or condition_start_offset < 1 or condition_end_offset > MAX_PUBLISHED_HORIZON_MONTHS:
-        raise ValueError(f'Condition window must lie inside M+1..M+{MAX_PUBLISHED_HORIZON_MONTHS}; received start={condition_start_offset}, count={condition_horizon}, end={condition_end_offset}.')
+    if (
+        condition_horizon < 1
+        or condition_start_offset < 1
+        or condition_end_offset > MAX_PUBLISHED_HORIZON_MONTHS
+    ):
+        raise ValueError(
+            f"Condition window must lie inside M+1..M+{MAX_PUBLISHED_HORIZON_MONTHS}; "
+            f"received start={condition_start_offset}, count={condition_horizon}, "
+            f"end={condition_end_offset}."
+        )
     if condition_horizon < 1 or condition_horizon > MAX_PUBLISHED_HORIZON_MONTHS:
-        raise ValueError(f'H must lie in 1..{MAX_PUBLISHED_HORIZON_MONTHS}.')
-    posterior = load_saved_headline_posterior(run_directory, project_root=project_root)
+        raise ValueError(f"H must lie in 1..{MAX_PUBLISHED_HORIZON_MONTHS}.")
+
+    posterior = load_saved_headline_posterior(
+        run_directory, project_root=project_root
+    )
     contract_draws = posterior.forecast_draws
     contract_seed = posterior.forecast_seed
     contract_outliers = posterior.simulate_future_outliers
     if n_draws is not None and int(n_draws) != contract_draws:
-        raise HeadlineConditionalError(f'Conditional n_draws must equal the persisted baseline contract: requested={int(n_draws)}, persisted={contract_draws}.')
+        raise HeadlineConditionalError(
+            "Conditional n_draws must equal the persisted baseline contract: "
+            f"requested={int(n_draws)}, persisted={contract_draws}."
+        )
     if seed is not None and int(seed) != contract_seed:
-        raise HeadlineConditionalError(f'Conditional seed must equal the persisted baseline contract: requested={int(seed)}, persisted={contract_seed}.')
+        raise HeadlineConditionalError(
+            "Conditional seed must equal the persisted baseline contract: "
+            f"requested={int(seed)}, persisted={contract_seed}."
+        )
+
     condition_calendar = future_dates_for_saved(posterior, condition_end_offset)
-    condition_dates = pd.DatetimeIndex(condition_calendar[condition_start_offset - 1:condition_end_offset], name='date')
+    condition_dates = pd.DatetimeIndex(
+        condition_calendar[condition_start_offset - 1:condition_end_offset],
+        name="date",
+    )
     condition_mask = np.zeros(COMPUTATIONAL_HORIZON, dtype=np.uint8)
     condition_mask[condition_start_offset - 1:condition_end_offset] = 1
-    condition_mask_hash = __import__('hashlib').sha256(condition_mask.tobytes()).hexdigest()
+    condition_mask_hash = __import__("hashlib").sha256(
+        condition_mask.tobytes()
+    ).hexdigest()
     full_future_dates = future_dates_for_saved(posterior, COMPUTATIONAL_HORIZON)
+
     finite_conditions: dict[str, np.ndarray] = {}
     expanded_conditions: dict[str, np.ndarray] = {}
     if not native_level_conditions:
-        raise HeadlineConditionalError('At least one native HICP condition is required.')
+        raise HeadlineConditionalError(
+            "At least one native HICP condition is required."
+        )
     for name, raw in native_level_conditions.items():
         if name not in NATIVE_VARIABLES:
-            raise KeyError(f'Unknown conditioned variable {name!r}.')
+            raise KeyError(f"Unknown conditioned variable {name!r}.")
         values = np.asarray(raw, dtype=float)
         if values.ndim != 1 or len(values) != condition_horizon:
-            raise HeadlineConditionalError(f'{name}: expected {condition_horizon} finite condition values.')
+            raise HeadlineConditionalError(
+                f"{name}: expected {condition_horizon} finite condition values."
+            )
         if not np.isfinite(values).all() or np.any(values <= 0):
-            raise HeadlineConditionalError(f'{name}: condition levels must be finite and positive.')
+            raise HeadlineConditionalError(
+                f"{name}: condition levels must be finite and positive."
+            )
         finite_conditions[str(name)] = values
         expanded = np.full(COMPUTATIONAL_HORIZON, np.nan, dtype=float)
         expanded[condition_start_offset - 1:condition_end_offset] = values
         expanded_conditions[str(name)] = expanded
-    baseline = forecast_locked_headline(posterior.result, inputs=posterior.inputs, H=COMPUTATIONAL_HORIZON, n_draws=contract_draws, native_level_conditions=None, simulate_future_outliers=contract_outliers, seed=contract_seed)
-    _assert_persisted_baseline_identity(posterior, baseline)
-    conditional = forecast_locked_headline(posterior.result, inputs=posterior.inputs, H=COMPUTATIONAL_HORIZON, n_draws=contract_draws, native_level_conditions=expanded_conditions, allow_partial_level_conditions=True, simulate_future_outliers=contract_outliers, seed=contract_seed)
-    if not np.array_equal(np.asarray(baseline['draw_indices']), np.asarray(conditional['draw_indices'])):
-        raise HeadlineConditionalError('Baseline/conditional posterior draw pairing failed.')
-    if not pd.DatetimeIndex(baseline['path_dates']).equals(pd.DatetimeIndex(conditional['path_dates'])):
-        raise HeadlineConditionalError('Baseline/conditional calendars differ.')
-    base_agg, base_contrib = _aggregate_pair(baseline, posterior)
+
+    baseline_replay = forecast_locked_headline(
+        posterior.result,
+        inputs=posterior.inputs,
+        H=COMPUTATIONAL_HORIZON,
+        n_draws=contract_draws,
+        native_level_conditions=None,
+        simulate_future_outliers=contract_outliers,
+        seed=contract_seed,
+    )
+    persisted_reference = _assert_persisted_baseline_identity(
+        posterior, baseline_replay
+    )
+    baseline_audit = dict(persisted_reference["audit"])
+
+    conditional = forecast_locked_headline(
+        posterior.result,
+        inputs=posterior.inputs,
+        H=COMPUTATIONAL_HORIZON,
+        n_draws=contract_draws,
+        native_level_conditions=expanded_conditions,
+        allow_partial_level_conditions=True,
+        simulate_future_outliers=contract_outliers,
+        seed=contract_seed,
+    )
+    if not np.array_equal(
+        np.asarray(baseline_replay["draw_indices"]),
+        np.asarray(conditional["draw_indices"]),
+    ):
+        raise HeadlineConditionalError(
+            "Baseline replay/conditional posterior draw pairing failed."
+        )
+    if not pd.DatetimeIndex(baseline_replay["path_dates"]).equals(
+        pd.DatetimeIndex(conditional["path_dates"])
+    ):
+        raise HeadlineConditionalError(
+            "Baseline replay/conditional calendars differ."
+        )
+
+    baseline_tail = int(persisted_reference["component"]["tail_length"])
+    conditional_tail = int(conditional["tail_length"])
+    if baseline_tail != conditional_tail:
+        raise HeadlineConditionalError(
+            "Persisted baseline/conditional tail lengths differ: "
+            f"{baseline_tail} vs {conditional_tail}."
+        )
+
+    base_component = dict(persisted_reference["component"])
+    base_agg = dict(persisted_reference["aggregate"])
+    base_contrib = np.asarray(persisted_reference["contribution"], dtype=float)
     cond_agg, cond_contrib = _aggregate_pair(conditional, posterior)
-    future_dates = pd.DatetimeIndex(conditional['future_dates'], name='date')
+
+    future_dates = pd.DatetimeIndex(conditional["future_dates"], name="date")
     if not future_dates.equals(full_future_dates):
-        raise HeadlineConditionalError('Conditional H=12 future calendar changed unexpectedly.')
-    meta: dict[str, Any] = {'scenario_contract_version': CONDITIONAL_CONTRACT_VERSION, 'headline_vintage': posterior.vintage, 'headline_run_id': posterior.run_id, 'condition_variables': sorted(finite_conditions), 'condition_dates': [x.isoformat() for x in condition_dates], 'condition_values': {k: v.tolist() for k, v in finite_conditions.items()}, 'condition_horizon': condition_horizon, 'computational_horizon': COMPUTATIONAL_HORIZON, 'n_draws': contract_draws, 'forecast_seed': contract_seed, 'simulate_future_outliers': contract_outliers, 'paired_baseline_conditional': True, 'persisted_baseline_bit_identical': True, 'bvar_reestimated': False, 'lineage_verification_status': posterior.integrity.get('verification_status', 'unverified'), 'publication_horizon_max_months': MAX_PUBLISHED_HORIZON_MONTHS, 'condition_start': condition_start_offset, 'condition_end': condition_end_offset, 'condition_start_offset': condition_start_offset, 'condition_end_offset': condition_end_offset, 'condition_mask_hash': condition_mask_hash, 'conditioned_horizon_months': condition_horizon, 'free_before_condition_months': condition_start_offset - 1, 'free_after_condition_months': COMPUTATIONAL_HORIZON - condition_end_offset, 'free_propagation_horizon_months': COMPUTATIONAL_HORIZON - condition_horizon}
+        raise HeadlineConditionalError(
+            "Conditional H=12 future calendar changed unexpectedly."
+        )
+
+    meta: dict[str, Any] = {
+        "scenario_contract_version": CONDITIONAL_CONTRACT_VERSION,
+        "headline_vintage": posterior.vintage,
+        "headline_run_id": posterior.run_id,
+        "condition_variables": sorted(finite_conditions),
+        "condition_dates": [x.isoformat() for x in condition_dates],
+        "condition_values": {k: v.tolist() for k, v in finite_conditions.items()},
+        "condition_horizon": condition_horizon,
+        "computational_horizon": COMPUTATIONAL_HORIZON,
+        "n_draws": contract_draws,
+        "forecast_seed": contract_seed,
+        "simulate_future_outliers": contract_outliers,
+        "paired_baseline_conditional": True,
+        "baseline_source": "persisted_unconditional",
+        "baseline_reference_contract": "headline-persisted-unconditional-v1",
+        "bvar_reestimated": False,
+        "lineage_verification_status": posterior.integrity.get(
+            "verification_status", "unverified"
+        ),
+        "publication_horizon_max_months": MAX_PUBLISHED_HORIZON_MONTHS,
+        "condition_start": condition_start_offset,
+        "condition_end": condition_end_offset,
+        "condition_start_offset": condition_start_offset,
+        "condition_end_offset": condition_end_offset,
+        "condition_mask_hash": condition_mask_hash,
+        "conditioned_horizon_months": condition_horizon,
+        "free_before_condition_months": condition_start_offset - 1,
+        "free_after_condition_months":
+            COMPUTATIONAL_HORIZON - condition_end_offset,
+        "free_propagation_horizon_months":
+            COMPUTATIONAL_HORIZON - condition_horizon,
+    }
     meta.update(dict(lineage or {}))
+    meta["baseline_source"] = "persisted_unconditional"
+    meta["baseline_reference_contract"] = "headline-persisted-unconditional-v1"
+
     scenario_id = _scenario_identity(meta)
-    meta['scenario_id'] = scenario_id
-    payload = _compact_payload(metadata=meta, future_dates=future_dates, baseline_component=baseline, conditional_component=conditional, baseline_aggregate=base_agg, conditional_aggregate=cond_agg, baseline_contrib=base_contrib, conditional_contrib=cond_contrib)
+    meta["scenario_id"] = scenario_id
+
+    meta.update(
+        {
+            "persisted_baseline_replay_verified": True,
+            "baseline_replay_status": str(baseline_audit["status"]),
+            "baseline_replay_max_abs_error": float(
+                baseline_audit["max_abs_error"]
+            ),
+            "baseline_replay_machine_tolerance": float(
+                baseline_audit["machine_tolerance"]
+            ),
+            "baseline_replay_hard_tolerance": float(
+                baseline_audit["hard_tolerance"]
+            ),
+            "baseline_replay_channel_diagnostics": dict(
+                baseline_audit["channels"]
+            ),
+            "persisted_baseline_bit_identical": bool(
+                baseline_audit["bit_identical"]
+            ),
+        }
+    )
+
+    payload = _compact_payload(
+        metadata=meta,
+        future_dates=future_dates,
+        baseline_component=base_component,
+        conditional_component=conditional,
+        baseline_aggregate=base_agg,
+        conditional_aggregate=cond_agg,
+        baseline_contrib=base_contrib,
+        conditional_contrib=cond_contrib,
+    )
+
     if persist:
-        directory = posterior.run_directory / 'scenarios' / scenario_id
+        directory = posterior.run_directory / "scenarios" / scenario_id
         directory.mkdir(parents=True, exist_ok=True)
-        (directory / 'metadata.json').write_text(json.dumps(meta, indent=2, default=str), encoding='utf-8')
-        tail = int(conditional['tail_length'])
-        np.savez_compressed(directory / 'scenario_draws.npz', future_dates=future_dates.astype('datetime64[ns]').to_numpy(), draw_indices=np.asarray(conditional['draw_indices'], dtype=int), baseline_native_level_paths=np.asarray(baseline['native_level_paths'], dtype=float)[:, tail:, :], conditional_native_level_paths=np.asarray(conditional['native_level_paths'], dtype=float)[:, tail:, :], baseline_component_yoy_paths=np.asarray(baseline['component_yoy_paths'], dtype=float)[:, tail:, :], conditional_component_yoy_paths=np.asarray(conditional['component_yoy_paths'], dtype=float)[:, tail:, :], baseline_headline_level_paths=np.asarray(base_agg['headline_level_paths'], dtype=float)[:, tail:], conditional_headline_level_paths=np.asarray(cond_agg['headline_level_paths'], dtype=float)[:, tail:], baseline_headline_yoy_paths=np.asarray(base_agg['headline_yoy_paths'], dtype=float)[:, tail:], conditional_headline_yoy_paths=np.asarray(cond_agg['headline_yoy_paths'], dtype=float)[:, tail:], baseline_yoy_contribution_paths=np.asarray(base_contrib, dtype=float)[:, tail:, :], conditional_yoy_contribution_paths=np.asarray(cond_contrib, dtype=float)[:, tail:, :])
-        (directory / 'display.json').write_text(json.dumps(payload, indent=2, default=str), encoding='utf-8')
-        payload['meta']['directory'] = str(directory)
+        (directory / "metadata.json").write_text(
+            json.dumps(meta, indent=2, default=str), encoding="utf-8"
+        )
+        tail = baseline_tail
+        np.savez_compressed(
+            directory / "scenario_draws.npz",
+            future_dates=future_dates.astype("datetime64[ns]").to_numpy(),
+            draw_indices=np.asarray(conditional["draw_indices"], dtype=int),
+            baseline_native_level_paths=np.asarray(
+                base_component["native_level_paths"], dtype=float
+            )[:, tail:, :],
+            conditional_native_level_paths=np.asarray(
+                conditional["native_level_paths"], dtype=float
+            )[:, tail:, :],
+            baseline_component_yoy_paths=np.asarray(
+                base_component["component_yoy_paths"], dtype=float
+            )[:, tail:, :],
+            conditional_component_yoy_paths=np.asarray(
+                conditional["component_yoy_paths"], dtype=float
+            )[:, tail:, :],
+            baseline_headline_level_paths=np.asarray(
+                base_agg["headline_level_paths"], dtype=float
+            )[:, tail:],
+            conditional_headline_level_paths=np.asarray(
+                cond_agg["headline_level_paths"], dtype=float
+            )[:, tail:],
+            baseline_headline_yoy_paths=np.asarray(
+                base_agg["headline_yoy_paths"], dtype=float
+            )[:, tail:],
+            conditional_headline_yoy_paths=np.asarray(
+                cond_agg["headline_yoy_paths"], dtype=float
+            )[:, tail:],
+            baseline_yoy_contribution_paths=np.asarray(
+                base_contrib, dtype=float
+            )[:, tail:, :],
+            conditional_yoy_contribution_paths=np.asarray(
+                cond_contrib, dtype=float
+            )[:, tail:, :],
+        )
+        (directory / "display.json").write_text(
+            json.dumps(payload, indent=2, default=str), encoding="utf-8"
+        )
+        payload["meta"]["directory"] = str(directory)
     return payload
 
 

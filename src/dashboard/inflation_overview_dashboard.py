@@ -1,3 +1,4 @@
+# OVERVIEW_COPY_CLEANUP_V1
 """Cross-domain Inflation Dashboard overview.
 
 The Overview is intentionally a display layer.  It resolves the production
@@ -112,10 +113,7 @@ def overview_page() -> html.Div:
                                 disabled=True,
                                 className="refresh-button",
                             ),
-                            html.Div(
-                                "Persisted display artifacts only · observed history + stored nowcast/forecast · no recomputation.",
-                                className="control-help",
-                            ),
+                            None,
                         ],
                         className="panel",
                     ),
@@ -132,10 +130,7 @@ def overview_page() -> html.Div:
                                 "Latest observation · nowcast · three-month outlook",
                                 className="panel-title",
                             ),
-                            html.P(
-                                "All rows use one common monthly display calendar. Predictive cells show posterior mean, median and q05–q95. Δ columns show the change in posterior mean versus the immediately preceding displayed period, in percentage points; positive changes are green and negative changes red.",
-                                className="panel-subtitle",
-                            ),
+                            None,
                         ],
                         className="panel-heading",
                     ),
@@ -348,25 +343,75 @@ def _latest_headline_run(results_root: Path, registry_path, vintage: str) -> Pat
     return run_dir
 
 
+# OVERVIEW_EXACT_PRODUCTION_ENERGY_AGGREGATE_V1
 def _latest_energy_aggregate(registry_path, vintage: str) -> Path:
+    """Resolve the exact HICP Energy aggregate declared by production manifest."""
+    from production_manifest import load_production_manifest
+
+    registry_path = Path(registry_path).expanduser().resolve()
+    project_root = registry_path.parent.parent
+    manifest = load_production_manifest(project_root)
+
+    manifest_vintage = str(manifest.get("production_vintage") or "")
+    if manifest_vintage != str(vintage):
+        raise FileNotFoundError(
+            f"Production manifest vintage {manifest_vintage!r} does not match "
+            f"requested Overview vintage {str(vintage)!r}."
+        )
+
+    contract = dict(manifest.get("energy_aggregate") or {})
+    aggregate_run_id = str(contract.get("aggregate_run_id") or "").strip()
+    forecast_name = str(
+        contract.get("forecast_name")
+        or manifest.get("forecast_name")
+        or ""
+    ).strip()
+    if not aggregate_run_id:
+        raise FileNotFoundError(
+            f"Production manifest has no Energy aggregate for vintage {vintage}."
+        )
+
     rows = _snapshot_registry_table("aggregates")
     if not rows.empty:
         rows = rows.loc[
             rows["vintage"].astype(str).eq(str(vintage))
+            & rows["aggregate_run_id"].astype(str).eq(aggregate_run_id)
         ].copy()
-    if rows.empty:
-        raise FileNotFoundError(f"No HICP Energy aggregate for vintage {vintage}.")
-    rows = rows.loc[rows["status"].astype(str).eq("complete")].copy()
-    if rows.empty:
-        raise FileNotFoundError(f"No complete HICP Energy aggregate for vintage {vintage}.")
-    if "promoted" not in rows:
-        rows["promoted"] = False
-    if "created_at_utc" not in rows:
-        rows["created_at_utc"] = ""
-    rows = rows.sort_values(["promoted", "created_at_utc", "aggregate_run_id"], ascending=[False, False, True])
-    directory = Path(str(rows.iloc[0]["directory"]))
+    if "status" in rows.columns:
+        rows = rows.loc[rows["status"].astype(str).eq("complete")].copy()
+    if "present_on_disk" in rows.columns:
+        rows = rows.loc[
+            rows["present_on_disk"].fillna(0).astype(int).eq(1)
+        ].copy()
+    if forecast_name and "forecast_name" in rows.columns:
+        rows = rows.loc[
+            rows["forecast_name"].astype(str).eq(forecast_name)
+        ].copy()
+
+    if len(rows) != 1:
+        raise FileNotFoundError(
+            f"Declared production Energy aggregate {aggregate_run_id!r} "
+            f"({forecast_name or 'unspecified forecast'}) is not uniquely "
+            f"complete and on disk for vintage {vintage}."
+        )
+
+    directory = Path(str(rows.iloc[0]["directory"])).expanduser()
+    if not directory.is_absolute():
+        directory = project_root / directory
+
     if not directory.is_dir():
-        raise FileNotFoundError(directory)
+        # Legacy absolute roots are rebased only after the stable repo anchor.
+        raw = str(directory).replace("\\\\", "/")
+        marker = "/results/"
+        if marker in raw:
+            suffix = raw.split(marker, 1)[1]
+            directory = project_root / "results" / Path(suffix)
+
+    directory = directory.resolve()
+    if not directory.is_dir():
+        raise FileNotFoundError(
+            f"Declared production Energy aggregate directory is missing: {directory}"
+        )
     return directory
 
 
@@ -2752,6 +2797,130 @@ def _overview_export_rows_from_frame(
     return rows
 
 
+# OVERVIEW_XLSX_READING_TABS_V1
+_OVERVIEW_READING_DETAIL_HEADERS = [
+    "date",
+    "record_type",
+    "observed",
+    "mean",
+    "median",
+    "q05",
+    "q16",
+    "q84",
+    "q95",
+]
+
+
+def _overview_export_reading_sheets(
+    *,
+    headers,
+    rows,
+    headline_run_id: str,
+    aggregate_run_id: str,
+):
+    # Human-readable canonical-series views from existing long rows only.
+    headers = list(headers or [])
+    positions = {str(name): idx for idx, name in enumerate(headers)}
+    required = {
+        "date", "run_id", "series", "record_type",
+        "observed", "mean", "median", "q05", "q16", "q84", "q95",
+    }
+    missing = sorted(required.difference(positions))
+    if missing:
+        raise ValueError(
+            "Overview reading-sheet projection lacks columns: " + ", ".join(missing)
+        )
+
+    def _mapping(row):
+        values = list(row)
+        return {
+            name: values[pos] if pos < len(values) else ""
+            for name, pos in positions.items()
+        }
+
+    mapped = [_mapping(row) for row in list(rows or [])]
+
+    specs = [
+        ("Headline", "hicp_total", str(headline_run_id)),
+        ("Core", "hicp_core", str(headline_run_id)),
+        ("Energy", "hicp_energy", str(aggregate_run_id)),
+    ]
+
+    detail_sheets = []
+    canonical = {}
+
+    for sheet_name, series_id, run_id in specs:
+        selected = [
+            item for item in mapped
+            if str(item.get("series") or "") == series_id
+            and str(item.get("run_id") or "") == run_id
+        ]
+        if not selected:
+            raise ValueError(
+                f"Overview XLSX reading tab {sheet_name!r} has no canonical "
+                f"{series_id!r} rows for run {run_id!r}."
+            )
+
+        priority = {"observed": 0, "nowcast": 1, "forecast": 2}
+        selected.sort(
+            key=lambda item: (
+                str(item.get("date") or ""),
+                priority.get(str(item.get("record_type") or "").lower(), 9),
+            )
+        )
+
+        detail_rows = [
+            [item.get(name, "") for name in _OVERVIEW_READING_DETAIL_HEADERS]
+            for item in selected
+        ]
+        detail_sheets.append(
+            {
+                "name": sheet_name,
+                "headers": list(_OVERVIEW_READING_DETAIL_HEADERS),
+                "rows": detail_rows,
+            }
+        )
+        canonical[series_id] = selected
+
+    by_series_date = {}
+    priority = {"observed": 0, "nowcast": 1, "forecast": 2}
+    for series_id, selected in canonical.items():
+        date_map = {}
+        for item in selected:
+            date = str(item.get("date") or "")
+            record_type = str(item.get("record_type") or "").lower()
+            value = item.get("observed") if record_type == "observed" else item.get("mean")
+            rank = priority.get(record_type, 9)
+            previous = date_map.get(date)
+            if previous is None or rank < previous[0]:
+                date_map[date] = (rank, value)
+        by_series_date[series_id] = {
+            date: value for date, (_, value) in date_map.items()
+        }
+
+    dates = sorted(
+        set().union(*(set(values) for values in by_series_date.values()))
+    )
+    series_headers = ["date", "hicp_total", "hicp_core", "hicp_energy"]
+    series_rows = [
+        [
+            date,
+            by_series_date["hicp_total"].get(date, ""),
+            by_series_date["hicp_core"].get(date, ""),
+            by_series_date["hicp_energy"].get(date, ""),
+        ]
+        for date in dates
+    ]
+
+    return [
+        {
+            "name": "Series",
+            "headers": series_headers,
+            "rows": series_rows,
+        },
+        *detail_sheets,
+    ]
+
 def _overview_results_export_payload(
     bundle,
     *,
@@ -2914,13 +3083,20 @@ def _overview_results_export_payload(
     for note in source_notes:
         metadata_rows.append(["Source artifact", note])
 
+    reading_sheets = _overview_export_reading_sheets(
+        headers=list(_OVERVIEW_EXPORT_HEADERS),
+        rows=all_rows,
+        headline_run_id=headline_run_id,
+        aggregate_run_id=aggregate_run_id,
+    )
     return {
         "vintage": vintage,
         "table_id": "overview-results",
         "title": "ECB VAR Overview results",
-        "sheet_name": "Results",
+        "sheet_name": "Data_long",
         "filename": f"ECB_VAR_results_vintage_{vintage}.xlsx",
         "metadata_rows": metadata_rows,
+        "additional_sheets": reading_sheets,
         "table": {
             "headers": list(_OVERVIEW_EXPORT_HEADERS),
             "rows": all_rows,

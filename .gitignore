@@ -1,19 +1,109 @@
-# Local data
+# =============================================================================
+# Local / generated data
+# =============================================================================
+
+# Raw and generated data stay local.
 data/raw/
 data/interim/
 data/processed/
+data/backup/
 
+# Same layers inside nested data domains.
+data/**/raw/
+data/**/interim/
+data/**/processed/
+data/**/backup/
+
+
+# =============================================================================
+# Results
+# =============================================================================
+
+# results/ is intentionally NOT ignored:
+# one complete reference vintage may be versioned.
+#
+# Runtime state inside results must never be committed.
+results/.dash_cache/
+results/.estimation.lock
+results/energy_bvar_registry.sqlite3
+results/*.sqlite3
+results/*.sqlite3-shm
+results/*.sqlite3-wal
+
+# Defensive global patterns for the same runtime files.
+.estimation.lock
+energy_bvar_registry.sqlite3
+
+
+# =============================================================================
+# Dashboard / generated runtime artefacts
+# =============================================================================
+
+output/
+.dashboard_cache/
+.dash_cache/
+scenario_regression_audit_*.json
+
+
+# =============================================================================
+# Patch / repair / temporary backup directories
+# =============================================================================
+
+.patch_backups/
+.*_backup/
 documentation_todelete/
 
-# Generated outputs
-output/
 
-# Python cache
+# =============================================================================
+# Python
+# =============================================================================
+
 __pycache__/
 *.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
 
+
+# =============================================================================
+# Virtual environments / IDE
+# =============================================================================
+
+.venv/
+venv/
+env/
+.idea/
+
+
+# =============================================================================
 # Jupyter
+# =============================================================================
+
 .ipynb_checkpoints/
 
-# Virtual environment
-.venv/
+
+# =============================================================================
+# Backup / temporary files
+# =============================================================================
+
+*.bak
+*.bak.*
+*.bak_*
+*.pre_*
+*.pre-*
+*.backup*
+*.tmp
+*.temp
+~$*
+
+
+# =============================================================================
+# OS noise
+# =============================================================================
+
+.DS_Store
+Thumbs.db
+desktop.ini
