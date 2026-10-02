@@ -73,7 +73,7 @@ Core corresponds to the non-Energy, non-Food part of the basket and is construct
 
 A generic VAR representation is
 
-$$
+```math
 y_t
 =
 c
@@ -89,13 +89,13 @@ A_p y_{t-p}
 B x_t
 +
 \varepsilon_t,
-$$
+```
 
 with
 
-$$
+```math
 \varepsilon_t \sim \mathcal{N}(0,\Sigma_t).
-$$
+```
 
 The production framework supports Minnesota-style shrinkage together with stochastic-volatility and outlier-robust specifications used by the component models.
 
@@ -120,25 +120,25 @@ The method is configurable by model. Linear is useful when turnaround time matte
 
 For an HICP index $I_t$, year-on-year inflation is
 
-$$
+```math
 \pi_t^{YoY}
 =
 100
 \left(
 \frac{I_t}{I_{t-12}} - 1
 \right).
-$$
+```
 
 For weekly series the analogous 52-week transformation is
 
-$$
+```math
 \pi_t^{52w}
 =
 100
 \left(
 \frac{I_t}{I_{t-52}} - 1
 \right).
-$$
+```
 
 Model targets and source variables may be transformed internally, including log differences. Inflation, levels and contributions shown in the dashboard are reconstructed downstream from the saved posterior paths.
 
@@ -150,16 +150,16 @@ Let $i=1,\ldots,N_E$ index the Energy components and let $w_{i,y}$ denote their 
 
 Weights are normalised inside the Energy basket:
 
-$$
+```math
 \widetilde{w}_{i,y}
 =
 \frac{w_{i,y}}
 {\sum_{j=1}^{N_E} w_{j,y}}.
-$$
+```
 
 For a month $t$ in calendar year $y$, the chain-linked Energy index is reconstructed relative to December of the previous year:
 
-$$
+```math
 I^{E}_t
 =
 I^{E}_{Dec(y-1)}
@@ -167,7 +167,7 @@ I^{E}_{Dec(y-1)}
 \widetilde{w}_{i,y}
 \frac{I_{i,t}}
 {I_{i,Dec(y-1)}}.
-$$
+```
 
 The recursion is performed **for every posterior draw**. This preserves nonlinear aggregation and posterior dependence across components.
 
@@ -179,16 +179,16 @@ The December re-linking means that January dynamics can reflect both the new wit
 
 Let the four Headline blocks be
 
-$$
+```math
 j \in
 \{
 Energy,\ Food,\ NEIG,\ Services
 \}.
-$$
+```
 
 With annual normalised weights $\widetilde{w}_{j,y}$, Headline is reconstructed using the same December-based chain-linking principle:
 
-$$
+```math
 I^{H}_t
 =
 I^{H}_{Dec(y-1)}
@@ -196,17 +196,17 @@ I^{H}_{Dec(y-1)}
 \widetilde{w}_{j,y}
 \frac{I_{j,t}}
 {I_{j,Dec(y-1)}}.
-$$
+```
 
 All aggregation is performed **draw by draw**, before posterior means, medians or credible intervals are calculated.
 
 This matters because, in general,
 
-$$
+```math
 f\!\left(E[X]\right)
 \neq
 E[f(X)].
-$$
+```
 
 The dashboard therefore does not aggregate already-summarised component forecasts.
 
@@ -216,25 +216,25 @@ The dashboard therefore does not aggregate already-summarised component forecast
 
 Headline YoY contribution decomposition is constructed so that the component contributions add exactly to total Headline inflation, up to numerical precision:
 
-$$
+```math
 \pi^{H}_t
 =
 \sum_j c_{j,t}.
-$$
+```
 
 For a scenario comparison between baseline $A$ and scenario $B$, the component contribution effect is
 
-$$
+```math
 \Delta c_{j,t}
 =
 c^{B}_{j,t}
 -
 c^{A}_{j,t}.
-$$
+```
 
 The exact Headline scenario effect therefore satisfies
 
-$$
+```math
 \Delta \pi^{H}_t
 =
 \pi^{H,B}_t
@@ -242,7 +242,7 @@ $$
 \pi^{H,A}_t
 =
 \sum_j \Delta c_{j,t}.
-$$
+```
 
 This is different from simply adding component IRFs or marginal scenario statistics.
 
@@ -254,25 +254,25 @@ Forecast distributions are generated from posterior draws and future shocks.
 
 For a VAR moving-average representation
 
-$$
+```math
 y_{t+h}
 =
 \mu_{t+h}
 +
 \sum_{s=0}^{h-1}
 \Psi_s \varepsilon_{t+h-s},
-$$
+```
 
 the conditional forecast variance contains accumulated future-shock uncertainty:
 
-$$
+```math
 Var(y_{t+h}\mid\theta)
 =
 \sum_{s=0}^{h-1}
 \Psi_s
 \Sigma
 \Psi_s'.
-$$
+```
 
 This is why forecast fan charts generally widen with horizon.
 
@@ -293,9 +293,9 @@ The framework supports hard conditioning over arbitrary future windows.
 
 If a variable is constrained only over horizons
 
-$$
+```math
 h \in [h_s,h_e],
-$$
+```
 
 then observations before $h_s$ and after $h_e$ are **not hard constrained**, but they may still move because the conditional forecast is solved jointly.
 
@@ -307,13 +307,13 @@ For example, conditioning only from $M+3$ to $M+5$ means:
 
 For delayed percentage scenarios relative to the last observed value $x_T$,
 
-$$
+```math
 x_{T+h}^{cond}
 =
 x_T(1+\delta),
 \qquad
 h_s \le h \le h_e.
-$$
+```
 
 ---
 
@@ -323,9 +323,9 @@ VAT and excise scenarios are handled downstream of the BVAR where the model arch
 
 For a pure tax scenario, the underlying pre-tax BVAR target is unchanged by construction:
 
-$$
+```math
 \Delta y_t^{BVAR}=0.
-$$
+```
 
 The consumer-price effect is produced by tax re-attribution and then propagated through the same draw-by-draw HICP Energy aggregation.
 
@@ -346,13 +346,13 @@ Define:
 
 The Headline scenario effect is calculated draw by draw:
 
-$$
+```math
 \Delta \pi^{H,(d)}_{t}
 =
 \pi^{H,B,(d)}_{t}
 -
 \pi^{H,A,(d)}_{t}.
-$$
+```
 
 Posterior summaries are computed only after the paired difference has been formed.
 
@@ -374,31 +374,31 @@ The validated baseline identification is recursive / Cholesky.
 
 If
 
-$$
+```math
 \Sigma = PP',
-$$
+```
 
 and $\Psi_h$ is the reduced-form moving-average coefficient at horizon $h$, the structural IRF is
 
-$$
+```math
 \Theta_h
 =
 \Psi_h P.
-$$
+```
 
 For response variable $i$ to structural shock $j$,
 
-$$
+```math
 IRF_{i,j}(h)
 =
 e_i'\Theta_h e_j.
-$$
+```
 
 Unlike a forecast fan chart, an IRF does **not** accumulate future random innovations. Its posterior band reflects uncertainty in estimated parameters and, where relevant, identification.
 
 A standard recursive FEVD share for variable $i$, shock $j$ and horizon $H$ is
 
-$$
+```math
 FEVD_{i \leftarrow j}(H)
 =
 \frac{
@@ -413,7 +413,7 @@ e_i'\Psi_h
 \Psi_h'
 e_i
 }.
-$$
+```
 
 ---
 
@@ -423,7 +423,7 @@ Headline Total structural responses are **not** obtained by summing component IR
 
 For component $i$, horizon $h$ and posterior draw $d$, the shocked component index is reconstructed from the deterministic baseline path and cumulative log IRF:
 
-$$
+```math
 I^{shock}_{i,h,d}
 =
 I^{base}_{i,h,d}
@@ -432,13 +432,13 @@ I^{base}_{i,h,d}
 \sum_{s=0}^{h}
 IRF_{i,s,d}
 \right).
-$$
+```
 
 The baseline and shocked component paths are then both passed through the production Headline aggregation.
 
 The Headline Total level response is
 
-$$
+```math
 R^{level}_{h,d}
 =
 100
@@ -450,17 +450,17 @@ I^{H,base}_{h,d}
 }
 -1
 \right).
-$$
+```
 
 The Headline Total YoY response is
 
-$$
+```math
 R^{YoY}_{h,d}
 =
 \pi^{H,shock}_{h,d}
 -
 \pi^{H,base}_{h,d}.
-$$
+```
 
 This is an exact nonlinear draw-by-draw re-aggregation.
 
@@ -470,11 +470,11 @@ Headline Total currently exposes the nonlinear IRF object, but **not** an aggreg
 
 The reason is that Headline is additive in index levels while the BVAR is estimated in transformed component space. Effective shares are state-dependent and covariance terms matter. Therefore, in general,
 
-$$
+```math
 FEVD^{Headline}
 \neq
 \sum_j FEVD_j.
-$$
+```
 
 An aggregated Headline FEVD or HD would be a separate econometric object requiring its own definition and validation.
 
@@ -688,15 +688,17 @@ The project follows several strict engineering rules:
 
 This README uses GitHub-native mathematical notation.
 
-Inline mathematics uses `$...$` and displayed equations use:
+Inline mathematics uses `$...$`.
 
-```text
-$$
+Displayed equations use GitHub fenced math blocks:
+
+````text
+```math
 ...
-$$
 ```
+````
 
-GitHub renders these expressions directly in Markdown.
+This convention is used throughout this README because it is more reliable for multiline equations on GitHub than `$$ ... $$` blocks.
 
 ---
 
