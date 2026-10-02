@@ -653,21 +653,7 @@ This separation keeps the modelling repository documentation focused on the Pyth
 
 ---
 
-## 20. Testing
-
-Run the test suite from the project root:
-
-```powershell
-.\.venv\Scripts\python.exe -m pytest .\tests -q
-```
-
-The test suite contains lightweight contract tests, numerical regression tests and dashboard integration checks.
-
-Production model results should not be regenerated merely to test presentation code.
-
----
-
-## 21. Reproducibility principles
+## 20. Reproducibility principles
 
 The project follows several strict engineering rules:
 
@@ -683,25 +669,6 @@ The project follows several strict engineering rules:
 10. **Large local data and result artefacts are excluded from Git.**
 
 ---
-
-## 22. GitHub math rendering
-
-This README uses GitHub-native mathematical notation.
-
-Inline mathematics uses `$...$`.
-
-Displayed equations use GitHub fenced math blocks:
-
-````text
-```math
-...
-```
-````
-
-This convention is used throughout this README because it is more reliable for multiline equations on GitHub than `$$ ... $$` blocks.
-
----
-
 ## License / data access
 
 No licence is asserted here for third-party datasets.
