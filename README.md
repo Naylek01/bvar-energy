@@ -12,7 +12,20 @@ A production-oriented Bayesian VAR framework for **euro-area inflation forecasti
 
 The project combines seven Energy BVARs with a separate joint monthly Headline BVAR and exact draw-by-draw HICP aggregation.
 
-> **Project status:** final research / production snapshot, August 2026.
+> **Project status:** final research / production snapshot, October 2026.
+
+---
+
+## Final dashboard contract
+
+The final dashboard snapshot follows these presentation and runtime contracts:
+
+- **Energy, Headline HICP and Core HICP** share the same section-first navigation for Forecast, Scenarios and Estimation; Structural analysis is available for Energy and Headline, while **Core Structural is intentionally unavailable**.
+- Structural **display horizons are presentation-only**. The default Structural display horizon is **6 months**; changing it does not change the stored computational horizon or re-estimate a BVAR.
+- Energy and regular Headline joint-BVAR FEVD charts show the **complete shock decomposition**, including the response variable's own shock as well as cross-shocks.
+- In scenario path charts, **Baseline / Unconditional paths are solid** and **Scenario / Conditional paths are dashed**.
+- Joint conditional-plus-tax Energy scenarios materialise the current **HICP Energy** result independently; Headline propagation is an additional downstream calculation rather than a prerequisite for the Energy result.
+- A condition expressed as **0% vs last observed** means holding the conditioned driver at its last observed level over the selected conditioning window. It is therefore not, in general, identical to the unconditional forecast path.
 
 ---
 
@@ -504,6 +517,8 @@ and the main analytical sections:
 
 The dashboard uses persisted model artefacts and a registry to avoid unnecessary re-estimation.
 
+Structural display controls are separated from stored computational horizons. In the final UI the default Structural display horizon is **6 months**. Core currently exposes Forecast, Scenarios and Estimation; **Core Structural is intentionally unavailable**.
+
 ---
 
 ## 14. Result persistence
@@ -572,12 +587,23 @@ The dashboard exposes this choice in the Estimation configuration. Changing pres
 
 ### Python
 
-Python 3.11 is the reference environment.
+### Dependency audit
+
+The final repository-wide static import audit was run against `src/`, `tests/`, `tools/`, `scripts/` and `notebooks/` without importing project code or executing notebooks.
+
+Two direct dependencies that were previously only available transitively are now declared explicitly:
+
+- `Flask` — directly imported by the dashboard XLSX export layer;
+- `ipython` — directly imported by an interactive plotting utility and used by notebooks.
+
+One legacy diagnostics notebook imports `pmdarima`. It is **not required by the production dashboard/runtime** and remains an optional notebook-only installation rather than a mandatory production dependency.
+
+Python **3.12** is the final audited environment; the final dependency audit was run on Python **3.12.6**.
 
 Create a virtual environment:
 
 ```powershell
-py -3.11 -m venv .venv
+py -3.12 -m venv .venv
 ```
 
 Activate it:
@@ -596,7 +622,7 @@ python -m pip install -r requirements.txt
 Verify the environment:
 
 ```powershell
-python -c "import numpy, pandas, scipy, dash, plotly, pyarrow, diskcache; print('environment: OK')"
+python -c "import numpy, pandas, scipy, dash, flask, plotly, pyarrow, diskcache, IPython; print('environment: OK')"
 ```
 
 ---
