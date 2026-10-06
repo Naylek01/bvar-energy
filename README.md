@@ -200,16 +200,6 @@ I^{H}_{Dec(y-1)}
 
 All aggregation is performed **draw by draw**, before posterior means, medians or credible intervals are calculated.
 
-This matters because, in general,
-
-```math
-f\!\left(E[X]\right)
-\neq
-E[f(X)].
-```
-
-The dashboard therefore does not aggregate already-summarised component forecasts.
-
 ---
 
 ## 6. Exact contribution accounting
