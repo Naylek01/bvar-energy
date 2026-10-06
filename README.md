@@ -643,13 +643,11 @@ The Excel / Power Query ingestion layer is intentionally **not documented in thi
 
 It includes external-source ingestion, workbook configuration, Power Query/M logic and source-specific contracts.
 
-That layer should be documented separately in a dedicated file, for example:
+That layer is documented separately in a dedicated file:
 
 ```text
 EXCEL_DATA_PIPELINE.md
 ```
-
-This separation keeps the modelling repository documentation focused on the Python econometric and dashboard stack.
 
 ---
 
