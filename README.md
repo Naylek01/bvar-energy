@@ -517,6 +517,14 @@ and the main analytical sections:
 
 The dashboard uses persisted model artefacts and a registry to avoid unnecessary re-estimation.
 
+For operating the dashboard and refitting the models after a data refresh, see [`DASHBOARD_USER_GUIDE.md`](DASHBOARD_USER_GUIDE.md). For the Excel / Power Query refresh itself, see [`EXCEL_DATA_PIPELINE.md`](EXCEL_DATA_PIPELINE.md).
+
+Production refresh:
+
+```text
+Excel refresh → processed vintage → Energy fits → HICP Energy aggregate → Headline fit → validation / promotion → dashboard refresh
+```
+
 Structural display controls are separated from stored computational horizons. In the final UI the default Structural display horizon is **6 months**. Core currently exposes Forecast, Scenarios and Estimation; **Core Structural is intentionally unavailable**.
 
 ---
